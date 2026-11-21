@@ -38,18 +38,82 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
     out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
 }
 
-__global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
-                                    cutlass::half_t* __restrict__ out, std::int64_t count) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+// Prepacked code plane in storage order: [N/32 tile][K/128 block][8 slices][32 lanes][16 codes],
+// where a lane's 16 codes are 16 consecutive columns of one row (fp8_qpn_prepacked_offset). One
+// thread moves one 16-code chunk: a warp reads 512 contiguous bytes and each thread writes 32
+// contiguous bytes of its row. Same per-value decode as the row-order kernel, which gathers two
+// bytes per thread (~505 GB/s on the p45k prefill trace).
+__global__ void dequant_fp8_prepacked_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
+                                              cutlass::half_t* __restrict__ out) {
+    const std::int64_t chunk =
+        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int blocks = k / 128;
+    const int lane   = static_cast<int>(chunk & 31);
+    const int slice  = static_cast<int>((chunk >> 5) & 7);
+    const std::int64_t tile_block = chunk >> 8;
+    const int block  = static_cast<int>(tile_block % blocks);
+    const int tile   = static_cast<int>(tile_block / blocks);
+    const int row    = tile * 32 + ((lane >> 2) & 3) * 8 + ((lane & 3) | ((lane & 16) ? 4 : 0));
+    if (row >= n) { return; }
+    const uint4 raw      = *reinterpret_cast<const uint4*>(codes + chunk * 16);
+    const auto* pairs    = reinterpret_cast<const std::uint16_t*>(&raw);
+    uint4 packed[2];
+    auto* dst = reinterpret_cast<__half2*>(packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float2 weight = decode_fp8_e4m3x2(pairs[j]);
+        dst[j]              = __floats2half2_rn(weight.x, weight.y);
+    }
+    auto* destination = reinterpret_cast<uint4*>(out + static_cast<std::int64_t>(row) * k +
+                                                 block * 128 + slice * 16);
+    destination[0] = packed[0];
+    destination[1] = packed[1];
 }
 
+__global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
+                                    cutlass::half_t* __restrict__ out, std::int64_t count) {
+    // Eight elements (one 16-byte transaction each way) per thread; the scalar form ran at
+    // ~370 GB/s on the p45k prefill trace.
+    const std::int64_t i =
+        (static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+    if (i + 8 <= count) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(in + i);
+        const auto* src = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        uint4 packed;
+        auto* dst = reinterpret_cast<__half2*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 v = __bfloat1622float2(src[j]);
+            dst[j]         = __floats2half2_rn(v.x, v.y);
+        }
+        *reinterpret_cast<uint4*>(out + i) = packed;
+    } else {
+        for (std::int64_t j = i; j < count; ++j) {
+            out[j] = cutlass::half_t(__bfloat162float(in[j]));
+        }
+    }
+}
+
+// data is row-major {rows=n, cols}; element (r, c) at c*n + r is scaled by scales[r].
+// The old flat form paid an int64 modulo per element (237 GB/s on the p45k trace); the
+// 2-D grid drops the division entirely and vectorizes rows in bf16 pairs.
 __global__ void scale_rows_kernel(__nv_bfloat16* __restrict__ data,
-                                  const __nv_bfloat16* __restrict__ scales, std::int64_t count,
-                                  int n) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count) { return; }
-    data[i] = __float2bfloat16(__bfloat162float(data[i]) * __bfloat162float(scales[i % n]));
+                                  const __nv_bfloat16* __restrict__ scales, std::int64_t cols,
+                                  int rows) {
+    const int pair = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t col = static_cast<std::int64_t>(blockIdx.y);
+    if (pair * 2 + 1 >= rows) {
+        if (pair * 2 < rows) {
+            __nv_bfloat16* d = data + col * rows + pair * 2;
+            *d = __float2bfloat16(__bfloat162float(*d) * __bfloat162float(scales[pair * 2]));
+        }
+        return;
+    }
+    const __nv_bfloat162 s2 = reinterpret_cast<const __nv_bfloat162*>(scales)[pair];
+    __nv_bfloat162* d2      = reinterpret_cast<__nv_bfloat162*>(data + col * rows) + pair;
+    const float2 d0         = __bfloat1622float2(*d2);
+    const float2 sf         = __bfloat1622float2(s2);
+    *d2                     = __floats2bfloat162_rn(d0.x * sf.x, d0.y * sf.y);
 }
 
 using ElementAccumulator     = float;
@@ -109,14 +173,21 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     auto* weight = static_cast<cutlass::half_t*>(scratch.weight.data);
     auto* input  = static_cast<cutlass::half_t*>(scratch.input.data);
 
-    const dim3 block(256);
-    const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
-    dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), n, k,
-        w.layout == QuantLayout::VoltaQpnPrepacked, weight);
+    if (w.layout == QuantLayout::VoltaQpnPrepacked && n % 32 == 0 && k % 128 == 0) {
+        const std::int64_t chunks = static_cast<std::int64_t>(n) * k / 16;
+        dequant_fp8_prepacked_to_fp16<<<static_cast<unsigned>((chunks + 255) / 256), 256, 0,
+                                        stream>>>(static_cast<const std::uint8_t*>(w.qdata), n, k,
+                                                  weight);
+    } else {
+        const dim3 block(256);
+        const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
+        dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), n, k,
+            w.layout == QuantLayout::VoltaQpnPrepacked, weight);
+    }
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
-    bf16_to_fp16_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
+    bf16_to_fp16_kernel<<<static_cast<int>((input_count + 2047) / 2048), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), input, input_count);
     CUDA_CHECK(cudaGetLastError());
 
@@ -139,10 +210,11 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     }
     CUDA_CHECK(cudaGetLastError());
 
-    const std::int64_t output_count = static_cast<std::int64_t>(t) * n;
-    scale_rows_kernel<<<static_cast<int>((output_count + 255) / 256), 256, 0, stream>>>(
+    const dim3 scale_grid(static_cast<unsigned>(((n + 1) / 2 + 255) / 256),
+                          static_cast<unsigned>(t), 1u);
+    scale_rows_kernel<<<scale_grid, 256, 0, stream>>>(
         static_cast<__nv_bfloat16*>(out.data), static_cast<const __nv_bfloat16*>(w.scales),
-        output_count, n);
+        static_cast<std::int64_t>(t), n);
     CUDA_CHECK(cudaGetLastError());
 }
 

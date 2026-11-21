@@ -126,7 +126,9 @@ void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor
 
 
 #ifdef NINFER_VOLTA_BUILD
-inline constexpr std::int32_t kVoltaFlashQBlockTokens = 1024;
+// K/V traffic is independent of the Q-block (each CTA covers 32 queries over every visible
+// key), while the dense mask scales with it: 256 keeps the mask at ~170 MB for a 256K window.
+inline constexpr std::int32_t kVoltaFlashQBlockTokens = 256;
 inline constexpr std::int32_t kVoltaFlashMinimumWidth = 64;
 inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
 inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
@@ -139,6 +141,15 @@ void causal_attention_volta_flash_launch(
     CausalAttentionExecutionEnvelope envelope, std::int32_t q_block_tokens, Tensor& k_gathered,
     Tensor& v_gathered, Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
     cudaStream_t stream);
+
+// True when INT8-G64 prompts take the fused paged kernel, which needs no flash workspace.
+bool causal_attention_volta_paged_prefill_enabled();
+
+// Reads the paged INT8-G64 cache directly; K/V for this call must already be appended.
+void causal_attention_volta_paged_i8_prefill_launch(const Tensor& q, const Tensor& positions,
+                                                    const Tensor& table_rows, float scale,
+                                                    PagedKVBatchLayerView cache, Tensor& out,
+                                                    cudaStream_t stream);
 #endif
 
 } // namespace ninfer::ops::detail

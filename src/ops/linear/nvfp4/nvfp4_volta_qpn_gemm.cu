@@ -25,7 +25,7 @@ bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) n
     if (k / S::kChunkK < 8) { return false; }
     // Prepacked runtime weights also use QPN2 at T=1; checkpoint-native weights keep the existing
     // SIMT decode route through the semantic-op plan.
-    return t >= 1 && t <= 4 * S::kRowsPerTile;
+    return t >= 1 && t <= kVoltaQpnMaxTokens;
 }
 
 void launch_nvfp4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

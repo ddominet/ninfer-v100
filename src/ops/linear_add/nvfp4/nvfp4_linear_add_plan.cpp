@@ -1,3 +1,4 @@
+#include "ops/linear/volta_qpn_width.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "core/layout.h"
@@ -8,6 +9,7 @@
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #endif
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -75,11 +77,27 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
     return allocator.alloc(DType::BF16, {output_rows, tokens}, 256);
 }
 
+// Opt-in (NINFER_NVFP4_DOWN_T1_GEMV=1): the SIMT GEMV measures 590 GB/s in situ, the tensor-core
+// QPN pass with a staged FP16 activation ~690, so QPN is the default at T=1 as well.
+bool nvfp4_down_t1_gemv_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_NVFP4_DOWN_T1_GEMV");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
-                            WorkspaceArena& workspace, cudaStream_t stream) {
+                             WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();
+    if (nvfp4_down_t1_gemv_enabled() && x.ne[1] == 1 && weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        // T=1: the shared prepack GEMV (~590 GB/s in-situ) replaces the QPN2 pass (~419 GB/s,
+        // 6.71 ms/token over 56 layers in the d8k nsys decode profile).
+        nvfp4_linear_add_gemv_t1_sm70_launch(x, weight, residual, workspace, stream);
+        return;
+    }
     Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
-    if (x.ne[1] >= 33) {
+    if (x.ne[1] >= kVoltaCutlassMinT) {
         nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);
     } else {
         const std::size_t linear_bytes = std::max<std::size_t>(
@@ -96,7 +114,7 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
                                             std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, output_rows, tokens);
-    const std::size_t linear_bytes = tokens >= 33
+    const std::size_t linear_bytes = tokens >= kVoltaCutlassMinT
         ? nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
         : std::max<std::size_t>(
               linear_workspace_capacity_bytes(QType::NVFP4, output_rows, input_rows,
@@ -104,6 +122,10 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
               256);
     (void)layout.alloc_bytes(linear_bytes, 256);
     return layout.peak_bytes(1);
+}
+
+std::size_t linear_then_add_gemv_bytes(std::int32_t output_rows, std::int32_t input_rows) {
+    return nvfp4_linear_add_gemv_t1_sm70_workspace_bytes(output_rows, input_rows);
 }
 #endif // NINFER_VOLTA_BUILD
 
@@ -123,7 +145,13 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
     }
 #ifdef NINFER_VOLTA_BUILD
     if (route == Nvfp4LinearAddRoute::LinearThenAdd) {
-        return linear_then_add_workspace_bytes(output_rows, input_rows, max_tokens);
+        std::size_t bytes = linear_then_add_workspace_bytes(output_rows, input_rows, max_tokens);
+        if (min_tokens <= 1 && nvfp4_down_t1_gemv_enabled()) {
+            // The T=1 route allocates fp32 scratch + fp16 activation instead of a projected
+            // plane; any interval that can reach T=1 must cover it.
+            bytes = std::max(bytes, linear_then_add_gemv_bytes(output_rows, input_rows));
+        }
+        return bytes;
     }
 #endif
     return 0;

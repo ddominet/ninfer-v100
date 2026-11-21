@@ -73,9 +73,23 @@ __launch_bounds__(256) __global__
     const auto* up2   = reinterpret_cast<const __nv_bfloat162*>(up + col * up_col_stride);
     auto* out2 = reinterpret_cast<__nv_bfloat162*>(out + col * static_cast<std::int64_t>(rows));
 
-    for (int p = 0; p < kSiluAndMulPairsPerThread; ++p) {
-        const std::int64_t j = pair0 + p;
-        if (j < row_pairs) { out2[j] = silu_mul_pair(gate2[j], up2[j]); }
+    // Same pair mapping and silu math as the scalar form; the four consecutive pairs move as
+    // one 16-byte transaction per operand (the 4-byte form measured 438 GB/s on p45k).
+    if (pair0 + kSiluAndMulPairsPerThread <= row_pairs) {
+        const uint4 g4 = *reinterpret_cast<const uint4*>(gate2 + pair0);
+        const uint4 u4 = *reinterpret_cast<const uint4*>(up2 + pair0);
+        const auto* gp = reinterpret_cast<const __nv_bfloat162*>(&g4);
+        const auto* up = reinterpret_cast<const __nv_bfloat162*>(&u4);
+        uint4 o4;
+        auto* op = reinterpret_cast<__nv_bfloat162*>(&o4);
+#pragma unroll
+        for (int p = 0; p < kSiluAndMulPairsPerThread; ++p) { op[p] = silu_mul_pair(gp[p], up[p]); }
+        *reinterpret_cast<uint4*>(out2 + pair0) = o4;
+    } else {
+        for (int p = 0; p < kSiluAndMulPairsPerThread; ++p) {
+            const std::int64_t j = pair0 + p;
+            if (j < row_pairs) { out2[j] = silu_mul_pair(gate2[j], up2[j]); }
+        }
     }
 }
 

@@ -476,6 +476,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         if (route == detail::CausalAttentionRoute::Prompt) {
 #ifdef NINFER_VOLTA_BUILD
             if (volta_flash_route_possible(q_heads, width, batch_size, cache_storage)) {
+                if (cache_storage == KvCacheStorage::Int8Group64 &&
+                    detail::causal_attention_volta_paged_prefill_enabled()) {
+                    return std::size_t{0};
+                }
                 WorkspaceLayoutBuilder layout;
                 (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
                 return layout.peak_bytes(1);
@@ -549,8 +553,11 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
         volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
-        VoltaFlashWorkspace staging =
-            allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+        VoltaFlashWorkspace staging{};
+        if (cache.storage != KvCacheStorage::Int8Group64 ||
+            !detail::causal_attention_volta_paged_prefill_enabled()) {
+            staging = allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+        }
         detail::causal_attention_volta_flash_launch(
             q, k, v, positions, kv_table_rows, scale, cache, envelope,
             detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,

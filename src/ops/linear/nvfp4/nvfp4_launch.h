@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/linear/volta_qpn_width.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -17,8 +18,8 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
 // Quadpair-split-N form (nvfp4_volta_qpn_gemm.cuh), the fourth sibling of the q4/w8/fp8 QPN
 // kernels. The tile height is mirrored here because dispatch is host code and cannot see the
 // device header; the launcher static_asserts the two agree.
-inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = 8;
-inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = 32;
+inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = kVoltaQpnRowsPerTile;
+inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = kVoltaQpnMaxTokens;
 void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;

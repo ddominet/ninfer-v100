@@ -51,7 +51,9 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         // Splitting also extends the fast, precision-safe route through T=32 (kNvfp4VoltaQpnMaxTokens),
         // where T=17..32 previously fell to the same untested-precision composition this route
         // replaces at T<=16. See the NVFP4 decode sweep.
-        if (nvfp4_linear_swiglu_qpn_split_supported(Nvfp4MlpGateUpGeometry::kInputRows, tokens)) {
+        if (tokens < kVoltaCutlassMinT &&
+            nvfp4_linear_swiglu_qpn_split_supported(Nvfp4MlpGateUpGeometry::kInputRows,
+                                                    std::min(tokens, kVoltaQpnMaxTokens))) {
             return Nvfp4LinearSwiGluRoute::VoltaQpnSplit;
         }
         return Nvfp4LinearSwiGluRoute::VoltaCutlass;
@@ -133,11 +135,8 @@ std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
 }
 
 std::size_t cutlass_route_workspace_bytes(std::int32_t tokens) {
-    const std::size_t projected = static_cast<std::size_t>(
-        Nvfp4MlpGateUpGeometry::kOutputRows) * tokens * sizeof(std::uint16_t);
-    return projected + nvfp4_cutlass_sm70_workspace_bytes(
-                           Nvfp4MlpGateUpGeometry::kOutputRows,
-                           Nvfp4MlpGateUpGeometry::kInputRows, tokens);
+    return nvfp4_linear_swiglu_cutlass_sm70_workspace_bytes(
+        Nvfp4MlpGateUpGeometry::kOutputRows, Nvfp4MlpGateUpGeometry::kInputRows, tokens);
 }
 #endif // NINFER_VOLTA_BUILD
 
@@ -169,7 +168,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 #ifdef NINFER_VOLTA_BUILD
         if (max_tokens == 1) { return qpn_split_workspace_bytes(1); }
         if (route == Nvfp4LinearSwiGluRoute::VoltaQpnSplit) {
-            return qpn_split_workspace_bytes(max_tokens);
+            return qpn_split_workspace_bytes(std::min(max_tokens, kVoltaQpnMaxTokens));
         }
         if (route == Nvfp4LinearSwiGluRoute::VoltaCutlass) {
             return cutlass_route_workspace_bytes(max_tokens);
@@ -227,24 +226,29 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         nvfp4_linear_swiglu_volta_qpn_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::VoltaQpnSplit: {
-        auto scope                       = workspace.scope();
-        Nvfp4QpnSplitWorkspace scratch    = allocate_qpn_split_workspace(workspace, x.ne[1]);
-        nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
-                                             reinterpret_cast<float*>(scratch.gate.data),
-                                             reinterpret_cast<float*>(scratch.up.data),
-                                             scratch.activation.data, stream);
-        return;
-    }
-    case Nvfp4LinearSwiGluRoute::VoltaCutlass: {
         auto scope = workspace.scope();
-        Tensor projected = workspace.alloc(
-            DType::BF16, {Nvfp4MlpGateUpGeometry::kOutputRows, x.ne[1]}, 256);
-        nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);
+        Nvfp4QpnSplitWorkspace scratch =
+            allocate_qpn_split_workspace(workspace, std::min(x.ne[1], kVoltaQpnMaxTokens));
         constexpr std::int32_t kIntermediate = Nvfp4MlpGateUpGeometry::kOutputRows / 2;
-        silu_mul(projected.slice(0, 0, kIntermediate),
-                 projected.slice(0, kIntermediate, kIntermediate), out, stream);
+        for (std::int32_t begin = 0; begin < x.ne[1]; begin += kVoltaQpnMaxTokens) {
+            const std::int32_t active = std::min(kVoltaQpnMaxTokens, x.ne[1] - begin);
+            Tensor input(static_cast<std::uint8_t*>(x.data) +
+                             static_cast<std::int64_t>(begin) * weight.k * sizeof(std::uint16_t),
+                         DType::BF16, {weight.k, active});
+            Tensor output(static_cast<std::uint8_t*>(out.data) +
+                              static_cast<std::int64_t>(begin) * kIntermediate *
+                                  sizeof(std::uint16_t),
+                          DType::BF16, {kIntermediate, active});
+            nvfp4_linear_swiglu_qpn_split_launch(input, weight, output,
+                                                 reinterpret_cast<float*>(scratch.gate.data),
+                                                 reinterpret_cast<float*>(scratch.up.data),
+                                                 scratch.activation.data, stream);
+        }
         return;
     }
+    case Nvfp4LinearSwiGluRoute::VoltaCutlass:
+        nvfp4_linear_swiglu_cutlass_sm70_launch(x, weight, out, workspace, stream);
+        return;
 #endif
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);

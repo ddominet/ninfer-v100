@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
 
@@ -22,11 +24,47 @@ template <bool NormalizeQK>
 void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
-                                   cudaStream_t stream) {
+                                   float* prepared, cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_bf16_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
+    // Pipelined form hides q/k/v/gate latency on long sequences. At decode width=1 the ring
+    // has nothing to hide and only burns registers; use the plain kernel so more CTAs fit
+    // (Qwen3.6-27B: 48 value heads × 8 state tiles = 384 CTAs on an 80-SM V100).
+    static const bool pipelined_env = [] {
+        const char* value = std::getenv("NINFER_GDN_PIPELINED");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Prefill widths: hoist the per-(token, head) work into a prepass and run the leaner
+    // recurrence (recurrent.cuh, "Prepared form"): 3.45 -> 2.24 ms per layer-chunk at T=2048 on a
+    // V100 including the prepass, outputs within one bf16 step of the direct kernel.
+    if (prepared != nullptr) {
+        const std::int64_t width      = q.ne[2];
+        const std::int64_t qk_units   = width * q.ne[1];
+        const std::int64_t gate_count = width * v.ne[1];
+        float* qn    = prepared;
+        float* kn    = qn + qk_units * kStateDim;
+        float* kq    = kn + qk_units * kStateDim;
+        float* alpha = kq + qk_units;
+        recurrent_prepare_qk_kernel<NormalizeQK>
+            <<<static_cast<unsigned>((qk_units + 7) / 8), 256, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const __nv_bfloat16*>(k.data), qn, kn, kq, qk_units);
+        recurrent_prepare_gate_kernel
+            <<<static_cast<unsigned>((gate_count + 255) / 256), 256, 0, stream>>>(
+                static_cast<const float*>(g.data), alpha, gate_count);
+        recurrent_bf16_direct_prepared_kernel<<<grid, block, 0, stream>>>(
+            qn, kn, kq, alpha, static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
+            static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
+            heads, scale);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const bool pipelined = pipelined_env && q.ne[2] > 1;
+    auto* kernel = pipelined ? recurrent_bf16_direct_pipelined_kernel<NormalizeQK>
+                             : recurrent_bf16_direct_kernel<NormalizeQK>;
+    kernel<<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
@@ -134,23 +172,44 @@ void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       Tensor& out, cudaStream_t stream) {
     if (normalize_qk) {
         launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
-                                            stream);
+                                            nullptr, stream);
     } else {
         launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
-                                             stream);
+                                             nullptr, stream);
     }
+}
+
+std::size_t recurrent_prepared_bytes(std::int32_t qk_heads, std::int32_t value_heads,
+                                     std::int32_t tokens) {
+#ifdef NINFER_VOLTA_BUILD
+    // Below 64 tokens the prepass costs more than it saves; decode keeps the plain kernel.
+    if (tokens < 64) { return 0; }
+    const std::size_t qk_units = static_cast<std::size_t>(tokens) * qk_heads;
+    return (2 * qk_units * kStateDim + qk_units + static_cast<std::size_t>(tokens) * value_heads) *
+           sizeof(float);
+#else
+    (void)qk_heads;
+    (void)value_heads;
+    (void)tokens;
+    return 0;
+#endif
 }
 
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                            cudaStream_t stream) {
+                            DeviceSpan prepared, cudaStream_t stream) {
+    float* planes = nullptr;
+    if (const std::size_t need = recurrent_prepared_bytes(q.ne[1], v.ne[1], q.ne[2]); need > 0) {
+        if (prepared.data == nullptr || prepared.bytes < need) { throw std::bad_alloc(); }
+        planes = static_cast<float*>(prepared.data);
+    }
     if (normalize_qk) {
         launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                            out, stream);
+                                            out, planes, stream);
     } else {
         launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                             out, stream);
+                                             out, planes, stream);
     }
 }
 

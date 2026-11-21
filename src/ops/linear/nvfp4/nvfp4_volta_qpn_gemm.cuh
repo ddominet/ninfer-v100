@@ -45,6 +45,7 @@
 // stream global -> register. The single __syncthreads() is the cross-warp K reduction at the
 // output.
 
+#include "ops/linear/volta_fp16_stage.h"
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
@@ -53,11 +54,16 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 namespace ninfer::ops::detail {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+
+#ifndef NINFER_NVFP4_QPN_PREPACKED_BATCH
+#define NINFER_NVFP4_QPN_PREPACKED_BATCH 8
+#endif
 
 struct Nvfp4VoltaQpnSchedule {
     static constexpr int kColsPerCta  = 32; // output rows per CTA (mma's N axis)
@@ -324,11 +330,9 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         }
     }
 
-    for (int group = g0; group < gend; ++group) {
-        const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
-        const uint2 q2 = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
-        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scales[packed_index]), divisor2);
+    auto consume = [&](int group, uint2 q2, std::uint8_t scale_byte) {
         half2 b[8];
+        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scale_byte), divisor2);
         nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
         nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
 #pragma unroll
@@ -340,6 +344,18 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         for (int tile = 0; tile < kTiles; ++tile) {
             const int row = tile * S::kRowsPerTile + r;
             half values[16];
+            if constexpr (std::is_same_v<Activation, VoltaGroupMajorHalf>) {
+                // Group-major staging: [group][tile][k half][8 rows][8 k], rows past T zero-filled:
+                // each of a warp's two 16-byte loads covers exactly one 128-byte line (the
+                // row-major form touches eight lines per load).
+                const half* source =
+                    reinterpret_cast<const half*>(x) +
+                    ((static_cast<std::int64_t>(group) * kTiles + tile) * 16 + r) * 8;
+                const uint4 raw0 = *reinterpret_cast<const uint4*>(source);
+                const uint4 raw1 = *reinterpret_cast<const uint4*>(source + 64);
+                *reinterpret_cast<uint4*>(values)     = raw0;
+                *reinterpret_cast<uint4*>(values + 8) = raw1;
+            } else {
             if (row < t) {
                 const Activation* source = x + static_cast<std::int64_t>(row) * k + kbase;
                 const uint4 raw0 = *reinterpret_cast<const uint4*>(source);
@@ -365,19 +381,44 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
 #pragma unroll
                 for (int j = 0; j < 16; ++j) { values[j] = __ushort_as_half(0); }
             }
+            }
             const unsigned* A = reinterpret_cast<const unsigned*>(values);
             volta_mma_qp_n(c[tile][0 % NACC], A[0], A[1], B[0], B[1]);
             volta_mma_qp_n(c[tile][1 % NACC], A[2], A[3], B[2], B[3]);
             volta_mma_qp_n(c[tile][2 % NACC], A[4], A[5], B[4], B[5]);
             volta_mma_qp_n(c[tile][3 % NACC], A[6], A[7], B[6], B[7]);
         }
+    };
+
+    // Each group is only 8 B per lane, and the low-CTA-count shapes (down: 160 CTAs) run 16 warps
+    // per SM, so one load in flight per warp leaves HBM half idle. Issue a batch of groups' code
+    // and scale loads before consuming any of them.
+    constexpr int kBatch = NINFER_NVFP4_QPN_PREPACKED_BATCH;
+    int group = g0;
+    for (; group + kBatch <= gend; group += kBatch) {
+        uint2 q2[kBatch];
+        std::uint8_t sb[kBatch];
+#pragma unroll
+        for (int u = 0; u < kBatch; ++u) {
+            const std::int64_t packed_index =
+                tile_base + static_cast<std::int64_t>(group + u) * 32;
+            q2[u] = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
+            sb[u] = __ldg(scales + packed_index);
+        }
+#pragma unroll
+        for (int u = 0; u < kBatch; ++u) { consume(group + u, q2[u], sb[u]); }
+    }
+    for (; group < gend; ++group) {
+        const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
+        consume(group, __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8)),
+                __ldg(scales + packed_index));
     }
 
 #pragma unroll
     for (int tile = 0; tile < kTiles; ++tile) {
 #pragma unroll
         for (int a = 1; a < NACC; ++a) {
-#pragma unroll
+   #pragma unroll
             for (int i = 0; i < 8; ++i) { c[tile][0][i] += c[tile][a][i]; }
         }
     }
@@ -433,6 +474,8 @@ void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* co
         nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC>
             <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
                                                inverse_weight_divisor, output);
+    } else if constexpr (std::is_same_v<Activation, VoltaGroupMajorHalf>) {
+        throw std::invalid_argument("nvfp4 qpn: group-major activation requires prepacked weights");
     } else {
         nvfp4_volta_qpn_gemm_kernel<kTiles, SPLITK, NACC>
             <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
@@ -456,8 +499,18 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
     if (t <= S::kRowsPerTile) {
-        if (gate_up || split_half) {
+        if (t == 1 && split_half) {
+            // T=1 gate/up half, checksum-locked: SPLITK 16 / NACC 2 is 326 GB/s and
+            // SPLITK 8 / NACC 1 is 398 GB/s. Same bf16 values (max abs 0.007 vs the scalar).
+            launch_nvfp4_qpn_schedule<1, 8, 1>(prepacked, grid, codes, scales, xd, n, k, t,
+                                               inverse_weight_divisor, output, stream);
+        } else if (gate_up || split_half) {
             launch_nvfp4_qpn_schedule<1, 16, 2>(prepacked, grid, codes, scales, xd, n, k, t,
+                                                inverse_weight_divisor, output, stream);
+        } else if (!std::is_same_v<Activation, __nv_bfloat16> && (k / S::kGroupK) % 16 == 0) {
+            // Down projection (5120 x 17408, 160 CTAs) with a staged FP16 activation: 16 warps
+            // splitting K measure 690-700 GB/s at T=1..8 against 630 for 8.
+            launch_nvfp4_qpn_schedule<1, 16, 1>(prepacked, grid, codes, scales, xd, n, k, t,
                                                 inverse_weight_divisor, output, stream);
         } else {
             launch_nvfp4_qpn_schedule<1, 8, 2>(prepacked, grid, codes, scales, xd, n, k, t,
@@ -473,10 +526,24 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
             launch_nvfp4_qpn_schedule<2, 8, 1>(prepacked, grid, codes, scales, xd, n, k, t,
                                                inverse_weight_divisor, output, stream);
         }
-    } else {
+    } else if (t <= 3 * S::kRowsPerTile) {
+        launch_nvfp4_qpn_schedule<3, 8, 1>(prepacked, grid, codes, scales, xd, n, k, t,
+                                           inverse_weight_divisor, output, stream);
+    } else if (t <= 4 * S::kRowsPerTile) {
         launch_nvfp4_qpn_schedule<4, 8, 1>(prepacked, grid, codes, scales, xd, n, k, t,
                                            inverse_weight_divisor, output, stream);
+    } else if (t <= 6 * S::kRowsPerTile) {
+        // Four K-split warps keep the SPLITK * kTiles * 1 KB reduce buffer inside the 48 KB
+        // static limit for the six- and eight-tile forms.
+        launch_nvfp4_qpn_schedule<6, 4, 1>(prepacked, grid, codes, scales, xd, n, k, t,
+                                           inverse_weight_divisor, output, stream);
+    } else {
+        launch_nvfp4_qpn_schedule<8, 4, 1>(prepacked, grid, codes, scales, xd, n, k, t,
+                                           inverse_weight_divisor, output, stream);
     }
+    static_assert(volta_qpn_tiles(17) == 3 && volta_qpn_tiles(33) == 6 &&
+                  volta_qpn_tiles(49) == 8 && kVoltaQpnMaxTokens == 8 * S::kRowsPerTile,
+                  "tile buckets mirror volta_qpn_tiles, which sizes the group-major staging");
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -484,6 +551,21 @@ template <class OutputPolicy>
 void launch_nvfp4_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPolicy output,
                                         std::int32_t n, float inverse_weight_divisor,
                                         cudaStream_t stream) {
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        if (const VoltaGroupMajorHalf* staged = volta_stage_fp16_group_major(x, stream)) {
+            launch_nvfp4_volta_qpn_with_activation(x, w, staged, output, n, inverse_weight_divisor,
+                                                   stream);
+            return;
+        }
+    }
+    {
+        // Every QPN width: the in-loop conversion costs more per extra row tile.
+        if (const half* x_fp16 = volta_stage_fp16_activation(x, stream)) {
+            launch_nvfp4_volta_qpn_with_activation(x, w, x_fp16, output, n, inverse_weight_divisor,
+                                                   stream);
+            return;
+        }
+    }
     launch_nvfp4_volta_qpn_with_activation(
         x, w, static_cast<const __nv_bfloat16*>(x.data), output, n, inverse_weight_divisor,
         stream);
@@ -495,6 +577,16 @@ void launch_nvfp4_volta_qpn_with_fp16_activation(const Tensor& x, const Weight& 
                                                  std::int32_t n, float inverse_weight_divisor,
                                                  cudaStream_t stream) {
     launch_nvfp4_volta_qpn_with_activation(x, w, x_fp16, output, n, inverse_weight_divisor,
+                                           stream);
+}
+
+template <class OutputPolicy>
+void launch_nvfp4_volta_qpn_with_group_major_activation(const Tensor& x, const Weight& w,
+                                                        const VoltaGroupMajorHalf* staged,
+                                                        OutputPolicy output, std::int32_t n,
+                                                        float inverse_weight_divisor,
+                                                        cudaStream_t stream) {
+    launch_nvfp4_volta_qpn_with_activation(x, w, staged, output, n, inverse_weight_divisor,
                                            stream);
 }
 

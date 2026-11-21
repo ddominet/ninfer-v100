@@ -9,7 +9,14 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
+#ifdef NINFER_VOLTA_BUILD
+        // One width per QPN tile bucket (1, 2, 3, 4, 6, 8 tiles), multi-pass widths, then the
+        // CUTLASS route in one and in two column passes.
+        constexpr std::array<std::int32_t, 16> kA16Cases{1,  4,  8,   16,  17,  32,  33,  49,
+                                                         64, 65, 100, 128, 192, 193, 256, 1027};
+#else
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+#endif
         constexpr std::array<std::int32_t, 6> kA4Cases{5, 48, 49, 128, 256, 1024};
         int failures = 0;
         failures += run_profile("LinearSwiGLU NVFP4_A16",

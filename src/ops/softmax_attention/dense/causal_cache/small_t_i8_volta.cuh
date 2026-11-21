@@ -42,8 +42,9 @@
 //      cap with nothing left for Q/K fragments or loop state. Fix: split the head dimension
 //      across warps (DimSplit=4 below) instead of giving each warp the full D range, so each
 //      warp only holds D/4=64 columns resident (8 chunks x 8 floats = 64 registers). Warps
-//      that share a row-tile redundantly recompute the (cheap, register-light) QK^T +
-//      online-softmax step identically and only diverge for the PV accumulate.
+//      that share a row-tile split the QK^T contraction into four D/4 slices, add the
+//      fragments, then diverge for the PV accumulate. The fifth-warp tail still
+//      contracts the full head dim on its own rows.
 //
 //   2. Shared-memory wall. This kernel reloads Q from shared memory every key-tile
 //      iteration rather than keeping Q fragments resident in registers (that trade-off is
@@ -67,6 +68,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/softmax_attention/dense/causal_cache/direct_i8_volta.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -77,16 +79,24 @@
 namespace ninfer::ops {
 
 __device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
-    const std::int8_t* codes8, float scale) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
-    __half2 packed[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        packed[i] = __floats2half2_rn(static_cast<float>(c[2 * i]) * scale,
-                                      static_cast<float>(c[2 * i + 1]) * scale);
-    }
-    return *reinterpret_cast<const int4*>(packed);
+    const std::int8_t* codes8, half scale) {
+    // 0x64xx widening, same as prefill. Bit-matches the int->float->half path on the
+    // 43K dense checksum and drops the decode attention tile from 0.876 ms to 0.780 ms.
+    const uint2 raw = *reinterpret_cast<const uint2*>(codes8);
+    const unsigned w0 = raw.x ^ 0x80808080u;
+    const unsigned w1 = raw.y ^ 0x80808080u;
+    const half2 bias = __half2half2(__ushort_as_half(0x6480));
+    const half2 s2   = __half2half2(scale);
+    const unsigned p00 = __byte_perm(w0, 0x64646464u, 0x4140);
+    const unsigned p01 = __byte_perm(w0, 0x64646464u, 0x4342);
+    const unsigned p10 = __byte_perm(w1, 0x64646464u, 0x4140);
+    const unsigned p11 = __byte_perm(w1, 0x64646464u, 0x4342);
+    half2 h00 = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&p00), bias), s2);
+    half2 h01 = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&p01), bias), s2);
+    half2 h10 = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&p10), bias), s2);
+    half2 h11 = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&p11), bias), s2);
+    return make_int4(*reinterpret_cast<const int*>(&h00), *reinterpret_cast<const int*>(&h01),
+                     *reinterpret_cast<const int*>(&h10), *reinterpret_cast<const int*>(&h11));
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
@@ -143,6 +153,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
+    // Partial QK fragment per warp. 4 KiB. The 4-warp path splits the D=256 contraction.
+    __shared__ float qk_part[4][32][8];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -392,25 +404,33 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
             // and the store. Every key in range is read from the cache, including this tile's
             // own new tokens -- the append block above has already written and __syncthreads()'d
             // them, so there is no need for the bf16 kernel's separate "from_new" source.
-            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
-                const int key_l = chunk / (D / 8);
-                const int d     = (chunk - key_l * (D / 8)) * 8;
-                const int key   = k0 + key_l;
-                half* k_dst     = &k_s[key_l * SmemStride + d];
-                half* v_dst     = &v_s[key_l * SmemStride + d];
-                if (key >= split_start && key < split_end) {
-                    const int page_offset = key & kPagedKVPageMask;
-                    const std::int64_t code_off =
-                        kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
-                    const std::int64_t scale_off = kv_cache_int8_quant_scale_index<Geometry>(
-                        physical_page, kv_head, d / kKVCacheInt8Group, page_offset);
-                    const float ks = __half2float(cache_k_scale[scale_off]);
-                    const float vs = __half2float(cache_v_scale[scale_off]);
-                    store_vec(k_dst, causal_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
-                    store_vec(v_dst, causal_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
-                } else {
-                    store_vec(k_dst, make_int4(0, 0, 0, 0));
-                    store_vec(v_dst, make_int4(0, 0, 0, 0));
+            // Two independent chunks per iteration so the half dequant pipes overlap.
+            for (int base = tid; base < Bc * (D / 8); base += Threads * 2) {
+                const int chunk1 = base + Threads;
+#pragma unroll
+                for (int step = 0; step < 2; ++step) {
+                    const int chunk = step == 0 ? base : chunk1;
+                    if (step == 1 && chunk >= Bc * (D / 8)) break;
+                    const int key_l = chunk / (D / 8);
+                    const int d     = (chunk - key_l * (D / 8)) * 8;
+                    const int key   = k0 + key_l;
+                    half* k_dst     = &k_s[key_l * SmemStride + d];
+                    half* v_dst     = &v_s[key_l * SmemStride + d];
+                    if (key >= split_start && key < split_end) {
+                        const int page_offset = key & kPagedKVPageMask;
+                        const std::int64_t code_off =
+                            kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d,
+                                                                     page_offset);
+                        const std::int64_t scale_off = kv_cache_int8_quant_scale_index<Geometry>(
+                            physical_page, kv_head, d / kKVCacheInt8Group, page_offset);
+                        const half ks = cache_k_scale[scale_off];
+                        const half vs = cache_v_scale[scale_off];
+                        store_vec(k_dst, causal_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
+                        store_vec(v_dst, causal_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
+                    } else {
+                        store_vec(k_dst, make_int4(0, 0, 0, 0));
+                        store_vec(v_dst, make_int4(0, 0, 0, 0));
+                    }
                 }
             }
             __syncthreads();
@@ -418,15 +438,40 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
             // Bc=16 keys are staged together, but QK^T/softmax/PV operate on 8-key
             // sub-groups within that stage: each mma.sync.m8n8k4 call only covers an
             // 8-key "N" dimension, so each sub-group gets its own complete online-softmax
-            // rescale step (same recurrence as the outer kb loop, one level finer). Every
-            // dim-split warp sharing this row-tile computes this step identically and
-            // redundantly -- see file comment #1.
+            // rescale step (same recurrence as the outer kb loop, one level finer).
+            // The 4-warp path splits that contraction; the tail warp still does all of D.
 #pragma unroll
             for (int sub = 0; sub < PVChunks; ++sub) {
                 const int sub_k0 = k0 + sub * 8;
 
                 // --- QK^T: accumulate over the full D=256 head dim, 8 real k-elements/call. ---
                 float d_score[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                // Four warps used to each contract all 256 dims. Split the contraction and
+                // add the fragments. CompactTail's fifth warp owns a different row map.
+                if constexpr (!CompactTail) {
+                    constexpr int kSlice = DChunks / DimSplit;
+                    const int c0         = dim_warp * kSlice;
+#pragma unroll
+                    for (int c = c0; c < c0 + kSlice; ++c) {
+                        half2 qf[4];
+                        volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
+                                      SmemStride / 2);
+                        half2 kf[4];
+                        volta_load_k(
+                            kf, reinterpret_cast<const half2*>(&k_s[sub * 8 * SmemStride + c * 8]),
+                            SmemStride / 2);
+                        volta_mma_qk(d_score, qf, kf);
+                    }
+#pragma unroll
+                    for (int l = 0; l < 8; ++l) qk_part[warp][lane][l] = d_score[l];
+                    __syncthreads();
+#pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        d_score[l] = qk_part[0][lane][l] + qk_part[1][lane][l] +
+                                     qk_part[2][lane][l] + qk_part[3][lane][l];
+                    }
+                    __syncthreads();
+                } else {
 #pragma unroll
                 for (int c = 0; c < DChunks; ++c) {
                     half2 qf[4];
@@ -453,6 +498,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                         kf, reinterpret_cast<const half2*>(&k_s[sub * 8 * SmemStride + c * 8]),
                         SmemStride / 2);
                     volta_mma_qk(d_score, qf, kf);
+                }
                 }
 
                 // --- Causal mask + scale. Row = volta_d_get_i(l) (0..31, this pass's local
@@ -676,6 +722,81 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         __syncthreads();
     }
 #endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+}
+
+// One warp per (KV head, new token, stream) appends; grid.y is the token count and grid.z the
+// stream count. The decode kernels of direct_i8_volta.cuh only read the cache, and launching the
+// full partial kernel just to append would stand up hundreds of CTAs for a few rows.
+template <typename Geometry, typename CacheInput>
+__global__ void causal_attention_qwen27_append_t1(
+    CacheInput input, const std::int32_t* __restrict__ pos, std::int8_t* __restrict__ cache_k_i8,
+    std::int8_t* __restrict__ cache_v_i8, __half* __restrict__ cache_k_scale,
+    __half* __restrict__ cache_v_scale, const std::int32_t* __restrict__ block_tables,
+    const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
+    std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
+    std::int32_t logical_capacity) {
+    static_assert(CacheInput::writes_cache);
+    constexpr int D      = kCausalHeadDim;
+    constexpr int Groups = D / kKVCacheInt8Group;
+    constexpr unsigned FullMask = 0xffffffffu;
+    const int kv_head           = static_cast<int>(blockIdx.x);
+    const int lane              = static_cast<int>(threadIdx.x);
+    if (kv_head >= Geometry::KVHeads) return;
+    const int batch     = static_cast<int>(blockIdx.z);
+    const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    const std::int64_t column_base = column_begin + static_cast<std::int64_t>(batch) * full_width;
+    pos += column_base;
+    input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+    input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+    const int token = static_cast<int>(blockIdx.y);
+    if (valid_columns != nullptr && valid_columns[batch] <= column_begin + token) return;
+    const int position = pos[token];
+    if (position < 0 || position >= logical_capacity) return;
+
+    float k_values[8];
+    float v_values[8];
+#pragma unroll
+    for (int part = 0; part < 8; ++part) {
+        const int d                  = lane + 32 * part;
+        const std::int64_t source    = kv_cache_int8_new_index<Geometry>(kv_head, d, token);
+        k_values[part]               = __bfloat162float(input.k[source]);
+        v_values[part]               = __bfloat162float(input.v[source]);
+    }
+    normalized_hadamard_d256_inplace(k_values, lane);
+    int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    physical_page     = __shfl_sync(FullMask, physical_page, 0);
+    const int page_offset = position & kPagedKVPageMask;
+#pragma unroll
+    for (int grp = 0; grp < Groups; ++grp) {
+        float kamax = fmaxf(fabsf(k_values[2 * grp]), fabsf(k_values[2 * grp + 1]));
+        float vamax = fmaxf(fabsf(v_values[2 * grp]), fabsf(v_values[2 * grp + 1]));
+        kamax       = warp_max(kamax, FullMask);
+        vamax       = warp_max(vamax, FullMask);
+        const KVCacheInt8QuantParams kp = kv_cache_int8_quant_params(kamax);
+        const KVCacheInt8QuantParams vp = kv_cache_int8_quant_params(vamax);
+        const int d0                     = grp * kKVCacheInt8Group + lane;
+        const int d1                     = d0 + 32;
+        cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
+                                                            page_offset)] =
+            kv_cache_int8_quant_code(k_values[2 * grp], kp.inverse_scale);
+        cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
+                                                            page_offset)] =
+            kv_cache_int8_quant_code(k_values[2 * grp + 1], kp.inverse_scale);
+        cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
+                                                            page_offset)] =
+            kv_cache_int8_quant_code(v_values[2 * grp], vp.inverse_scale);
+        cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
+                                                            page_offset)] =
+            kv_cache_int8_quant_code(v_values[2 * grp + 1], vp.inverse_scale);
+        if (lane == 0) {
+            const std::int64_t so =
+                kv_cache_int8_quant_scale_index<Geometry>(physical_page, kv_head, grp, page_offset);
+            cache_k_scale[so] = kp.scale;
+            cache_v_scale[so] = vp.scale;
+        }
+    }
 }
 
 } // namespace ninfer::ops

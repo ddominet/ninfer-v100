@@ -33,6 +33,7 @@
 // exact for every finite E4M3 value including all 14 denormals, with only the two NaN encodings
 // mapping to +-480, which weights never contain.
 
+#include "ops/linear/volta_fp16_stage.h"
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
@@ -262,8 +263,16 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
         }
     } else if (t <= 2 * S::kRowsPerTile) {
         NINFER_FP8_QPN_LAUNCH(2, 8, 1);
-    } else {
+    } else if (t <= 3 * S::kRowsPerTile) {
+        NINFER_FP8_QPN_LAUNCH(3, 8, 1);
+    } else if (t <= 4 * S::kRowsPerTile) {
         NINFER_FP8_QPN_LAUNCH(4, 8, 1);
+    } else if (t <= 6 * S::kRowsPerTile) {
+        // Four K-split warps keep the SPLITK * kTiles * 1 KB reduce buffer inside the 48 KB
+        // static limit for the six- and eight-tile forms.
+        NINFER_FP8_QPN_LAUNCH(6, 4, 1);
+    } else {
+        NINFER_FP8_QPN_LAUNCH(8, 4, 1);
     }
 #undef NINFER_FP8_QPN_LAUNCH
     CUDA_CHECK(cudaGetLastError());
@@ -272,6 +281,13 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
 template <class OutputPolicy>
 void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPolicy output,
                                       std::int32_t n, cudaStream_t stream) {
+    {
+        // Every QPN width: the in-loop conversion costs more per extra row tile.
+        if (const half* x_fp16 = volta_stage_fp16_activation(x, stream)) {
+            launch_fp8_volta_qpn_typed(x, w, x_fp16, output, n, stream);
+            return;
+        }
+    }
     launch_fp8_volta_qpn_typed(x, w, static_cast<const __nv_bfloat16*>(x.data), output, n, stream);
 }
 

@@ -17,6 +17,10 @@
 
 #include <cstdint>
 
+#ifndef NINFER_CAUSAL_DIRECT_MIN_WINDOW
+#define NINFER_CAUSAL_DIRECT_MIN_WINDOW 2048
+#endif
+
 namespace ninfer::ops {
 
 inline constexpr int kCausalHeadDim = 256;
@@ -93,12 +97,42 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     return splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
 }
 
+// Windows above this run the tensor-core kernels of direct_i8_volta.cuh for T <= 8 on the INT8
+// cache; host split policy and launch stay in lockstep through causal_direct_splits.
+//
+// Keys per split (multiples of the 32-key tile), measured on a V100:
+//   one token (a single register-direct warp per CTA): 64 up to 4K keys, 128 up to 12K, then 256;
+//   more tokens (the staged multi-warp CTA, whose setup and partial output amortize over a
+//   longer split): 128 up to 3K, 256 up to 12K, then 512.
+// Past 176 splits (704 CTAs for four KV heads) extra CTAs only queue behind the resident ones, so
+// longer windows lengthen the splits instead (T=1 at 90K: 625 GB/s at 176 splits, 555 at 352).
+inline constexpr int kCausalDirectMinWindow = NINFER_CAUSAL_DIRECT_MIN_WINDOW;
+inline constexpr int kCausalDirectMaxTokens = 8;
+inline constexpr int kCausalDirectMaxSplits = 176;
+// Windows at which the keys-per-split tier, and so the split count, steps down.
+inline constexpr int kCausalDirectTierEnds[] = {3072, 4096, 12288};
+
+__host__ __device__ constexpr int causal_direct_splits(int window, int tokens) {
+    const int keys = tokens == 1 ? (window <= 4096 ? 64 : window <= 12288 ? 128 : 256)
+                                 : (window <= 3072 ? 128 : window <= 12288 ? 256 : 512);
+    const int splits = (window + keys - 1) / keys;
+    return splits < 4 ? 4 : (splits > kCausalDirectMaxSplits ? kCausalDirectMaxSplits : splits);
+}
+
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int causal_small_t_active_splits(int window, int launch_capacity,
                                                             int tokens) {
     if (window <= 0) { return launch_capacity; }
     int splits = 0;
     if constexpr (Int8) {
+        // Long-window GQA-6 decode, in lockstep with causal_small_t_split_count. Scale-2
+        // geometries stay on the host policy.
+        if constexpr (Geometry::SmallTSplitScale == 1) {
+            if (tokens <= kCausalDirectMaxTokens && window > kCausalDirectMinWindow) {
+                const int long_splits = causal_direct_splits(window, tokens);
+                return long_splits < launch_capacity ? long_splits : launch_capacity;
+            }
+        }
         if (tokens == 5 && window > 128 && window <= 512) {
             splits = div_up(window, 32 / Geometry::SmallTSplitScale);
         } else if (tokens >= 6 && window > 128 && window <= 160) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/linear/volta_qpn_width.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -14,8 +15,8 @@ void launch_fp8_vocabulary_a16_gemm(const Tensor& x, const Weight& weight, Tenso
                                     cudaStream_t stream);
 
 #ifdef NINFER_VOLTA_BUILD
-inline constexpr std::int32_t kFp8VoltaQpnRowsPerTile = 8;
-inline constexpr std::int32_t kFp8VoltaQpnMaxTokens   = 32;
+inline constexpr std::int32_t kFp8VoltaQpnRowsPerTile = kVoltaQpnRowsPerTile;
+inline constexpr std::int32_t kFp8VoltaQpnMaxTokens   = kVoltaQpnMaxTokens;
 void fp8_stage_bf16_activation_sm70(const Tensor& x, void* fp16_out, cudaStream_t stream);
 void launch_fp8_volta_qpn(const Tensor& x, const Weight& weight, Tensor& out,
                           cudaStream_t stream);

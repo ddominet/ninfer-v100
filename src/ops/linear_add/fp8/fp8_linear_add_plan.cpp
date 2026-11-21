@@ -1,3 +1,4 @@
+#include "ops/linear/volta_qpn_width.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/layout.h"
@@ -76,8 +77,17 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
 
 void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual,
                          WorkspaceArena& workspace, cudaStream_t stream) {
-    if (x.ne[1] <= 32) {
-        fp8_linear_add_qpn_launch(x, weight, residual, stream);
+    if (x.ne[1] < kVoltaCutlassMinT) {
+        for (std::int32_t begin = 0; begin < x.ne[1]; begin += kVoltaQpnMaxTokens) {
+            const std::int32_t active = std::min(kVoltaQpnMaxTokens, x.ne[1] - begin);
+            Tensor input(static_cast<std::uint8_t*>(x.data) +
+                             static_cast<std::int64_t>(begin) * weight.k * sizeof(std::uint16_t),
+                         DType::BF16, {weight.k, active});
+            Tensor output(static_cast<std::uint8_t*>(residual.data) +
+                              static_cast<std::int64_t>(begin) * weight.n * sizeof(std::uint16_t),
+                          DType::BF16, {weight.n, active});
+            fp8_linear_add_qpn_launch(input, weight, output, stream);
+        }
         return;
     }
     auto scope       = workspace.scope();
@@ -89,7 +99,7 @@ void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual
 std::size_t qpn_residual_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                          std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
-    if (tokens <= 32) { return 0; }
+    if (tokens < kVoltaCutlassMinT) { return 0; }
     (void)allocate_projected(layout, output_rows, tokens);
     const std::size_t linear_bytes =
         fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens);

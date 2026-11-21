@@ -69,7 +69,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--decode-share PCT] [--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -172,6 +172,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--decode-share") {
+            const int share =
+                parse_nonnegative_int(require_value("--decode-share"), "decode-share");
+            if (share > 90) { throw std::invalid_argument("--decode-share must be in [0,90]"); }
+            options.decode_share_percent = static_cast<std::uint32_t>(share);
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

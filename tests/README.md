@@ -1,8 +1,7 @@
 # Tests
 
 The retained tests protect current `.ninfer`, numerical operator, target, runtime-transaction,
-benchmark-report, and external protocol behavior. Repository verification principles are defined in
-[`../AGENTS.md`](../AGENTS.md); Op contract and CUDA implementation guidance is in
+benchmark-report, and external protocol behavior. Op contract and CUDA implementation guidance is in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
 ## Organization

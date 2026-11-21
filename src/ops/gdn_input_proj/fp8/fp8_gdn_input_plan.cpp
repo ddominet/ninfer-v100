@@ -14,7 +14,6 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kVoltaCutlassMinT = 33;
 
 enum class Fp8GdnInputRoute : std::uint8_t {
     A16,

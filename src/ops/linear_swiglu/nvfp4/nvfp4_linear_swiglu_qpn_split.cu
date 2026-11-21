@@ -1,8 +1,11 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_gemv_t1.cuh"
+#include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cuh"
 
+#include <cstdlib>
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -21,6 +24,10 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ input,
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) { output[i] = __float2half(__bfloat162float(input[i])); }
 }
+
+// nvfp4_prepack_gemv_t1 (shared via nvfp4_prepack_gemv_t1.cuh) matches fp32 QPN (SPLITK 8)
+// bit-exactly on the 17408x5120 gate half and runs at ~480 GB/s standalone / ~590 GB/s
+// in-situ (d8k nsys profile) versus ~387 GB/s for the fused A16 decode route.
 } // namespace
 
 bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept {
@@ -49,12 +56,45 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     up_weight.scales = static_cast<const std::uint8_t*>(weight.scales) +
                        static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512;
 
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
-        kIntermediate, inverse_weight_divisor, stream);
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, up_weight, x_fp16, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
-        kIntermediate, inverse_weight_divisor, stream);
+    // The SIMT GEMV splits K across CTAs and combines with atomicAdd, so its FP32 sums (and
+    // therefore greedy decode) are not reproducible run to run; the tensor-core route with a
+    // staged activation is deterministic. Opt-in for A/B (NINFER_NVFP4_SWIGLU_T1_GEMV=1); it
+    // indexes the load-time prepacked layout only.
+    static const bool t1_gemv = [] {
+        const char* value = std::getenv("NINFER_NVFP4_SWIGLU_T1_GEMV");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (t1_gemv && t == 1 && weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        const std::size_t scratch_bytes = static_cast<std::size_t>(kIntermediate) * sizeof(float);
+        cudaMemsetAsync(gate_scratch, 0, scratch_bytes, stream);
+        cudaMemsetAsync(up_scratch, 0, scratch_bytes, stream);
+        const dim3 grid(static_cast<unsigned>(kIntermediate / 32), 32);
+        auto launch_half = [&](const Weight& half_weight, float* scratch) {
+            nvfp4_prepack_gemv_t1<32><<<grid, 32, 0, stream>>>(
+                static_cast<const std::uint8_t*>(half_weight.qdata),
+                static_cast<const std::uint8_t*>(half_weight.scales), x_fp16, scratch,
+                kIntermediate, k, inverse_weight_divisor);
+        };
+        launch_half(gate_weight, gate_scratch);
+        launch_half(up_weight, up_scratch);
+    } else if (const VoltaGroupMajorHalf* staged =
+                   weight.layout == QuantLayout::VoltaQpnPrepacked
+                       ? volta_stage_fp16_group_major(x, stream)
+                       : nullptr) {
+        launch_nvfp4_volta_qpn_with_group_major_activation(
+            x, gate_weight, staged, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
+            kIntermediate, inverse_weight_divisor, stream);
+        launch_nvfp4_volta_qpn_with_group_major_activation(
+            x, up_weight, staged, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
+            kIntermediate, inverse_weight_divisor, stream);
+    } else {
+        launch_nvfp4_volta_qpn_with_fp16_activation(
+            x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
+            kIntermediate, inverse_weight_divisor, stream);
+        launch_nvfp4_volta_qpn_with_fp16_activation(
+            x, up_weight, x_fp16, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
+            kIntermediate, inverse_weight_divisor, stream);
+    }
 
     const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
     const int threads           = 256;

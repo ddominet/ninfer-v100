@@ -10,10 +10,12 @@
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16_volta.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta.cuh"
+#include "ops/linear/volta_fp16_stage.h"
 #endif
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
 
+#include <cstdlib>
 #include <cstdint>
 #include <algorithm>
 #include <stdexcept>
@@ -54,6 +56,11 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         if (storage == KvCacheStorage::Fp8E4M3Row256 && tokens == 1 && window > 8198) {
             return Geometry::SmallTMaximumSplits;
         }
+        // Same cutoff as causal_small_t_active_splits and the stream launch below.
+        if (storage == KvCacheStorage::Int8Group64 && tokens <= kCausalDirectMaxTokens &&
+            window > kCausalDirectMinWindow) {
+            return causal_direct_splits(window, tokens);
+        }
     }
     // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T>=6 profile keeps
@@ -91,8 +98,10 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
     include(envelope.max_visible_keys);
     // The policy is monotonic inside these finite segments and may drop when crossing a boundary.
     // Evaluating every segment end plus both interval ends gives the exact interval maximum.
-    constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390};
+    constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390,
+                                      static_cast<std::uint32_t>(kCausalDirectMinWindow)};
     for (const std::uint32_t end : ends) { include(end); }
+    for (const int end : kCausalDirectTierEnds) { include(static_cast<std::uint32_t>(end)); }
     return capacity;
 }
 
@@ -164,6 +173,61 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     // its include, which is why every INT8-group64 KV path (no-spec decode included) hit
     // cudaErrorLaunchFailure at this launch site.
     const dim3 volta_grid(Geometry::KVHeads, splits, invocation.batch_size);
+    // Envelopes above kCausalDirectMinWindow keys take the tensor-core decode kernels of
+    // direct_i8_volta.cuh; one stream per grid.z slice.
+    if constexpr (TokenTile <= kCausalDirectMaxTokens && Geometry::GroupSize == 6) {
+        if (implementation_window > kCausalDirectMinWindow) {
+            const auto* valid = invocation.valid_columns == nullptr
+                                    ? nullptr
+                                    : static_cast<const std::int32_t*>(invocation.valid_columns->data);
+            const auto* rows  = invocation.table_rows == nullptr
+                                    ? nullptr
+                                    : static_cast<const std::int32_t*>(invocation.table_rows->data);
+            if constexpr (CacheInput::writes_cache) {
+                causal_attention_qwen27_append_t1<Geometry, CacheInput>
+                    <<<dim3(Geometry::KVHeads, invocation.width, invocation.batch_size), 32, 0,
+                       stream>>>(
+                        input, static_cast<const std::int32_t*>(pos.data),
+                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::int8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data),
+                        static_cast<const std::int32_t*>(cache.block_tables.data), valid, rows,
+                        cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                        logical_capacity);
+            }
+            static const bool configured = [] {
+                causal_attention_direct_i8_configure<Geometry>();
+                return true;
+            }();
+            (void)configured;
+            // The rotated FP16 queries are shared by every CTA; without the scratch (first use
+            // inside a graph capture) the kernels rotate their own rows.
+            auto* prepared = static_cast<half*>(detail::volta_stream_scratch(
+                stream, causal_attention_direct_prepared_q_bytes(Geometry::QHeads, invocation.width,
+                                                                 invocation.batch_size)));
+            if (prepared != nullptr) {
+                causal_attention_direct_prepare_q<Geometry>(
+                    static_cast<const __nv_bfloat16*>(q.data), prepared, invocation.width,
+                    invocation.batch_size, invocation.full_width, invocation.column_begin, scale,
+                    stream);
+            }
+            causal_attention_direct_i8_launch<Geometry>(
+                volta_grid, static_cast<const __nv_bfloat16*>(q.data), prepared,
+                static_cast<const std::int32_t*>(pos.data),
+                static_cast<const std::int8_t*>(cache_k.data),
+                static_cast<const std::int8_t*>(cache_v.data),
+                static_cast<const __half*>(cache_k_scale.data),
+                static_cast<const __half*>(cache_v_scale.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data), valid, rows,
+                cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                invocation.column_begin, logical_capacity, scale,
+                static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+                static_cast<float*>(partial_l.data), stream);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     const auto launch_volta = [&]<int WarpsPerCta>() {
         causal_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, WarpsPerCta,
                                                             MultiBatch, Masked, CacheInput>

@@ -321,6 +321,11 @@ int run_fp8() {
     for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
+#else
+    // One width per QPN tile bucket above two rows, multi-pass widths, and the first CUTLASS width.
+    for (const std::int32_t tokens : {12, 20, 32, 40, 64, 65, 192, 193}) {
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::A16Only);
+    }
 #endif
     return failures;
 }

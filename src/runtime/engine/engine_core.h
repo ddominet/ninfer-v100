@@ -68,6 +68,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          decode_share_percent_(std::min<std::uint32_t>(options.decode_share_percent, 90)),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -1990,19 +1991,38 @@ private:
                     }
                     prefill_runnable = !slots_[*lane]->capture_pending;
                 }
+                if (membership.empty()) { decode_credit_ = std::chrono::nanoseconds{0}; }
+                const bool decode_owed = decode_share_percent_ != 0 && prefill_runnable &&
+                                         !membership.empty() &&
+                                         decode_credit_ > std::chrono::nanoseconds{0};
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                    !membership.empty(), prefill_runnable,
+                    decode_owed ? false : previous_unit_was_decode);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    const auto started = Clock::now();
                     run_prefill_step(cancelled_at_unit_start);
+                    if (decode_share_percent_ != 0) {
+                        // Bounded so a long prefill cannot bank unbounded decode priority.
+                        constexpr std::chrono::nanoseconds kMaxDecodeCredit = std::chrono::seconds(8);
+                        const auto spent = Clock::now() - started;
+                        decode_credit_   = std::min<std::chrono::nanoseconds>(
+                            kMaxDecodeCredit, decode_credit_ + spent * decode_share_percent_ /
+                                                                   (100 - decode_share_percent_));
+                    }
                     previous_unit_was_decode = false;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    const auto started = Clock::now();
                     run_decode_round(membership, cancelled_at_unit_start);
+                    if (decode_share_percent_ != 0) {
+                        decode_credit_ = std::max<std::chrono::nanoseconds>(
+                            std::chrono::nanoseconds{0}, decode_credit_ - (Clock::now() - started));
+                    }
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -2030,6 +2050,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const std::uint32_t decode_share_percent_;
+    std::chrono::nanoseconds decode_credit_{0};
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;

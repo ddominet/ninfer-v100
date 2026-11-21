@@ -1,0 +1,121 @@
+# NInfer on one Tesla V100: model volume, Deployment and Service.
+#
+#   kubectl create namespace ninfer
+#   kubectl -n ninfer apply -f deploy/kubernetes/ninfer.yaml
+#
+# The model file is expected at /models/qwen3_8_27b_nvfp4.ninfer on the claim below. Copy it there
+# once, for example with a temporary pod that mounts the claim and runs `hf download`.
+# One replica owns one GPU and one resident model; scale by adding Deployments, not replicas.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ninfer-models
+  labels:
+    app.kubernetes.io/name: ninfer
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ninfer
+  labels:
+    app.kubernetes.io/name: ninfer
+spec:
+  replicas: 1
+  # The GPU cannot hold two copies of the model, so the old pod must stop first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ninfer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ninfer
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: ninfer
+          image: ghcr.io/ddominet/ninfer-v100:latest
+          imagePullPolicy: Always
+          args:
+            - ninfer-serve
+            - /models/qwen3_8_27b_nvfp4.ninfer
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8080"
+            - --max-context
+            - "262144"
+            - --kv-capacity
+            - "262144"
+            - --kv-dtype
+            - "int8"
+            - --max-concurrency
+            - "8"
+            - --device-state-slots
+            - "0"
+            - --host-state-slots
+            - "16"
+            - --host-kv-mib
+            - "6144"
+            - --prefill-chunk
+            - "2048"
+            - --spec
+            - "mtp"
+            - --draft-tokens
+            - "3"
+            - --lm-head-draft
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "4"
+              memory: 24Gi
+            limits:
+              memory: 48Gi
+              nvidia.com/gpu: 1
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ninfer-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ninfer
+  labels:
+    app.kubernetes.io/name: ninfer
+spec:
+  selector:
+    app.kubernetes.io/name: ninfer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -1,10 +1,79 @@
-# NInfer
+# NInfer for Tesla V100 — performance rework
 
-> Up to 219 decode tok/s from Qwen 3.8 27B on a single V100.  With software NVFP4 on Volta.
+A from-scratch C++/CUDA inference engine for selected Qwen checkpoints, tuned for a single
+NVIDIA Tesla V100 (Volta, `sm_70`). It serves text, image, and video input through a local CLI or
+OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident
+model, 1–8 active requests.
 
-NInfer is a from-scratch C++/CUDA inference engine optimized for selected Qwen checkpoints on NVIDIA Tesla V100.
+This repository is a performance-focused fork of
+[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Measured through the real HTTP
+server on a V100-PCIe-32GB with Qwen3.8-27B NVFP4, it is faster than that port at every context
+length and concurrency tested:
 
-It supports text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident model, 1–8 active requests.
+| Workload | Upstream port | This fork | Gain |
+|---|---:|---:|---:|
+| Decode, 1K context, MTP K=3 | 78.8 tok/s | 92.2 tok/s | 1.17× |
+| Decode, 45K context, MTP K=3 | 60.8 tok/s | 79.1 tok/s | 1.30× |
+| Decode, 180K context, MTP K=3 | 35.6 tok/s | 64.8 tok/s | 1.82× |
+| Decode, 180K context, MTP off | 13.8 tok/s | 24.0 tok/s | 1.74× |
+| 8 concurrent streams, MTP K=3 | 183.9 tok/s | 285.8 tok/s | 1.55× |
+| 4 streams × 40K context, MTP K=3 | 94.0 tok/s | 154.6 tok/s | 1.64× |
+| Prefill, 55-token prompt | 146 tok/s | 363 tok/s | 2.49× |
+| Prefill, 180K-token prompt | 439 tok/s (410 s) | 607 tok/s (297 s) | 1.38× |
+
+It also starts at the full 262,144-token context with MTP enabled, which the upstream port cannot
+fit in 32 GB. Full tables, draft-acceptance rates, and the method are in
+[V100 performance rework](docs/v100-rework.md).
+
+## Credits
+
+This work stands on other people's engines and ideas:
+
+- **[Neroued/ninfer](https://github.com/Neroued/ninfer)** — the original NInfer engine, its
+  artifact format, serving stack, and the published model artifacts. Everything here is that
+  engine.
+- **[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100)** — the Tesla V100 port
+  this fork starts from: the `sm_70` build, software NVFP4 on Volta tensor cores, the
+  quadpair-split-N linear kernels, load-time weight prepacking, and the INT8 paged KV cache. The
+  rework below tunes that design; it does not replace it.
+- **[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny)** — inspiration for the Volta
+  QPN prepacking and fragment maps used by the port.
+- **[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)** — inspiration for
+  context-lookup MTP.
+
+## What changed from the upstream port
+
+Baseline is upstream `master` at `b37d0dd`. No model artifact, API, or output contract changed;
+every change is in the Volta execution path.
+
+**Decode attention**
+- New tensor-core attention kernels over the paged INT8 KV cache for rounds of 1–8 tokens: a
+  register-direct kernel for one token and a staged kernel that dequantises each key/value tile
+  once and shares it across all rows, instead of every row re-fetching it.
+- Queries are Hadamard-rotated once per round, not once per kernel block.
+- Split sizes follow context length and round width, with fewer, longer splits at long context.
+- The kernels handle several streams in one launch.
+
+**Linear layers**
+- The decode-width (QPN) kernels now cover rounds up to 64 rows; previously anything above 32
+  rows fell through to the prefill GEMM with a per-call weight dequantisation.
+- Activations are staged once per round as FP16 in the layout the kernels read, instead of being
+  converted inside the weight-streaming loop.
+- FP8 MLP layers process the full round in one pass.
+
+**Prefill**
+- A fused prefill attention kernel reads the paged INT8 cache directly, with no gather workspace.
+- Short prompts no longer pay the wide-prefill route: a 55-token prompt is 2.5× faster.
+- The NVFP4 MLP keeps gate and up in FP32 through SwiGLU on the wide route, matching the
+  reference more closely.
+- The Gated Delta Net recurrence is software-pipelined and reads pre-normalised inputs.
+
+**Engine and memory**
+- `--decode-share` interleaves decode rounds with long prefills by time share.
+- Gated Delta Net scratch moved into the planned workspace; the remaining activation staging uses
+  small fixed per-stream blocks instead of buffers that grow on demand.
+- 2,048-token prefill chunks and CUDA Graphs fit alongside a 262,144-token INT8 KV pool.
+- An FP8 GDN convolution workspace under-allocation that could abort under load is fixed.
 
 ## Models
 
@@ -20,82 +89,29 @@ Artifacts contain the exact model weights, tokenizer, chat template, and require
 
 ## Performance
 
-Qwen3.8-27B NVFP4 reaches **218.98 decode tok/s** at K=1, with 99.2% MTP draft acceptance.
-That result is on a V100-PCIe-32GB, not SXM. The equivalent SXM2 card is roughly 7% faster; decode is predominantly HBM-bound, so PCIe bandwidth and host performance have little effect.
+Numbers are from the HTTP server on a Tesla V100-PCIe-32GB, CUDA 12.8, Qwen3.8-27B NVFP4, INT8
+group-64 KV: one cold prompt, then 256 greedily decoded tokens, single run per cell.
 
-### Tesla V100: software NVFP4 and groupwise inference
+Single-stream decode, tok/s (upstream port → this fork):
 
-The Qwen3.8-27B NVFP4 short-context target round, retested after the width-6+ verify fix below,
-peaks at K=1 draft tokens: **219.0 decode tok/s** at 99.2% draft acceptance -- narrow windows win
-outright on this corpus; see the full K sweep below.
+| Context | MTP off | K=1 | K=3 | K=5 |
+|---|---|---|---|---|
+| 1K | 29.3 → 33.6 | 51.3 → 58.0 | 78.8 → 92.2 | 86.7 → 99.3 |
+| 12K | 26.5 → 32.8 | 47.5 → 57.3 | 73.0 → 88.9 | 78.0 → 105.5 |
+| 45K | 22.2 → 30.9 | 39.1 → 53.6 | 60.8 → 79.1 | 58.4 → 90.1 |
+| 90K | 18.8 → 27.8 | 33.4 → 50.2 | 52.8 → 72.3 | 50.7 → 83.1 |
+| 180K | 13.8 → 24.0 | – | 35.6 → 64.8 | – |
 
-The single-request sweep uses the public Engine benchmark on a Tesla V100-PCIe-32GB with CUDA
-12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with CUDA
-Graphs and the optimized proposal head. Each result uses one discarded warmup and three measured
-repetitions. On the DFlash window sweep in the V100 notes the preferred V100-SXM2-32GB ran about
-7% faster per round; this decode workload is HBM-bound, so the host and PCIe bus barely matter.
+Draft acceptance on this real-text workload is 89–94% at K=1, 72–81% at K=3, and 59–70% at K=5,
+for both builds. Decode throughput depends on it, so every MTP figure in
+[the full report](docs/v100-rework.md) is published with its acceptance rate.
 
-| Model profile | K | Prefill tok/s | Decode tok/s | Draft acceptance |
-|---|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` MTP | 4 | 1,085.0 | 54.54 | 66.5% |
-| Qwen3.6-27B `nvfp4` MTP | 5 | 223.8 | 55.22 | 54.4% |
-| Qwen3.8-27B `groupwise-int` MTP | 5 | 1,083.9 | 130.96 | 97.1% |
-| Qwen3.8-27B `nvfp4` MTP | 5 | 1,100.3 | 199.58 | 97.1% |
-| Qwen3.8-27B `groupwise-int` DFlash2 | 7 | 1,044.2 | 77.84 | 100% |
-| Qwen3.8-27B `nvfp4` DFlash2 | 7 | 1,059.0 | 126.32 | 100% |
-| Qwen3.6-35B-A3B `groupwise-int` DFlash | 4 | 686.2 | 139.58 | 90.9% |
+At short context a decode round is bound by memory bandwidth: each round reads all 19.1 GB of
+weights, and the large kernels already run at 700–865 GB/s of the card's roughly 880 GB/s. That is
+why the short-context gain is 13–20% while the long-context gain is 30–82%.
 
-
-Full Qwen3.8-27B `nvfp4` MTP draft-window sweep on this same corpus-continuation shape, now that
-the width-6+ fix removes the sm_70 cap at four:
-
-| K | Prefill tok/s | Decode tok/s | Draft acceptance |
-|---:|---:|---:|---:|
-| 1 | 1,102.5 | **218.98** | 99.2% |
-| 2 | 1,097.4 | 213.99 | 98.3% |
-| 3 | 1,094.9 | 209.24 | 97.5% |
-| 4 | 1,096.6 | 204.02 | 97.9% |
-| 5 | 1,100.3 | 199.58 | 97.1% |
-| 6 | 1,089.6 | 178.47 | 92.5% |
-| 7 | 1,087.2 | 180.74 | 93.3% |
-
-This corpus is a deterministic continuation with unusually high, near-ceiling acceptance at every
-K, so narrow windows win outright: round-verify cost dominates once there's little more accepted
-length to buy. Treat these as a synthetic-corpus ceiling, not a general-generation rate -- on real,
-less predictable text the practical production sweet spot is K=3 (see the long-context sweep
-elsewhere in this repo's history).
-
-Decode throughput depends strongly on draft acceptance -- see the MTP sweep above for how much.
-The sm_70 width-6+ target-verify regression is fixed (see below), so `--spec mtp` now accepts the
-same [1,7] window upstream does, no Volta-specific cap. `--spec dflash2` peaks at K=7 on this same
-corpus-continuation shape (a 3-10 sweep falls off on both sides); MTP still leads DFlash2 here at
-every K tried.
-
-The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
-(`--spec dflash2`). MTP remains the recommended Volta backend for general decoding. On a varied,
-non-repetitive corpus, DFlash2 K=7 narrowly beat the best MTP window at 2K and 32K context, while
-MTP led at 8K, 16K, and 150K. DFlash2 K=7 is its strongest static default; acceptance-driven
-window adaptation can favor K=3 on difficult continuations. See the full comparison in the
-[V100 port notes](docs/v100.md#varied-context-dflash2-sweep).
-
-MTP automatically extends verification up to fifteen draft tokens when the generated suffix
-exactly matches an earlier 16-token span and the learned proposal agrees with the lookup
-continuation. On a 172-token verbatim-copy prompt, Qwen3.8-27B NVFP4 produced the exact
-continuation at **201.0 tok/s**, averaging 12.91 output tokens per round. This is a
-context-reproduction fast path; ordinary generation continues to use the normal MTP window and
-the general decode results above.
-
-Context-lookup MTP was inspired by
-[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090).
-
-On Volta, NVFP4 is decoded and executed in software using tuned FP16 tensor-core and SIMT kernels.
-Dense MLP gate/up payloads are prepacked in place during model load for the QPN decode layout; the
-artifact on disk is unchanged and inference does not perform runtime weight repacking. The Volta
-QPN prepacking work was inspired by
-[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny).
-
-The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **125.9 tok/s** and 3.8
-mean output tokens per round over ten measured rounds after two warmups.
+The upstream port's own published figures, measured with the `ninfer_bench` tool on a synthetic
+high-acceptance corpus, remain in the [V100 port notes](docs/v100.md).
 
 ## Quick start
 
@@ -134,7 +150,7 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir models
 ```
 
-Start a long-running text/vision agent server with one active-request lane and Device/Host
+Start a long-running text/vision server with one active-request lane and Device/Host
 checkpoint retention:
 
 ```bash
@@ -228,34 +244,37 @@ and DFlash2 for Qwen3.8-27B.
 
 ## Docker
 
-Build the runtime image on a host with the NVIDIA Container Toolkit:
+The image builds for `sm_70` with CUDA 12.8. Pushes to `master` publish it to GitHub Container
+Registry through [`.github/workflows/image.yml`](.github/workflows/image.yml).
+
+Run with Docker Compose on a host with the NVIDIA Container Toolkit:
 
 ```bash
-docker build --tag ninfer:local .
+mkdir -p models
+hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
+docker compose up -d            # pulls the published image
+docker compose up -d --build    # or builds it locally
 ```
 
-Mount the downloaded model and run the same example server profile:
+[`docker-compose.yml`](docker-compose.yml) serves on port 8080 with a 262,144-token context, eight
+request lanes, INT8 KV, and MTP with three draft tokens. `NINFER_GPU`, `NINFER_PORT`,
+`NINFER_MODELS`, `NINFER_MAX_CONTEXT`, `NINFER_MAX_CONCURRENCY`, and `NINFER_DRAFT_TOKENS` override
+the defaults.
+
+## Kubernetes
+
+[`deploy/kubernetes/ninfer.yaml`](deploy/kubernetes/ninfer.yaml) defines a model volume claim, a
+one-replica Deployment that requests one `nvidia.com/gpu`, and a Service:
 
 ```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer \
-  --host 0.0.0.0 \
-  --max-context 240000 \
-  --kv-capacity auto \
-  --max-concurrency 1 \
-  --kv-dtype int8 \
-  --device-state-slots 1 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 4 \
-  --lm-head-draft \
-  --preserve-thinking \
-  --vision
+kubectl create namespace ninfer
+kubectl -n ninfer apply -f deploy/kubernetes/ninfer.yaml
 ```
+
+Place `qwen3_8_27b_nvfp4.ninfer` on the `ninfer-models` claim before the first start. The
+Deployment uses the `Recreate` strategy because one V100 cannot hold two copies of the model, and
+pulls `latest` on every restart, so `kubectl rollout restart deployment/ninfer` deploys the newest
+published image.
 
 ## Capabilities and limits
 
@@ -297,7 +316,8 @@ capacities remain fixed for the process lifetime.
 - [Documentation index](docs/README.md)
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
-- [V100 qualification and performance](docs/v100.md)
+- [V100 performance rework and benchmarks](docs/v100-rework.md)
+- [V100 port notes](docs/v100.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)

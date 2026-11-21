@@ -536,6 +536,18 @@ int run_fp8() {
 #endif
     failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
     failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
+#ifdef NINFER_VOLTA_BUILD
+    // Lookup MTP verifies 16 columns per lane. Three lanes cross the Volta
+    // materialized-projection boundary; execution must fit the public capacity query.
+    failures += run_fp8_oracle_case(parent, 16, 2, {16, 13},
+                                    ops::LinearPolicy::A16Only, 1831U);
+    failures += run_fp8_oracle_case(parent, 11, 3, {11, 9, 5},
+                                    ops::LinearPolicy::A16Only, 1841U);
+    failures += run_fp8_oracle_case(parent, 16, 3, {16, 13, 7},
+                                    ops::LinearPolicy::A16Only, 1851U);
+    failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
+                                    ops::LinearPolicy::A16Only, 1861U);
+#endif
 #ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_oracle_case(parent, 3, 2, {3, 1}, ops::LinearPolicy::AllowA8, 1801U);
     failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);

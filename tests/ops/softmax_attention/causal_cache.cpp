@@ -2307,6 +2307,30 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// Windows above 32768 keys take the sm_70 tensor-core decode kernels: register-direct for one
+// token, the staged multi-warp CTA for two to eight (two to six 8-row tiles). The bases leave the
+// last 32-key tile partial and put the new tokens on either side of a 64-token page boundary.
+int run_volta_long_window_cases() {
+    int failures = 0;
+    for (const int width : {1, 2, 3, 4, 5, 6, 8}) {
+        failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                                {width, 33001, static_cast<unsigned>(33001 + width),
+                                 2100u + static_cast<unsigned>(width)},
+                                MappingPattern::Fragmented);
+    }
+    for (const int width : {1, 4, 7}) {
+        failures += run_a3_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                                {width, 34557, static_cast<unsigned>(34557 + width),
+                                 2200u + static_cast<unsigned>(width)},
+                                MappingPattern::Identity);
+    }
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {5, 46013, 46018u, 2301u, false, true}, MappingPattern::Offset);
+    return failures;
+}
+#endif
+
 int run_fp8_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -2496,6 +2520,9 @@ int run_softmax_attention_causal_cache_tests() {
 #endif
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_fp8_cases();
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_volta_long_window_cases();
+#endif
     failures += run_batch_cases();
     failures += run_dflash2_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")

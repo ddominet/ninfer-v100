@@ -19,6 +19,7 @@
 #include "ninfer/ops/speculative_round.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -766,21 +767,40 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles =
+            // V100 serving keeps a 256K INT8 pool; the stock 2x*82MiB*C allowance does not fit.
+            // Size the reservation from the configured draft window plus one lookup family, and
+            // allow NINFER_GRAPH_ALLOWANCE_MIB to override the total when tuning on real hardware.
+            const auto draft_profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
+            const auto lookup_profiles =
                 mtp_graph_profiles(impl->capacity, qwen3_6::kMtpLookupMaximumDrafts);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) +
-                            2ULL * qwen3_6::kMtpLookupMaximumDrafts);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(2ULL * per_batch_allowance,
-                                                      impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            const auto class_bytes = [&](const std::vector<GraphExecutionProfile>& profiles,
+                                         std::uint32_t draft_span, const char* label) {
+                return graph_topology_allowance(
+                    profiles,
+                    [&](GraphExecutionProfile profile) {
+                        const std::uint64_t final_visible = std::min<std::uint64_t>(
+                            impl->capacity,
+                            static_cast<std::uint64_t>(profile.max) + 2ULL * draft_span);
+                        // Measured on V100 with lm-head MTP K1: long-context executables land
+                        // near 40-56 MiB; 48 MiB fits the 256K INT8 ledger with CUDA graphs enabled.
+                        return (final_visible <= 4096 ? 12ULL : 48ULL) * kMiB;
+                    },
+                    label);
+            };
+            const std::size_t per_batch = checked_add(
+                class_bytes(draft_profiles, impl->draft_window, "MTP draft graph allowance"),
+                class_bytes(lookup_profiles, qwen3_6::kMtpLookupMaximumDrafts,
+                            "MTP lookup graph allowance"),
+                "MTP draft+lookup graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch, impl->max_concurrency, "MTP exact-b graph allowance");
+            if (const char* env = std::getenv("NINFER_GRAPH_ALLOWANCE_MIB"); env != nullptr) {
+                const long mib = std::strtol(env, nullptr, 10);
+                if (mib > 0) {
+                    impl->graph_allowance_bytes =
+                        static_cast<std::size_t>(mib) * kMiB;
+                }
+            }
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =

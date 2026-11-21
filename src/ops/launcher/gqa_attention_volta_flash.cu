@@ -31,6 +31,8 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -456,6 +458,99 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
 
 // ---------------------------------------------------------------------------
 
+// NINFER_VOLTA_PAGED_FA: 0 = gather + llama.cpp flash, 1 (default) = fused paged INT8 kernel,
+// 2 = run both and log the output difference (debug only; synchronizes the stream).
+int volta_paged_prefill_mode() {
+    static const int mode = [] {
+        const char* env = std::getenv("NINFER_VOLTA_PAGED_FA");
+        return env != nullptr ? std::atoi(env) : 1;
+    }();
+    return mode;
+}
+
+__global__ void volta_flash_compare_kernel(const __nv_bfloat16* __restrict__ ref,
+                                           const __nv_bfloat16* __restrict__ candidate,
+                                           std::int64_t count, float* __restrict__ stats) {
+    float max_diff = 0.0f, max_ref = 0.0f, sum_diff = 0.0f, sum_ref = 0.0f;
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+        const float a = __bfloat162float(ref[i]);
+        const float d = fabsf(a - __bfloat162float(candidate[i]));
+        max_diff      = fmaxf(max_diff, d);
+        max_ref       = fmaxf(max_ref, fabsf(a));
+        sum_diff += d;
+        sum_ref += fabsf(a);
+    }
+    atomicMax(reinterpret_cast<unsigned*>(stats + 0), __float_as_uint(max_diff));
+    atomicMax(reinterpret_cast<unsigned*>(stats + 1), __float_as_uint(max_ref));
+    atomicAdd(stats + 2, sum_diff);
+    atomicAdd(stats + 3, sum_ref);
+}
+
+// FP32 ground truth for sampled rows of the INT8 route (debug only): one warp per (token, head).
+template <int QHeads, int KVHeads>
+__global__ void volta_flash_reference_i8_kernel(
+        const __nv_bfloat16* __restrict__ q, const std::int32_t* __restrict__ positions, int width,
+        int token_stride, const std::int8_t* __restrict__ k_pages,
+        const std::int8_t* __restrict__ v_pages, const half* __restrict__ k_scales,
+        const half* __restrict__ v_scales, const std::int32_t* __restrict__ block_tables,
+        const std::int32_t* __restrict__ table_rows, int logical_pages, float scale,
+        const __nv_bfloat16* __restrict__ old_out,
+        const __nv_bfloat16* __restrict__ new_out, float* __restrict__ stats) {
+    const int lane = threadIdx.x & 31;
+    const int unit = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int t    = (unit / QHeads) * token_stride;
+    const int qh   = unit % QHeads;
+    if (t >= width) { return; }
+    const int kvh = qh / (QHeads / KVHeads);
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    float qv[8];
+    for (int p = 0; p < 8; ++p) {
+        qv[p] = __bfloat162float(q[(static_cast<std::int64_t>(t) * QHeads + qh) * kHeadDim + lane + 32 * p]);
+    }
+    normalized_hadamard_d256_inplace(qv, lane);
+    float m = -INFINITY, l = 0.0f, acc[8] = {};
+    const int pos = positions[t];
+    for (int key = 0; key <= pos; ++key) {
+        float dot = 0.0f;
+        for (int p = 0; p < 8; ++p) {
+            const int d = lane + 32 * p;
+            const float ks =
+                __half2float(k_scales[paged_kv_element_offset<kKVCacheInt8Groups, KVHeads>(
+                    block_table, kvh, key, d / kKVCacheInt8Group)]);
+            dot += qv[p] * static_cast<float>(k_pages[paged_kv_element_offset<kHeadDim, KVHeads>(
+                               block_table, kvh, key, d)]) * ks;
+        }
+        for (int off = 16; off > 0; off >>= 1) { dot += __shfl_xor_sync(0xffffffffu, dot, off); }
+        const float s     = dot * scale;
+        const float m_new = fmaxf(m, s);
+        const float alpha = expf(m - m_new);
+        const float pr    = expf(s - m_new);
+        l                 = l * alpha + pr;
+        for (int p = 0; p < 8; ++p) {
+            const int d = lane + 32 * p;
+            const float vs =
+                __half2float(v_scales[paged_kv_element_offset<kKVCacheInt8Groups, KVHeads>(
+                    block_table, kvh, key, d / kKVCacheInt8Group)]);
+            acc[p] = acc[p] * alpha +
+                     pr * static_cast<float>(v_pages[paged_kv_element_offset<kHeadDim, KVHeads>(
+                              block_table, kvh, key, d)]) * vs;
+        }
+        m = m_new;
+    }
+    float e_old = 0.0f, e_new = 0.0f, mag = 0.0f;
+    for (int p = 0; p < 8; ++p) {
+        const std::int64_t idx = (static_cast<std::int64_t>(t) * QHeads + qh) * kHeadDim + lane + 32 * p;
+        const float ref        = acc[p] / l;
+        e_old += fabsf(__bfloat162float(old_out[idx]) - ref);
+        e_new += fabsf(__bfloat162float(new_out[idx]) - ref);
+        mag += fabsf(ref);
+    }
+    atomicAdd(stats + 0, e_old);
+    atomicAdd(stats + 1, e_new);
+    atomicAdd(stats + 2, mag);
+}
+
 template <typename Geometry>
 std::size_t meta_elements_impl(std::int32_t tokens) {
     using P                    = VoltaFlashParams<Geometry>;
@@ -504,6 +599,13 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
             static_cast<half*>(cache.v_pages.data), block_tables, logical_pages, width);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    const int paged_mode = volta_paged_prefill_mode();
+    if (cache.storage == KvCacheStorage::Int8Group64 && paged_mode == 1) {
+        causal_attention_volta_paged_i8_prefill_launch(q, positions, table_rows, scale, cache, out,
+                                                       stream);
+        return;
+    }
 
     // 2. Gather the visible key range paged -> contiguous FP16, once for every
     //    Q-block of this layer.
@@ -574,12 +676,51 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                 static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
             q_count);
     }
+
+    if (cache.storage == KvCacheStorage::Int8Group64 && paged_mode == 2) {
+        const std::int64_t count = static_cast<std::int64_t>(width) * kQHeads * kHeadDim;
+        void* candidate          = nullptr;
+        float* stats             = nullptr;
+        CUDA_CHECK(cudaMallocAsync(&candidate, count * sizeof(__nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&stats), 8 * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 8 * sizeof(float), stream));
+        Tensor candidate_out = out;
+        candidate_out.data   = candidate;
+        causal_attention_volta_paged_i8_prefill_launch(q, positions, table_rows, scale, cache,
+                                                       candidate_out, stream);
+        volta_flash_compare_kernel<<<160, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(out.data),
+            static_cast<const __nv_bfloat16*>(candidate), count, stats);
+        constexpr int kSampleStride = 61;
+        const int samples           = ((width + kSampleStride - 1) / kSampleStride) * kQHeads;
+        volta_flash_reference_i8_kernel<kQHeads, kKVHeads><<<(samples + 7) / 8, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), position_ptr, width, kSampleStride,
+            static_cast<const std::int8_t*>(cache.k_pages.data),
+            static_cast<const std::int8_t*>(cache.v_pages.data),
+            static_cast<const half*>(cache.k_scale_pages.data),
+            static_cast<const half*>(cache.v_scale_pages.data),
+            block_tables, rows, logical_pages, scale,
+            static_cast<const __nv_bfloat16*>(out.data),
+            static_cast<const __nv_bfloat16*>(candidate), stats + 4);
+        float host[8];
+        CUDA_CHECK(cudaMemcpyAsync(host, stats, sizeof(host), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::fprintf(stderr,
+                     "[volta-paged-fa] width=%d n_kv=%d max_diff=%.5f max_ref=%.4f "
+                     "mean_diff=%.6f mean_ref=%.5f fp32_rel_err old=%.5f new=%.5f\n",
+                     width, n_kv_total, host[0], host[1], host[2] / count, host[3] / count,
+                     host[4] / host[6], host[5] / host[6]);
+        CUDA_CHECK(cudaFreeAsync(candidate, stream));
+        CUDA_CHECK(cudaFreeAsync(stats, stream));
+    }
 }
 
 } // namespace
 
 // The two registered geometries differ only in tiling; both are instantiated so
 // the route can serve 27B (24q/4kv) and 35B-A3B (16q/2kv) from one launcher.
+bool causal_attention_volta_paged_prefill_enabled() { return volta_paged_prefill_mode() == 1; }
+
 std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
     if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_impl<CausalD256H24Kv4>(tokens); }
     if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_impl<CausalD256H16Kv2>(tokens); }

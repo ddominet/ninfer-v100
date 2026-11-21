@@ -158,6 +158,9 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Percent of execution time granted to active decode lanes while a prefill is runnable.
+    // Zero keeps strict one-prefill-chunk/one-decode-round alternation.
+    std::uint32_t decode_share_percent = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

@@ -1,3 +1,5 @@
+#include "ops/linear/volta_qpn_width.h"
+#include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
 #include "core/layout.h"
@@ -31,7 +33,13 @@ Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 }
 
 constexpr std::int32_t kOutputRows = Fp8MlpGateUpGeometry::kOutputRows / 2;
-constexpr std::int32_t kChunk      = kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
+#ifdef NINFER_VOLTA_BUILD
+// The split QPN route covers the whole decode width in one pass over each weight half; the SIMT
+// small-T limit would re-read 178 MB of weights once per four rows.
+constexpr std::int32_t kChunk = kFp8VoltaQpnMaxTokens;
+#else
+constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
+#endif
 
 #ifdef NINFER_VOLTA_BUILD
 struct Fp8QpnSplitWorkspace {
@@ -55,7 +63,6 @@ std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
     return layout.peak_bytes(1);
 }
 
-constexpr std::int32_t kVoltaCutlassMinT = 33;
 
 template <class Allocator>
 Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows,

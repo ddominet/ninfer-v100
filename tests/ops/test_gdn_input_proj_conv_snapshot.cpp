@@ -949,6 +949,13 @@ int run_fp8() {
 #endif
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
+#ifdef NINFER_VOLTA_BUILD
+    // The snapshot wrapper must include the nested wide-projection scratch,
+    // including when a single request crosses the 32/33-column route boundary.
+    failures += run_fp8_case(parent, 32, ops::LinearPolicy::A16Only, 33);
+    failures += run_fp8_case(parent, 33, ops::LinearPolicy::A16Only, 34);
+    failures += run_fp8_case(parent, 48, ops::LinearPolicy::A16Only, 49);
+#endif
 #ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
 

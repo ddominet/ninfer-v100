@@ -173,6 +173,7 @@ struct ChunkedWorkspace {
     Tensor normalized_q;
     Tensor normalized_k;
     DeviceSpan stage;
+    DeviceSpan recurrent_prepared;
 };
 
 template <class Allocator>
@@ -180,6 +181,17 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             std::int32_t value_heads, std::int32_t tokens,
                                             bool normalize_qk) {
     ChunkedWorkspace out;
+#ifdef NINFER_VOLTA_BUILD
+    // sm_70 runs the whole width through the recurrent kernel (see gated_delta_net below), so
+    // the chunked planes are never used; the recurrence's own prepass scratch is.
+    (void)normalize_qk;
+    if (const std::size_t bytes =
+            detail::gated_delta_net::recurrent_prepared_bytes(qk_heads, value_heads, tokens);
+        bytes > 0) {
+        out.recurrent_prepared = allocator.alloc_bytes(bytes, 256);
+    }
+    return out;
+#else
     const std::int32_t full =
         (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
     if (full == 0) { return out; }
@@ -192,6 +204,7 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
     out.stage =
         allocator.alloc_bytes(detail::gated_delta_net::chunked_workspace_bytes(value_heads, full));
     return out;
+#endif
 }
 
 } // namespace
@@ -301,7 +314,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         const Tensor& tail_in = (T_full > 0) ? ssm_state_out : ssm_state_in;
         detail::gated_delta_net::launch_recurrent_inout(q_tail, k_tail, v_tail, g_tail, beta_tail,
                                                         scale, recurrent_normalize, tail_in,
-                                                        ssm_state_out, out_tail, stream);
+                                                        ssm_state_out, out_tail,
+                                                        scratch.recurrent_prepared, stream);
     }
 }
 

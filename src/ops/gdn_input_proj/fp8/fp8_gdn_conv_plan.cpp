@@ -62,8 +62,11 @@ std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t material
         (void)allocate_fp8_a8_workspace(layout, maximum_columns, Fp8GdnInputGeometry::kInputRows);
 #ifdef NINFER_VOLTA_BUILD
     } else {
-        (void)layout.alloc_bytes(static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) *
-                                 materialized_columns * sizeof(std::uint16_t));
+        // The flattened projection changes from QPN to CUTLASS at kVoltaCutlassMinT columns.
+        // Include its projected output and dequantized weight scratch as well as
+        // activation staging; B*W, not W alone, selects that route.
+        (void)layout.alloc_bytes(fp8_gdn_input_workspace_capacity_bytes(
+            LinearPolicy::A16Only, materialized_columns, materialized_columns));
 #endif
     }
     return layout.peak_bytes(1);
@@ -76,8 +79,8 @@ std::size_t record_capacity(Fp8GdnConvPlan plan, std::int32_t aggregate_columns)
     }
 #ifdef NINFER_VOLTA_BUILD
     if (plan.schedule == Fp8GdnConvScheduleId::MaterializedA16) {
-        return static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) * aggregate_columns *
-               sizeof(std::uint16_t);
+        return fp8_gdn_input_workspace_capacity_bytes(
+            LinearPolicy::A16Only, aggregate_columns, aggregate_columns);
     }
 #endif
     return 0;

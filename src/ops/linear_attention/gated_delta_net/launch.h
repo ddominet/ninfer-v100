@@ -26,10 +26,15 @@ void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
                       Tensor& out, cudaStream_t stream);
 
+// FP32 scratch launch_recurrent_inout needs for this width: the sm_70 prepared recurrence keeps
+// normalized q and k, k.q and exp(g) there from 64 tokens up. Zero otherwise.
+std::size_t recurrent_prepared_bytes(std::int32_t qk_heads, std::int32_t value_heads,
+                                     std::int32_t tokens);
+
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                            cudaStream_t stream);
+                            DeviceSpan prepared, cudaStream_t stream);
 
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,

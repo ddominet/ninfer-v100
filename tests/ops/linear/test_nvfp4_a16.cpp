@@ -19,11 +19,17 @@ int run_nvfp4_a16() {
         Invocation{20, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{57, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
     constexpr std::array new_problem_invocations{
         Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{40, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
     int failures = 0;
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,

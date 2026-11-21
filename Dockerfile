@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
+# Tesla V100 (sm_70) build. CUDA 12.8 is the last toolkit that compiles for Volta.
+ARG CUDA_VERSION=12.8.1
+ARG UBUNTU_VERSION=24.04
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
+        ca-certificates \
         cmake \
+        git \
         libavcodec-dev \
         libavformat-dev \
         libavutil-dev \
@@ -13,6 +19,7 @@ RUN apt-get update \
         libswscale-dev \
         ninja-build \
         pkg-config \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -20,12 +27,13 @@ COPY . .
 
 RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
     && cmake --build /build --parallel --target ninfer ninfer-serve
 
-FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

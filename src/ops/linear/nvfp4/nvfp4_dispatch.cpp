@@ -56,7 +56,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
     // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
     // fault if a caller genuinely has none. See docs/v100.md.
-    if (workspace != nullptr && total_t > kNvfp4VoltaQpnMaxTokens &&
+    if (workspace != nullptr && total_t >= kVoltaCutlassMinT &&
         nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
         const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);
         if (need == 0 || workspace->capacity() - workspace->used() >= need) {
@@ -111,7 +111,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
     // so a caller sizing for the widest T this interval reaches has it available. A caller that
     // doesn't (the zero-workspace linear() overload) still works -- launch_a16 falls back to the
     // chunked route rather than fault.
-    if (policy == LinearPolicy::A16Only && max_tokens > kNvfp4VoltaQpnMaxTokens &&
+    if (policy == LinearPolicy::A16Only && max_tokens >= kVoltaCutlassMinT &&
         nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
         return nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
     }

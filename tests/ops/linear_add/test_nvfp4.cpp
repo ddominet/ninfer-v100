@@ -92,6 +92,14 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{12, ops::LinearPolicy::A16Only},
+        Invocation{23, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},
+        Invocation{40, ops::LinearPolicy::A16Only},
+        Invocation{64, ops::LinearPolicy::A16Only},
+        Invocation{65, ops::LinearPolicy::A16Only},
+        Invocation{192, ops::LinearPolicy::A16Only},
+        Invocation{193, ops::LinearPolicy::A16Only},
     };
 #else
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;

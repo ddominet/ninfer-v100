@@ -10,8 +10,18 @@
 
 namespace ninfer::ops::detail::gated_delta_net {
 
-inline constexpr int kDvPerWarp = 4;
-inline constexpr int kNumWarps  = 4;
+// Geometry is compile-time overridable for single-TU microbench sweeps;
+// production TUs never set the macros, so the ODR is stable. Finer value tiles trade redundant
+// per-warp normalize work for more resident chains, which matters at prefill width where the
+// serial delta-rule chain is latency-bound, not issue-bound.
+#ifndef NINFER_GDN_DV_PER_WARP
+#define NINFER_GDN_DV_PER_WARP 4
+#endif
+#ifndef NINFER_GDN_NUM_WARPS
+#define NINFER_GDN_NUM_WARPS 4
+#endif
+inline constexpr int kDvPerWarp = NINFER_GDN_DV_PER_WARP;
+inline constexpr int kNumWarps  = NINFER_GDN_NUM_WARPS;
 inline constexpr int kBlockDv   = kNumWarps * kDvPerWarp;
 inline constexpr int kQkPerLane = kStateDim / kWarpSize;
 
@@ -21,12 +31,19 @@ static_assert(kStateDim % kBlockDv == 0);
 
 __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const float* base,
                                              std::uint32_t dqk_base) {
-    store_vec(reg, load_vec<float4>(base + dqk_base));
+    // State tiles are touched once per decode step: stream through L2, keep L1 for q/k/v.
+    float4 v;
+    asm volatile("ld.global.cs.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(base + dqk_base));
+    store_vec(reg, v);
 }
 
 __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], float* base,
                                               std::uint32_t dqk_base) {
-    store_vec(base + dqk_base, load_vec<float4>(reg));
+    float4 v = load_vec<float4>(reg);
+    asm volatile("st.global.cs.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(base + dqk_base), "f"(v.x),
+                 "f"(v.y), "f"(v.z), "f"(v.w));
 }
 
 inline constexpr float kQkL2NormEps = 1.0e-6f;
@@ -96,11 +113,43 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
+// Batched-reduce switch: the per-token delta-rule step runs kDvPerWarp row reductions through
+// warp_sum; issuing their butterflies interleaved (mask outer, row inner) collapses kDvPerWarp
+// dependent 5-step chains into one, with identical per-value xor-butterfly order (bit-identical
+// sums). The serial chain, not issue throughput, is what paces the prefill recurrence.
+#ifndef NINFER_GDN_BATCH_REDUCE
+#define NINFER_GDN_BATCH_REDUCE 0
+#endif
+
 __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
                                                      const float (&key)[kQkPerLane], float v_local,
                                                      float g, float beta) {
     const float alpha = expf(g);
 
+#if NINFER_GDN_BATCH_REDUCE
+    float partial[kDvPerWarp];
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float p = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { p += state[r][c] * key[c]; }
+        partial[r] = p;
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            partial[r] += __shfl_xor_sync(kFullWarpMask, partial[r], offset, kWarpSize);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        const float v_r   = __shfl_sync(kFullWarpMask, v_local, r, kWarpSize);
+        const float delta = beta * (v_r - alpha * partial[r]);
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
+    }
+#else
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         float partial = 0.0f;
@@ -114,6 +163,7 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
     }
+#endif
 }
 
 template <bool Normalize>
@@ -124,6 +174,24 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     RawQkLane q = load_raw_qk_lane(query, dqk_base);
     normalize_qk_lane<Normalize>(q.value, lane);
 
+#if NINFER_GDN_BATCH_REDUCE
+    float partial[kDvPerWarp];
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float p = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { p += state[r][c] * q.value[c]; }
+        partial[r] = p;
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            partial[r] += __shfl_xor_sync(kFullWarpMask, partial[r], offset, kWarpSize);
+        }
+    }
+    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(partial[lane] * scale); }
+#else
     float attn_val = 0.0f;
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
@@ -134,6 +202,7 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
         if (lane == r) { attn_val = partial; }
     }
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+#endif
 }
 
 struct RecurrentCoordinates {
@@ -659,6 +728,292 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, width);
+    store_state_tile(state, access.state_write_base(coord), coord);
+}
+
+// Software-pipelined form of recurrent_bf16_direct_kernel for long widths: identical lane mapping
+// and arithmetic (bit-identical output), but each token's q/k/v/gate bits are loaded
+// kDirectPipelineDepth tokens ahead and only converted when consumed. The plain form loads the
+// gate and value at the top of each iteration and uses them immediately, so every token pays a
+// global-memory round trip on the state chain; that, not the shuffle reductions, is what makes it
+// ~2 us/token regardless of how many heads share the GPU.
+#ifndef NINFER_GDN_DIRECT_MIN_BLOCKS
+#define NINFER_GDN_DIRECT_MIN_BLOCKS 6
+#endif
+#ifndef NINFER_GDN_DIRECT_PIPELINE_DEPTH
+#define NINFER_GDN_DIRECT_PIPELINE_DEPTH 2
+#endif
+inline constexpr int kDirectPipelineDepth = NINFER_GDN_DIRECT_PIPELINE_DEPTH;
+
+struct DirectTokenBits {
+    Bf16x4Pack key;
+    Bf16x4Pack query;
+    __nv_bfloat16 value;
+    float g;
+    float beta;
+};
+
+__device__ __forceinline__ DirectTokenBits load_direct_token(const DirectAccess& access,
+                                                             const RecurrentCoordinates& coord,
+                                                             std::int32_t token) {
+    DirectTokenBits bits;
+    bits.key   = load_vec<Bf16x4Pack>(access.key_ptr(coord, token) + coord.dqk_base);
+    bits.query = load_vec<Bf16x4Pack>(access.query_ptr(coord, token) + coord.dqk_base);
+    bits.value = coord.lane < kDvPerWarp
+                     ? access.value_ptr(coord, token)[coord.dv_base + coord.lane]
+                     : __float2bfloat16(0.0f);
+    const std::int64_t gate =
+        static_cast<std::int64_t>(token) * access.heads.H_v + coord.value_head;
+    bits.g    = access.g[gate];
+    bits.beta = access.beta[gate];
+    return bits;
+}
+
+__device__ __forceinline__ void unpack_qk_lane(float (&out)[kQkPerLane], const Bf16x4Pack& bits) {
+    const float2 lo = bf16x2_to_float2(bits.pair[0]);
+    const float2 hi = bf16x2_to_float2(bits.pair[1]);
+    out[0]          = lo.x;
+    out[1]          = lo.y;
+    out[2]          = hi.x;
+    out[3]          = hi.y;
+}
+
+template <bool NormalizeInputs>
+__device__ __forceinline__ void consume_direct_token(float (&state)[kDvPerWarp][kQkPerLane],
+                                                     const DirectTokenBits& bits,
+                                                     const DirectAccess& access,
+                                                     const RecurrentCoordinates& coord,
+                                                     std::int32_t token) {
+    float key[kQkPerLane];
+    unpack_qk_lane(key, bits.key);
+    normalize_qk_lane<NormalizeInputs>(key, coord.lane);
+    const float value = coord.lane < kDvPerWarp ? __bfloat162float(bits.value) : 0.0f;
+    apply_gdn_transition(state, key, value, bits.g, bits.beta);
+
+    float query[kQkPerLane];
+    unpack_qk_lane(query, bits.query);
+    normalize_qk_lane<NormalizeInputs>(query, coord.lane);
+#if NINFER_GDN_BATCH_REDUCE
+    float partial[kDvPerWarp];
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float p = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { p += state[r][c] * query[c]; }
+        partial[r] = p;
+    }
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            partial[r] += __shfl_xor_sync(kFullWarpMask, partial[r], offset, kWarpSize);
+        }
+    }
+    if (coord.lane < kDvPerWarp) {
+        access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
+            __float2bfloat16(partial[coord.lane] * access.scale);
+    }
+#else
+    float attn_val = 0.0f;
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * query[c]; }
+        partial = warp_sum<kWarpSize>(partial);
+        if (coord.lane == r) { attn_val = partial; }
+    }
+    if (coord.lane < kDvPerWarp) {
+        access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
+            __float2bfloat16(attn_val * access.scale);
+    }
+#endif
+}
+
+template <bool NormalizeInputs>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, NINFER_GDN_DIRECT_MIN_BLOCKS)
+    recurrent_bf16_direct_pipelined_kernel(
+        const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+        const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
+        const float* __restrict__ beta, const float* __restrict__ state_read,
+        float* __restrict__ state_write, __nv_bfloat16* __restrict__ out, std::int32_t width,
+        head_map heads, float scale) {
+    const DirectAccess access{q, k, v, g, beta, state_read, state_write, out, heads, width, scale};
+    const RecurrentCoordinates coord = access.coordinates();
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state_tile(state, access.state_read_base(coord), coord);
+
+    DirectTokenBits ring[kDirectPipelineDepth];
+#pragma unroll
+    for (int i = 0; i < kDirectPipelineDepth; ++i) {
+        if (i < width) { ring[i] = load_direct_token(access, coord, i); }
+    }
+    for (std::int32_t base = 0; base < width; base += kDirectPipelineDepth) {
+#pragma unroll
+        for (int i = 0; i < kDirectPipelineDepth; ++i) {
+            const std::int32_t token = base + i;
+            if (token < width) {
+                const DirectTokenBits current = ring[i];
+                if (token + kDirectPipelineDepth < width) {
+                    ring[i] = load_direct_token(access, coord, token + kDirectPipelineDepth);
+                }
+                consume_direct_token<NormalizeInputs>(state, current, access, coord, token);
+            }
+        }
+    }
+    store_state_tile(state, access.state_write_base(coord), coord);
+}
+
+// ---- Prepared form of the direct recurrence for prefill widths --------------------------------
+// The direct kernels are bound by instruction count (384 CTAs x 4 warps, all resident, ~2 warp
+// instructions per SM cycle), and a fifth of that is every warp re-deriving values that depend
+// only on (token, head): the L2-normalized key and query, exp(g), and their bf16 unpacking. A
+// prepass computes those once; the recurrence then reads FP32 planes.
+//
+// It also takes both state contractions against the pre-update state, using
+//     M_t q = alpha (M_{t-1} q) + delta (k . q),
+// so the readout no longer waits on the state update and k . q comes from the prepass, and it
+// reduces the four rows of a warp with a transposed butterfly (6 shuffles for all four rows; lane
+// L ends holding row L & 3) instead of four separate 5-level butterflies. The summation order
+// differs from the direct kernels, so results agree to rounding, not bit for bit.
+template <bool Normalize>
+__global__ void recurrent_prepare_qk_kernel(const __nv_bfloat16* __restrict__ q,
+                                            const __nv_bfloat16* __restrict__ k,
+                                            float* __restrict__ qn, float* __restrict__ kn,
+                                            float* __restrict__ kq, std::int64_t units) {
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const std::int64_t unit = static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) +
+                              (static_cast<int>(threadIdx.x) >> 5);
+    if (unit >= units) { return; }
+    const std::int64_t base = unit * kStateDim + lane * kQkPerLane;
+    float key[kQkPerLane];
+    float query[kQkPerLane];
+    unpack_qk_lane(key, load_vec<Bf16x4Pack>(k + base));
+    normalize_qk_lane<Normalize>(key, lane);
+    unpack_qk_lane(query, load_vec<Bf16x4Pack>(q + base));
+    normalize_qk_lane<Normalize>(query, lane);
+    store_vec(kn + base, load_vec<float4>(key));
+    store_vec(qn + base, load_vec<float4>(query));
+    float dot = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kQkPerLane; ++c) { dot += key[c] * query[c]; }
+    dot = warp_reduce_sum(dot);
+    if (lane == 0) { kq[unit] = dot; }
+}
+
+__global__ void recurrent_prepare_gate_kernel(const float* __restrict__ g,
+                                              float* __restrict__ alpha, std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { alpha[i] = expf(g[i]); }
+}
+
+// Four values per lane -> lane L holds the warp total of value[L & 3].
+__device__ __forceinline__ float transposed_reduce4(const float (&value)[4], int lane) {
+    const bool b0    = (lane & 1) != 0;
+    const bool b1    = (lane & 2) != 0;
+    const float lo   = (b0 ? value[1] : value[0]) +
+                       __shfl_xor_sync(kFullWarpMask, b0 ? value[0] : value[1], 1, kWarpSize);
+    const float hi   = (b0 ? value[3] : value[2]) +
+                       __shfl_xor_sync(kFullWarpMask, b0 ? value[2] : value[3], 1, kWarpSize);
+    float total      = (b1 ? hi : lo) + __shfl_xor_sync(kFullWarpMask, b1 ? lo : hi, 2, kWarpSize);
+    total += __shfl_xor_sync(kFullWarpMask, total, 4, kWarpSize);
+    total += __shfl_xor_sync(kFullWarpMask, total, 8, kWarpSize);
+    total += __shfl_xor_sync(kFullWarpMask, total, 16, kWarpSize);
+    return total;
+}
+
+struct PreparedTokenBits {
+    float4 key;
+    float4 query;
+    float value;
+    float alpha;
+    float beta;
+    float kq;
+};
+
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, NINFER_GDN_DIRECT_MIN_BLOCKS)
+    recurrent_bf16_direct_prepared_kernel(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ kq,
+        const float* __restrict__ alpha, const __nv_bfloat16* __restrict__ v,
+        const float* __restrict__ beta, const float* __restrict__ state_read,
+        float* __restrict__ state_write, __nv_bfloat16* __restrict__ out, std::int32_t width,
+        head_map heads, float scale) {
+    static_assert(kDvPerWarp == 4 && kQkPerLane == 4);
+    const DirectAccess access{nullptr, nullptr, v,     nullptr, beta, state_read,
+                              state_write, out, heads, width,   scale};
+    const RecurrentCoordinates coord = access.coordinates();
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state_tile(state, access.state_read_base(coord), coord);
+
+    const auto load_token = [&](std::int32_t token) {
+        PreparedTokenBits bits;
+        const std::int64_t qk_unit = static_cast<std::int64_t>(token) * heads.H_qk + coord.qk_head;
+        const std::int64_t base    = qk_unit * kStateDim + coord.dqk_base;
+        bits.key                   = load_vec<float4>(kn + base);
+        bits.query                 = load_vec<float4>(qn + base);
+        bits.value = coord.lane < kDvPerWarp
+                         ? __bfloat162float(
+                               access.value_ptr(coord, token)[coord.dv_base + coord.lane])
+                         : 0.0f;
+        const std::int64_t gate = static_cast<std::int64_t>(token) * heads.H_v + coord.value_head;
+        bits.alpha              = alpha[gate];
+        bits.beta               = beta[gate];
+        bits.kq                 = kq[qk_unit];
+        return bits;
+    };
+    const auto consume_token = [&](const PreparedTokenBits& bits, std::int32_t token) {
+        const float key[4]   = {bits.key.x, bits.key.y, bits.key.z, bits.key.w};
+        const float query[4] = {bits.query.x, bits.query.y, bits.query.z, bits.query.w};
+        float pk[4];
+        float pq[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            float a = 0.0f;
+            float b = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                a = fmaf(state[r][c], key[c], a);
+                b = fmaf(state[r][c], query[c], b);
+            }
+            pk[r] = a;
+            pq[r] = b;
+        }
+        const float sk = transposed_reduce4(pk, coord.lane);
+        const float sq = transposed_reduce4(pq, coord.lane);
+        // Lanes 0..3 own rows 0..3 and their value element.
+        const float delta_own = bits.beta * (bits.value - bits.alpha * sk);
+        if (coord.lane < kDvPerWarp) {
+            access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
+                __float2bfloat16((bits.alpha * sq + delta_own * bits.kq) * access.scale);
+        }
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const float delta = __shfl_sync(kFullWarpMask, delta_own, r, kWarpSize);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                state[r][c] = fmaf(delta, key[c], bits.alpha * state[r][c]);
+            }
+        }
+    };
+
+    PreparedTokenBits ring[kDirectPipelineDepth];
+#pragma unroll
+    for (int i = 0; i < kDirectPipelineDepth; ++i) {
+        if (i < width) { ring[i] = load_token(i); }
+    }
+    for (std::int32_t base = 0; base < width; base += kDirectPipelineDepth) {
+#pragma unroll
+        for (int i = 0; i < kDirectPipelineDepth; ++i) {
+            const std::int32_t token = base + i;
+            if (token < width) {
+                const PreparedTokenBits current = ring[i];
+                if (token + kDirectPipelineDepth < width) {
+                    ring[i] = load_token(token + kDirectPipelineDepth);
+                }
+                consume_token(current, token);
+            }
+        }
+    }
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
