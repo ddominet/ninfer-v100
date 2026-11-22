@@ -11,9 +11,10 @@ comparison between the two. The port's own notes and published figures are in
 |---|---|
 | GPU | Tesla V100-PCIe-32GB, nothing else running on the card |
 | Toolkit | CUDA 12.8, `-DCMAKE_CUDA_ARCHITECTURES=70`, Release |
-| Model | Qwen3.8-27B NVFP4 (`qwen3_8_27b_nvfp4.ninfer`), INT8 group-64 KV |
+| Model | a Qwen3.8-27B artifact in the registered `qwen3.8-27b/nvfp4` format (not the published file), INT8 group-64 KV |
 | Route | `ninfer-serve` over HTTP, OpenAI Chat Completions, greedy sampling |
 | Single-stream test | one cold fixed prompt of the stated length, then 256 decoded tokens |
+| Prompt | a summarisation instruction followed by synthetic filler tokens; the decoded output is ordinary English |
 | Speculation | `--spec mtp --draft-tokens K --lm-head-draft`; "MTP off" omits `--spec` |
 | Repetitions | one run per cell |
 
@@ -29,15 +30,19 @@ The multi-stream rows use `--max-context 65536 --kv-capacity 196608 --device-sta
 
 Reading the results:
 
-- The context is 200,704 tokens, not 262,144, because the upstream build does not start at 262,144
-  with MTP enabled (it needs 12.93 GB of runtime memory against 12.56 GB available).
+- The context is 200,704 tokens, not 262,144. With these flags, `--kv-capacity 262144` and MTP
+  enabled, the upstream build stopped at startup reporting 12.93 GB of runtime memory needed
+  against 12.56 GB available.
+- The prompt body is synthetic filler, not natural text. Draft acceptance on natural-language
+  context may differ.
 - Each cell is a single run on one prompt. Prefill repeated across the six K settings stayed
   within about 3% (7% at 1K).
 - Draft acceptance moves a few points between runs because small rounding differences change the
   generated text. Tok/s at a given K carries that noise; time per round does not.
 - The upstream port publishes 219 tok/s at K=1 with 99.2% acceptance. That figure comes from the
-  `ninfer_bench` tool on a synthetic corpus and is described there as a ceiling. Through the
-  server on real text, the same build decodes 33–51 tok/s at K=1 with 89–94% acceptance.
+  `ninfer_bench` tool on a synthetic corpus and is described there as a ceiling. In this server
+  test the same build decodes 33–51 tok/s at K=1 with 89–94% acceptance. The two are different
+  workloads and tools; `ninfer_bench` was not run on this fork.
 
 ## Single-stream decode
 
@@ -134,23 +139,22 @@ Aggregate tokens per second across all streams, eight device state slots.
 | 2 streams × 45K context, K=3 | 92.5 | 127.4 | 1.38× |
 | 4 streams × 40K context, K=3 | 94.0 | 154.6 | 1.64× |
 | 4 streams, K=4 | 131.9 | 198.0 | 1.50× |
-| 8 streams, K=4 | request errors (HTTP 500) | 262.6 | – |
+| 8 streams, K=4 | no result (requests returned HTTP 500 in the one run) | 262.6 | – |
 
 ## Where the remaining time goes
 
-With MTP off at 1K context, kernels occupy 97% of the 30 ms round and the weight-reading kernels
-run at 700–865 GB/s, against a practical ceiling of about 880 GB/s on this card. Reading 19.1 GB at
-that ceiling takes 21.7 ms, so no engine can be more than about 27% faster than this one on that
-workload without changing the model artifact. That is why the short-context gain over the upstream
-port is 13–20% while the long-context and concurrent gains, where the port was far from the
-ceiling, are 30–82%.
+A kernel profile of this fork with MTP off at 1K context shows kernels occupying 97% of the round,
+with the large weight-reading kernels at 700–865 GB/s (bytes read divided by kernel time). Short
+context decode is therefore mostly bound by memory throughput, which is consistent with the gain
+over the upstream port being smaller at short context (13–20%) than at long context or under
+concurrency (30–82%).
 
-At K=3 the MTP draft layer accounts for about 4.9 ms of a 37.5 ms round and runs at 270–400 GB/s,
-because its W8 weights are read in checkpoint row order instead of a prepacked fragment order. It
-is the largest piece still off the ceiling.
+At K=3 the same profile attributes about 4.9 ms of a 37.5 ms round to the MTP draft layer, whose
+W8 kernels measure 270–400 GB/s in the linear Op benchmark. Its weights are read in checkpoint
+row order, not a prepacked fragment order.
 
-Draft windows of four and five tokens were faster than three for a single stream on this prompt,
-and three was faster at eight streams. Pick `--draft-tokens` from the expected concurrency.
+Draft windows of four and five tokens were faster than three for a single stream on this one
+prompt, and three was faster than four at eight streams.
 
 ## Changes
 
@@ -206,7 +210,7 @@ These environment variables select between routes at startup. Defaults are the m
 | `NINFER_VOLTA_PAGED_FA` | on | fused paged INT8 prefill attention |
 | `NINFER_GDN_PIPELINED` | on | software-pipelined GDN recurrence |
 | `NINFER_NVFP4_DOWN_T1_GEMV` | off | one-token NVFP4 GEMV route for the MLP down projection |
-| `NINFER_GRAPH_ALLOWANCE_MIB` | planner | memory reserved for CUDA Graphs |
+| `NINFER_GRAPH_ALLOWANCE_MIB` | computed | overrides the memory reserved for MTP CUDA Graphs |
 
 ## Qualification
 

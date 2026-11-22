@@ -7,8 +7,8 @@ model, 1–8 active requests.
 
 This repository is a performance-focused fork of
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Measured through the real HTTP
-server on a V100-PCIe-32GB with Qwen3.8-27B NVFP4, it is faster than that port at every context
-length and concurrency tested:
+server on a V100-PCIe-32GB with a Qwen3.8-27B NVFP4-format artifact, it was faster than that port
+at every context length and concurrency tested (single runs; see the method):
 
 | Workload | Upstream port | This fork | Gain |
 |---|---:|---:|---:|
@@ -21,8 +21,8 @@ length and concurrency tested:
 | Prefill, 55-token prompt | 146 tok/s | 363 tok/s | 2.49× |
 | Prefill, 180K-token prompt | 439 tok/s (410 s) | 607 tok/s (297 s) | 1.38× |
 
-It also starts at the full 262,144-token context with MTP enabled, which the upstream port cannot
-fit in 32 GB. Full tables, draft-acceptance rates, and the method are in
+With `--max-context 262144 --kv-capacity 262144` and MTP enabled this fork starts and serves on a
+32 GB card; the upstream build stopped at startup with the same flags. Full tables, draft-acceptance rates, and the method are in
 [V100 performance rework](docs/v100-rework.md).
 
 ## Credits
@@ -89,8 +89,9 @@ Artifacts contain the exact model weights, tokenizer, chat template, and require
 
 ## Performance
 
-Numbers are from the HTTP server on a Tesla V100-PCIe-32GB, CUDA 12.8, Qwen3.8-27B NVFP4, INT8
-group-64 KV: one cold prompt, then 256 greedily decoded tokens, single run per cell.
+Numbers are from the HTTP server on a Tesla V100-PCIe-32GB, CUDA 12.8, a Qwen3.8-27B
+NVFP4-format artifact, INT8 group-64 KV: one cold prompt (an instruction plus synthetic filler),
+then 256 greedily decoded tokens, single run per cell.
 
 Single-stream decode, tok/s (upstream port → this fork):
 
@@ -102,13 +103,12 @@ Single-stream decode, tok/s (upstream port → this fork):
 | 90K | 18.8 → 27.8 | 33.4 → 50.2 | 52.8 → 72.3 | 50.7 → 83.1 |
 | 180K | 13.8 → 24.0 | – | 35.6 → 64.8 | – |
 
-Draft acceptance on this real-text workload is 89–94% at K=1, 72–81% at K=3, and 59–70% at K=5,
-for both builds. Decode throughput depends on it, so every MTP figure in
+Draft acceptance in this test is 89–94% at K=1, 72–81% at K=3, and 59–70% at K=5, for both
+builds. Decode throughput depends on it, so every MTP figure in
 [the full report](docs/v100-rework.md) is published with its acceptance rate.
 
-At short context a decode round is bound by memory bandwidth: each round reads all 19.1 GB of
-weights, and the large kernels already run at 700–865 GB/s of the card's roughly 880 GB/s. That is
-why the short-context gain is 13–20% while the long-context gain is 30–82%.
+Short-context decode is mostly bound by memory throughput (the large weight kernels measure
+700–865 GB/s), so the gain there is 13–20%, against 30–82% at long context.
 
 The upstream port's own published figures, measured with the `ninfer_bench` tool on a synthetic
 high-acceptance corpus, remain in the [V100 port notes](docs/v100.md).
@@ -244,8 +244,9 @@ and DFlash2 for Qwen3.8-27B.
 
 ## Docker
 
-The image builds for `sm_70` with CUDA 12.8. Pushes to `master` publish it to GitHub Container
-Registry through [`.github/workflows/image.yml`](.github/workflows/image.yml).
+The image builds for `sm_70` with CUDA 12.8.
+[`.github/workflows/image.yml`](.github/workflows/image.yml) builds it on pushes to `master` and
+pushes it to GitHub Container Registry.
 
 Run with Docker Compose on a host with the NVIDIA Container Toolkit:
 
