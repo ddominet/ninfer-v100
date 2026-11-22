@@ -147,8 +147,15 @@ Download the artifact used by this example with the Hugging Face CLI:
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   qwen3_8_27b_nvfp4.ninfer \
+  --revision 11dbbbbbc33db198afe2f02c9232c771ff7031be \
   --local-dir models
 ```
+
+The revision matters. This engine reads the v2 artifact format; the file currently at the head of
+that Hugging Face repository is a later format and is rejected at startup with
+`artifact magic is not NInfer v2`. The pinned revision loads in this build
+(SHA-256 `552c374c685dce302603b95fbe940fb04243c0cd44c083efc644ad3d980d462c`).
+The other model links in the table above have not been checked against this build.
 
 Start a long-running text/vision server with one active-request lane and Device/Host
 checkpoint retention:
@@ -252,7 +259,8 @@ Run with Docker Compose on a host with the NVIDIA Container Toolkit:
 
 ```bash
 mkdir -p models
-hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
+hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer \
+  --revision 11dbbbbbc33db198afe2f02c9232c771ff7031be --local-dir models
 docker compose up -d            # pulls the published image
 docker compose up -d --build    # or builds it locally
 ```

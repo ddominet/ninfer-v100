@@ -1,7 +1,8 @@
 # Single-GPU NInfer server on a Tesla V100.
 #
 #   mkdir -p models
-#   hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer --local-dir models
+#   hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer \
+#     --revision 11dbbbbbc33db198afe2f02c9232c771ff7031be --local-dir models
 #   docker compose up -d
 #
 # Requires the NVIDIA Container Toolkit. Override any variable below in a .env file.

@@ -4,7 +4,8 @@
 #   kubectl -n ninfer apply -f deploy/kubernetes/ninfer.yaml
 #
 # The model file is expected at /models/qwen3_8_27b_nvfp4.ninfer on the claim below. Copy it there
-# once, for example with a temporary pod that mounts the claim and runs `hf download`.
+# once, for example with a temporary pod that mounts the claim and runs `hf download` with the
+# revision given in the README (the engine reads the v2 artifact format).
 # One replica owns one GPU and one resident model; scale by adding Deployments, not replicas.
 apiVersion: v1
 kind: PersistentVolumeClaim
