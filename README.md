@@ -6,24 +6,26 @@ OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one
 model, 1–8 active requests.
 
 This repository is a performance-focused fork of
-[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Measured through the real HTTP
-server on a V100-PCIe-32GB with a Qwen3.8-27B NVFP4-format artifact, it was faster than that port
-at every context length and concurrency tested (single runs; see the method):
+[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Both builds were measured
+through the HTTP server on one V100-PCIe-32GB with the published Qwen3.8-27B NVFP4 artifact and
+natural-text prompts (reference prose, fiction, source code). This fork was faster in every cell
+measured:
 
 | Workload | Upstream port | This fork | Gain |
 |---|---:|---:|---:|
-| Decode, 1K context, MTP K=3 | 78.8 tok/s | 92.2 tok/s | 1.17× |
-| Decode, 45K context, MTP K=3 | 60.8 tok/s | 79.1 tok/s | 1.30× |
-| Decode, 180K context, MTP K=3 | 35.6 tok/s | 64.8 tok/s | 1.82× |
-| Decode, 180K context, MTP off | 13.8 tok/s | 24.0 tok/s | 1.74× |
-| 8 concurrent streams, MTP K=3 | 183.9 tok/s | 285.8 tok/s | 1.55× |
-| 4 streams × 40K context, MTP K=3 | 94.0 tok/s | 154.6 tok/s | 1.64× |
-| Prefill, 55-token prompt | 146 tok/s | 363 tok/s | 2.49× |
-| Prefill, 180K-token prompt | 439 tok/s (410 s) | 607 tok/s (297 s) | 1.38× |
+| Decode, 1.1K-token prompt, MTP K=3 | 67.5 tok/s | 72.9 tok/s | 1.08× |
+| Decode, 24K-token prompt, MTP K=3 | 57.2 tok/s | 70.0 tok/s | 1.22× |
+| Decode, 89K-token prompt, MTP K=3 | 41.4 tok/s | 57.9 tok/s | 1.40× |
+| Decode, 172K-token prompt, MTP K=3 | 31.9 tok/s | 53.5 tok/s | 1.68× |
+| Decode, 172K-token prompt, MTP off | 14.1 tok/s | 24.2 tok/s | 1.72× |
+| 8 concurrent streams, MTP K=1 | 155.7 tok/s | 243.3 tok/s | 1.56× |
+| 8 concurrent streams, MTP K=3 | 129.6 tok/s | 211.8 tok/s | 1.63× |
+| Prefill, 52–66 token prompts | 154 tok/s | 339 tok/s | 2.21× |
+| Prefill, 172K-token prompt | 455 tok/s (380 s) | 625 tok/s (276 s) | 1.37× |
 
-With `--max-context 262144 --kv-capacity 262144` and MTP enabled this fork starts and serves on a
-32 GB card; the upstream build stopped at startup with the same flags. Full tables, draft-acceptance rates, and the method are in
-[V100 performance rework](docs/v100-rework.md).
+Decode rows are means over three to six requests; draft acceptance at K=3 was 53–60% on both
+builds. Full tables, per-request spread, acceptance rates, derived memory and arithmetic
+throughput, and the method are in [V100 performance rework](docs/v100-rework.md).
 
 ## Credits
 
@@ -72,7 +74,9 @@ every change is in the Volta execution path.
 - `--decode-share` interleaves decode rounds with long prefills by time share.
 - Gated Delta Net scratch moved into the planned workspace; the remaining activation staging uses
   small fixed per-stream blocks instead of buffers that grow on demand.
-- 2,048-token prefill chunks and CUDA Graphs fit alongside a 262,144-token INT8 KV pool.
+- 2,048-token prefill chunks and CUDA Graphs fit alongside a 262,144-token INT8 KV pool with MTP up
+  to K=5 and no device state slots; configurations that do not fit are refused at startup with the
+  byte counts.
 - An FP8 GDN convolution workspace under-allocation that could abort under load is fixed.
 
 ## Models
@@ -89,26 +93,49 @@ Artifacts contain the exact model weights, tokenizer, chat template, and require
 
 ## Performance
 
-Numbers are from the HTTP server on a Tesla V100-PCIe-32GB, CUDA 12.8, a Qwen3.8-27B
-NVFP4-format artifact, INT8 group-64 KV: one cold prompt (an instruction plus synthetic filler),
-then 256 greedily decoded tokens, single run per cell.
+Numbers are from the HTTP server on a Tesla V100-PCIe-32GB, CUDA 12.8, the published Qwen3.8-27B
+NVFP4 artifact at the revision pinned in the quick start, INT8 group-64 KV. Each request is a cold
+natural-text prompt of the stated size followed by 256 greedily decoded tokens; cells are means
+over six requests (three from 89K).
 
 Single-stream decode, tok/s (upstream port → this fork):
 
-| Context | MTP off | K=1 | K=3 | K=5 |
-|---|---|---|---|---|
-| 1K | 29.3 → 33.6 | 51.3 → 58.0 | 78.8 → 92.2 | 86.7 → 99.3 |
-| 12K | 26.5 → 32.8 | 47.5 → 57.3 | 73.0 → 88.9 | 78.0 → 105.5 |
-| 45K | 22.2 → 30.9 | 39.1 → 53.6 | 60.8 → 79.1 | 58.4 → 90.1 |
-| 90K | 18.8 → 27.8 | 33.4 → 50.2 | 52.8 → 72.3 | 50.7 → 83.1 |
-| 180K | 13.8 → 24.0 | – | 35.6 → 64.8 | – |
+| Prompt tokens | MTP off | K=1 | K=3 | K=4 |
+|---:|---|---|---|---|
+| 60 | 29.4 → 33.8 | 49.2 → 55.7 | 65.5 → 72.7 | 63.3 → 74.7 |
+| 1.1K | 29.2 → 33.6 | 49.1 → 55.5 | 67.5 → 72.9 | 69.1 → 80.7 |
+| 5.9K | 28.0 → 33.2 | 47.2 → 54.9 | 66.0 → 75.3 | 67.8 → 81.1 |
+| 24K | 24.3 → 32.1 | 41.8 → 53.9 | 57.2 → 70.0 | 56.8 → 75.7 |
+| 89K | 18.8 → 27.9 | 31.8 → 47.2 | 41.4 → 57.9 | 41.4 → 60.9 |
+| 172K | 14.1 → 24.2 | – | 31.9 → 53.5 | – |
 
-Draft acceptance in this test is 89–94% at K=1, 72–81% at K=3, and 59–70% at K=5, for both
-builds. Decode throughput depends on it, so every MTP figure in
+Time per decode round, ms (independent of draft acceptance):
+
+| Prompt tokens | MTP off | K=1 | K=3 | K=4 |
+|---:|---|---|---|---|
+| 60 | 34.0 → 29.6 | 36.9 → 32.6 | 41.3 → 37.1 | 45.4 → 39.0 |
+| 24K | 41.2 → 31.1 | 43.5 → 33.4 | 49.6 → 39.5 | 54.6 → 41.6 |
+| 89K | 53.1 → 35.9 | 58.0 → 38.4 | 65.4 → 45.8 | 71.4 → 48.4 |
+| 172K | 71.0 → 41.3 | – | 87.6 → 51.7 | – |
+
+Prefill, tok/s:
+
+| Prompt tokens | Upstream port | This fork | Gain |
+|---:|---:|---:|---:|
+| 60 | 154 | 339 | 2.21× |
+| 1,127 | 946 | 978 | 1.03× |
+| 5,935 | 1,072 | 1,163 | 1.08× |
+| 24,108 | 973 | 1,078 | 1.11× |
+| 88,515 | 665 | 822 | 1.24× |
+| 171,901 | 455 | 625 | 1.37× |
+
+Draft acceptance in this test is 78–83% at K=1, 53–60% at K=3 and 45–53% at K=4, about the same
+on both builds, and it varies with the text: at K=3 reference prose is accepted 59–74% of the
+time and fiction 36–55%. Decode throughput depends on it, so every MTP figure in
 [the full report](docs/v100-rework.md) is published with its acceptance rate.
 
-Short-context decode is mostly bound by memory throughput (the large weight kernels measure
-700–865 GB/s), so the gain there is 13–20%, against 30–82% at long context.
+The gain is smallest for short prompts on a single stream (8–20%) and largest at long context
+and under concurrency (40–72%).
 
 The upstream port's own published figures, measured with the `ninfer_bench` tool on a synthetic
 high-acceptance corpus, remain in the [V100 port notes](docs/v100.md).
@@ -225,6 +252,10 @@ for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP 
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
 ## Evaluation
+
+This section is about answer quality, not speed. The scores below are the original NInfer
+project's published results, carried over unchanged. They were not re-measured for the V100 port
+or for this fork, which changes kernels and scheduling but not the model artifacts.
 
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
