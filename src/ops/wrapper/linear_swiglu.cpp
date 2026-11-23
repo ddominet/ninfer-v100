@@ -91,8 +91,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
     }
 
+    // The DFlash2 draft's W8 gate|up weight may also carry the load-time QPN layout
+    // (w8_prepack_sm70.cu); the W8 plan reads it only through the QPN split kernels.
+    const bool w8_prepacked = large_shape && gate_up_weight.qtype == QType::W8G32_F16S &&
+                              gate_up_weight.layout == QuantLayout::VoltaQpnPrepacked;
     const bool common_row_split =
-        gate_up_weight.layout == QuantLayout::RowSplit &&
+        (gate_up_weight.layout == QuantLayout::RowSplit || w8_prepacked) &&
         gate_up_weight.scale_dtype == DType::FP16 && gate_up_weight.ndim == 2 &&
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&

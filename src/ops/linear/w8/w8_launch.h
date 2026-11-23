@@ -27,6 +27,10 @@ void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& weight,
                                           cudaStream_t stream);
 [[nodiscard]] bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
+// A weight permuted by w8_prepack_qpn_sm70 is read by the three QPN launchers above at 1-64
+// tokens, and by nothing else.
+[[nodiscard]] bool w8_volta_qpn_prepacked_supported(std::int32_t n, std::int32_t k,
+                                                    std::int32_t t) noexcept;
 // The DFlash2 draft's [6144, K] q|k|v projection, scattered into q [4096, T], k [1024, T] and
 // v [1024, T]; T <= 8.
 void launch_w8_volta_qpn_split3(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,

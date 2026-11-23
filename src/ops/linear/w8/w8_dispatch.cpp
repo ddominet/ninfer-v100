@@ -268,6 +268,14 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // A load-time prepacked weight is readable only by the QPN kernel; every table route below
+    // reads row-major.
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        launch_w8_volta_qpn(x, w, out, stream);
+        return;
+    }
+#endif
     const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }

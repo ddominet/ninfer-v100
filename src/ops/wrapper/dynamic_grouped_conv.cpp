@@ -59,7 +59,11 @@ std::uint64_t required_w8_payload_bytes(std::int32_t input_rows) {
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
     const std::uint64_t payload_bytes = required_w8_payload_bytes(input_rows);
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+    // RowSplit, or the load-time QPN layout (w8_prepack_sm70.cu), which the W8 plan reads only
+    // through the fused QPN kernel.
+    const bool layout_ok = weight.layout == QuantLayout::RowSplit ||
+                           weight.layout == QuantLayout::VoltaQpnPrepacked;
+    if (weight.qtype != QType::W8G32_F16S || !layout_ok ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
         weight.ndim != 2 || weight.n != kHidden || weight.k != input_rows ||
         weight.shape[0] != kHidden || weight.shape[1] != input_rows || weight.shape[2] != 1 ||

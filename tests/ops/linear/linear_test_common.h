@@ -40,6 +40,8 @@ struct ShapeCase {
     Comparison comparison;
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
+    // Permute a W8 weight to the load-time QPN layout before every invocation (Volta only).
+    bool prepack_w8 = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,

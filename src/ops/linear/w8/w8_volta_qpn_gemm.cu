@@ -3,6 +3,8 @@
 #include "ops/linear/w8/w8_volta_qpn_gemm.cuh"
 #include "ops/linear/volta_fp16_stage.h"
 
+#include <stdexcept>
+
 #include <cuda_bf16.h>
 
 namespace ninfer::ops::detail {
@@ -96,6 +98,66 @@ std::int32_t w8_qpn_padded_groups(const Weight& w) {
     return w.padded_shape[1] / W8RowSplitStorage::kGroupK;
 }
 
+// Prepacked weights (w8_prepack_sm70.cu): one kernel for 1-64 tokens, with 1, 2, 4 or 8 row tiles,
+// so a batch of requests reads the weight once. The activation is staged as FP16 whenever staging
+// is available; on the prepacked layout that measured 1.4-2.3x faster at eight tokens (gate/up
+// 17408 x 5120: 175 -> 121 us, down 5120 x 17408: 177 -> 123 us), close to the NVFP4 kernels'
+// 750+ GB/s. Eight K-split warps for one or two tiles, four beyond, which keeps the reduce buffer
+// inside 32 KB.
+template <W8QpnEpilogue E, int TILES, int SPLITK, class Activation>
+void w8_qpn_launch_packed_typed(const dim3& grid, const Activation* x, const std::uint8_t* codes,
+                                const std::uint8_t* scales, __nv_bfloat16* out, int n, int k,
+                                int t, int out_ld, const __nv_bfloat16* finish_delta,
+                                const __nv_bfloat16* base, __nv_bfloat16* residual, int width,
+                                cudaStream_t stream) {
+    w8_volta_qpn_gemm_kernel<TILES, 4, SPLITK, Activation, E, true>
+        <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, out, n, k, t, k / 32, out_ld,
+                                           finish_delta, base, residual, width);
+}
+
+template <W8QpnEpilogue E>
+void w8_qpn_launch_packed(const Tensor& x, const half* x_fp16, const std::uint8_t* codes,
+                          const std::uint8_t* scales, __nv_bfloat16* out, int n, int out_ld,
+                          cudaStream_t stream, const __nv_bfloat16* finish_delta = nullptr,
+                          const __nv_bfloat16* base = nullptr, __nv_bfloat16* residual = nullptr,
+                          int width = 0) {
+    const int k = x.ne[0];
+    const int t = x.ne[1];
+    const auto* x_bf16 = static_cast<const __nv_bfloat16*>(x.data);
+    const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
+#define NINFER_W8_PACKED(TILES, SPLITK)                                                          \
+    do {                                                                                         \
+        if (x_fp16 != nullptr) {                                                                 \
+            w8_qpn_launch_packed_typed<E, TILES, SPLITK>(grid, x_fp16, codes, scales, out, n, k, \
+                                                         t, out_ld, finish_delta, base,          \
+                                                         residual, width, stream);               \
+        } else {                                                                                 \
+            w8_qpn_launch_packed_typed<E, TILES, SPLITK>(grid, x_bf16, codes, scales, out, n, k, \
+                                                         t, out_ld, finish_delta, base,          \
+                                                         residual, width, stream);               \
+        }                                                                                        \
+    } while (false)
+    if (t <= 8) {
+        NINFER_W8_PACKED(1, 8);
+    } else if (t <= 16) {
+        NINFER_W8_PACKED(2, 8);
+    } else if (t <= 32) {
+        NINFER_W8_PACKED(4, 4);
+    } else {
+        NINFER_W8_PACKED(8, 4);
+    }
+#undef NINFER_W8_PACKED
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void require_w8_packed(const Weight& w, std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (!w8_volta_qpn_prepacked_supported(n, k, t)) {
+        throw std::invalid_argument(
+            "W8 QPN: a prepacked weight is readable only at 1-64 tokens with N % 32 == 0 and "
+            "K % 128 == 0");
+    }
+}
+
 } // namespace
 
 bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
@@ -113,11 +175,23 @@ bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noex
     return t <= S::kRowsPerTile;
 }
 
+bool w8_volta_qpn_prepacked_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    return n > 0 && n % 32 == 0 && k > 0 && k % 128 == 0 && t >= 1 && t <= 64;
+}
+
 void launch_w8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const std::int32_t n      = out.ne[0];
     const std::int32_t k      = x.ne[0];
     const std::int32_t t      = x.ne[1];
     const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        require_w8_packed(w, n, k, t);
+        w8_qpn_launch_packed<W8QpnEpilogue::Store>(
+            x, volta_stage_fp16_activation(x, stream), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), n,
+            out_ld, stream);
+        return;
+    }
     const W8QpnLaunch launch  = w8_qpn_launch_settings(n, k);
     w8_qpn_launch<W8QpnEpilogue::Store>(
         w8_qpn_activation(x, launch, stream), launch.splitk,
@@ -129,6 +203,10 @@ void launch_w8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStre
 void launch_w8_volta_qpn_split3(const Tensor& x, const Weight& w, Tensor& q, Tensor& k,
                                 Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kParentRows = 6144;
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        // The q|k|v parent is shared with the row-major context K/V views; it is never packed.
+        throw std::invalid_argument("W8 QPN split3: the q|k|v weight must stay row-major");
+    }
     const W8QpnLaunch launch = w8_qpn_launch_settings(kParentRows, x.ne[0]);
     w8_qpn_launch<W8QpnEpilogue::Split3>(
         w8_qpn_activation(x, launch, stream), launch.splitk,
@@ -141,6 +219,16 @@ void launch_w8_volta_qpn_split3(const Tensor& x, const Weight& w, Tensor& q, Ten
 void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& w, const Tensor& base,
                                           const Tensor& finish_delta, Tensor& residual,
                                           std::int32_t width, cudaStream_t stream) {
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        require_w8_packed(w, residual.ne[0], x.ne[0], x.ne[1]);
+        w8_qpn_launch_packed<W8QpnEpilogue::DynamicConvAdd>(
+            x, volta_stage_fp16_activation(x, stream), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), nullptr, residual.ne[0], 0, stream,
+            static_cast<const __nv_bfloat16*>(finish_delta.data),
+            static_cast<const __nv_bfloat16*>(base.data),
+            static_cast<__nv_bfloat16*>(residual.data), width);
+        return;
+    }
     const W8QpnLaunch launch = w8_qpn_launch_settings(residual.ne[0], x.ne[0]);
     w8_qpn_launch<W8QpnEpilogue::DynamicConvAdd>(
         w8_qpn_activation(x, launch, stream), launch.splitk,
@@ -168,6 +256,17 @@ void w8_linear_swiglu_volta_qpn_split_launch(const Tensor& x, const Weight& w, T
     const auto* up_scales = gate_scales + static_cast<std::int64_t>(kIntermediate) * row_scale_bytes;
     auto* output = static_cast<__nv_bfloat16*>(out.data);
 
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        // Packed tiles are 32 rows of whole K, so the up half starts kIntermediate rows in, at
+        // the same byte offsets as the row-major planes.
+        require_w8_packed(w, 2 * kIntermediate, k, t);
+        const half* x_fp16 = volta_stage_fp16_activation(x, stream);
+        w8_qpn_launch_packed<W8QpnEpilogue::Store>(x, x_fp16, gate_codes, gate_scales, output,
+                                                   kIntermediate, kIntermediate, stream);
+        w8_qpn_launch_packed<W8QpnEpilogue::SwiGluUp>(x, x_fp16, up_codes, up_scales, output,
+                                                      kIntermediate, kIntermediate, stream);
+        return;
+    }
     // One activation for both halves: the gate pass writes its projection, the up pass reads it
     // back in its epilogue and writes silu(gate) * up in place.
     const W8QpnLaunch launch = w8_qpn_launch_settings(kIntermediate, k);

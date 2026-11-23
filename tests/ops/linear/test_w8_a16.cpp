@@ -26,6 +26,23 @@ int feature_conformance() {
                      {5120, 25600, 293U, Comparison::Sampled, true, calls});
 }
 
+// DFlash2 draft output and down projections in the load-time QPN layout (w8_prepack_sm70.cu),
+// read only by the QPN kernel at 1-64 tokens.
+int w8_prepacked_conformance() {
+    std::vector<Invocation> calls;
+    for (int t = 1; t <= 64; ++t) calls.push_back(a16(t));
+    int failures = 0;
+    ShapeCase output{5120, 4096, 331U, Comparison::Sampled, true, calls};
+    output.prepack_w8 = true;
+    failures += run_shape("W8_A16_prepacked", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          output);
+    ShapeCase down{5120, 17408, 337U, Comparison::Sampled, true, calls};
+    down.prepack_w8 = true;
+    failures += run_shape("W8_A16_prepacked", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          down);
+    return failures;
+}
+
 int w8_a16_conformance() {
     int failures = 0;
 
@@ -155,6 +172,9 @@ int w8_a16_conformance() {
                           {2048, 16384, 283U, Comparison::Sampled, false, kN2048K16384});
 
     failures += feature_conformance();
+#ifdef NINFER_VOLTA_BUILD
+    failures += w8_prepacked_conformance();
+#endif
 
     return failures;
 }

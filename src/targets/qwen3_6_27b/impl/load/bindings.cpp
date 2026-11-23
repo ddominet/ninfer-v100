@@ -4,6 +4,7 @@
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#include "ops/linear/w8/w8_prepack_sm70.h"
 #endif
 
 #include <algorithm>
@@ -707,6 +708,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 materialized_weight(backing, layer_source.mlp_conv.kernel_projection, 1280, 5120);
             target.gate_up = materialized_weight(backing, layer_source.gate_up, 34816, 5120);
             target.down    = materialized_weight(backing, layer_source.down, 5120, 17408);
+#ifdef NINFER_VOLTA_BUILD
+            // The draft block's output, gate|up and down projections only ever run on the masked
+            // block (at most 64 columns), so they take the coalesced QPN layout. q|k|v stays
+            // row-major: its key and value rows are also the context K/V views read at prefill.
+            ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.attention_output);
+            ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.gate_up);
+            ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.down);
+#endif
         }
         dflash2.final_norm =
             artifact::materialized_tensor(backing, source.final_norm, NumericFormat::BF16, {5120});

@@ -3,6 +3,7 @@
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include "ops/linear/w8/w8_prepack_sm70.h"
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +60,13 @@ public:
     void prepack_fp8() {
         Weight weight = view();
         ops::detail::fp8_prepack_qpn_sm70(weight);
+        layout = weight.layout;
+        device.copy_to_host(expected_payload.data(), expected_payload.size());
+    }
+
+    void prepack_w8() {
+        Weight weight = view();
+        ops::detail::w8_prepack_qpn_sm70(weight);
         layout = weight.layout;
         device.copy_to_host(expected_payload.data(), expected_payload.size());
     }

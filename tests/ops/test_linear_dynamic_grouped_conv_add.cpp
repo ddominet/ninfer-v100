@@ -178,7 +178,7 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
                         std::vector<std::uint16_t>(expected.begin(), expected.end()));
 }
 
-int run_profile(std::int32_t input_rows) {
+int run_profile(std::int32_t input_rows, bool prepacked = false) {
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
     std::transform(activation.begin(), activation.end(), activation_bits.begin(), f32_to_bf16);
@@ -202,10 +202,15 @@ int run_profile(std::int32_t input_rows) {
         input_rows, 2, 16, 1, kMaximumBatch);
 
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
+#ifdef NINFER_VOLTA_BUILD
+    if (prepacked) { projection_weight.prepack_w8(); }
+#endif
     const Weight weight = projection_weight.view();
     int failures        = 0;
     for (int width = 2; width <= 16; ++width)
         for (int batch_size = 1; batch_size <= 8; ++batch_size) {
+            // The prepacked layout is read at up to 64 columns (the draft block's 8 x 8).
+            if (prepacked && width * batch_size > 64) { continue; }
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
@@ -252,7 +257,8 @@ int run_profile(std::int32_t input_rows) {
                 } else
                     launch(nullptr);
                 cuda_synchronize();
-                const std::string label = "dynamic conv add C=" + std::to_string(input_rows) +
+                const std::string label = std::string(prepacked ? "prepacked " : "") +
+                                          "dynamic conv add C=" + std::to_string(input_rows) +
                                           " W=" + std::to_string(width) +
                                           " B=" + std::to_string(batch_size) +
                                           " graph=" + std::to_string(replay);
@@ -285,7 +291,10 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        const int failures = run_profile(4096) + run_profile(17408);
+        int failures = run_profile(4096) + run_profile(17408);
+#ifdef NINFER_VOLTA_BUILD
+        failures += run_profile(4096, true) + run_profile(17408, true);
+#endif
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -21,6 +21,8 @@ struct Profile {
     std::int32_t output_rows;
     std::uint32_t seed;
     ActivationCompute activation_compute;
+    // Permute a W8 weight to the load-time QPN layout first (Volta only).
+    bool prepack_w8 = false;
 };
 
 int run_profile(std::string_view label, const Profile& profile,

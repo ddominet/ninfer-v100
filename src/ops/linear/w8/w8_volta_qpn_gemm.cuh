@@ -67,9 +67,17 @@ enum class W8QpnEpilogue { Store, DynamicConvAdd, SwiGluUp, Split3 };
 // two knobs as the FP8 sibling, for the same reason. Four warps a CTA leave too few lines in
 // flight on the narrow (5120-row) shapes, and converting BF16 activations in the weight loop costs
 // every lane 8 conversions per row tile per group once T > 1.
+//
+// `kPrepacked` reads codes and scales in the load-time fragment order of w8_prepack_sm70.cu:
+// codes [N/32 tile][K/128 block][8 sixteen-byte slices][lane], scales [N/32 tile][K/128 block]
+// [lane] x 4 FP16. Each lane still receives its own row's 128 adjacent K, but a warp's load is one
+// contiguous 512-byte (codes) or 256-byte (scales) run instead of 32 rows a row-stride apart.
 template <int kTiles, int kBlk, int SPLITK, class Activation,
-          W8QpnEpilogue kEpilogue = W8QpnEpilogue::Store>
-__global__ __launch_bounds__(SPLITK * 32, W8VoltaQpnSchedule::kResidentWarps / SPLITK)
+          W8QpnEpilogue kEpilogue = W8QpnEpilogue::Store, bool kPrepacked = false>
+__global__ __launch_bounds__(SPLITK * 32,
+                             (W8VoltaQpnSchedule::kResidentWarps / SPLITK / kTiles) > 0
+                                 ? W8VoltaQpnSchedule::kResidentWarps / SPLITK / kTiles
+                                 : 1)
 void w8_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const Activation* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
@@ -103,6 +111,9 @@ void w8_volta_qpn_gemm_kernel(
     const int g0     = warp * gq;
     const int gend   = (warp == SPLITK - 1) ? groups : g0 + gq;
 
+    static_assert(!kPrepacked || kBlk == 4, "prepacked blocks are four groups");
+    const std::int64_t packed_tile =
+        static_cast<std::int64_t>(blockIdx.x) * (k / (kBlk * kGroupK)) * 8 * 32;
     const std::uint8_t* crow =
         codes + static_cast<std::int64_t>(good ? col : 0) * padded_groups * kCodeB;
     const std::uint16_t* srow = reinterpret_cast<const std::uint16_t*>(
@@ -126,18 +137,33 @@ void w8_volta_qpn_gemm_kernel(
     for (int gb = g0; gb < gend; gb += kBlk) {
         const int blk  = min(kBlk, gend - gb);
         const int last = gend - 1;
+        if constexpr (kPrepacked) {
+            // k % 128 == 0 for this layout, so every block is whole.
+            const std::int64_t base = packed_tile + static_cast<std::int64_t>(gb / kBlk) * 8 * 32 + lane;
 #pragma unroll
-        for (int e = 0; e < kBlk; ++e) {
-            const int g           = min(gb + e, last);
-            const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * kCodeB;
-            cw[2 * e]             = __ldg(reinterpret_cast<const uint4*>(p));
-            cw[2 * e + 1]         = __ldg(reinterpret_cast<const uint4*>(p + 16));
+            for (int e = 0; e < 2 * kBlk; ++e) {
+                cw[e] = __ldg(reinterpret_cast<const uint4*>(codes) + base + e * 32);
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < kBlk; ++e) {
+                const int g           = min(gb + e, last);
+                const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * kCodeB;
+                cw[2 * e]             = __ldg(reinterpret_cast<const uint4*>(p));
+                cw[2 * e + 1]         = __ldg(reinterpret_cast<const uint4*>(p + 16));
+            }
         }
         // Scales blocked as well, and this matters more than it looks. One fp16 scale per 32 k
         // means the plane is 79 MB on this shape, and a 2-byte load per lane fetches a whole 32B
         // sector for it -- a 16x amplification that measured as 1.89 GB of DRAM read against a
         // 1.31 GB weight. Reading the block's kBlk scales as one vector cuts that to 4x.
-        if (blk == kBlk && (gb % kBlk) == 0) {
+        if constexpr (kPrepacked) {
+            const uint2 packed = __ldg(reinterpret_cast<const uint2*>(scales) +
+                                       packed_tile / 8 + (gb / kBlk) * 32 + lane);
+            const auto* sc = reinterpret_cast<const std::uint16_t*>(&packed);
+#pragma unroll
+            for (int e = 0; e < kBlk; ++e) { scv[e] = good ? sc[e] : static_cast<std::uint16_t>(0); }
+        } else if (blk == kBlk && (gb % kBlk) == 0) {
             const uint2 packed =
                 __ldg(reinterpret_cast<const uint2*>(srow + gb)); // kBlk == 4 fp16 scales
             const auto* sc = reinterpret_cast<const std::uint16_t*>(&packed);

@@ -180,6 +180,21 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("W8 LinearSwiGLU: plan does not match exact problem");
     }
+#ifdef NINFER_VOLTA_BUILD
+    // A load-time prepacked gate|up weight is read only by the QPN split kernels, at 1-64 tokens.
+    // The workspace reserved is the one the planner reports for the shape (the QPN band's 256
+    // bytes, the materialized buffer elsewhere), so the capacity contract is unchanged.
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        auto scope = ws.scope();
+        if (problem.cols >= 5 && problem.cols <= 8) {
+            (void)ws.alloc_bytes(256);
+        } else {
+            (void)allocate_materialized_workspace(ws, problem.gate_up_rows, problem.cols);
+        }
+        w8_linear_swiglu_volta_qpn_split_launch(x, w, out, stream);
+        return;
+    }
+#endif
     if (plan.schedule == W8LinearSwiGluScheduleId::Materialized) {
         auto scope = ws.scope();
         Tensor gate_up = allocate_materialized_workspace(ws, problem.gate_up_rows, problem.cols);

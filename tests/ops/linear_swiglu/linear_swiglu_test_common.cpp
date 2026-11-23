@@ -7,6 +7,7 @@
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include "ops/linear/w8/w8_prepack_sm70.h"
 
 #include <cuda_runtime.h>
 
@@ -295,6 +296,10 @@ int run_profile(std::string_view label, const Profile& profile,
 #ifdef NINFER_VOLTA_BUILD
     if (profile.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         ops::detail::fp8_prepack_qpn_sm70(weight);
+        device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
+    }
+    if (profile.prepack_w8 && profile.qtype == QType::W8G32_F16S) {
+        ops::detail::w8_prepack_qpn_sm70(weight);
         device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
     }
 #endif
