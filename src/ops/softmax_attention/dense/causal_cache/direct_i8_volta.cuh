@@ -484,9 +484,17 @@ constexpr int causal_attention_staged_i8_smem_bytes(int tiles) {
     return causal_attention_direct_i8_smem_bytes(tiles) + kDirectKeys * kStagedKeyStride * 2;
 }
 
+// Five and six row tiles (6-8 tokens) are bounded to two CTAs per SM. Unbounded, the compiler
+// spends 215-242 registers a thread, so only one 6-warp CTA is resident and the barrier-separated
+// phases have nothing to hide behind; at two CTAs (at most 170 registers, no spill) the 8-token
+// kernel measured 11-28% faster from 8K to 172K keys (305 -> 220 us at 24K, 829 -> 674 at 90K).
+// Two CTAs of the six-tile form use 92 KB of shared memory, inside the 96 KB carve-out.
+template <int Warps>
+inline constexpr int kStagedMinBlocks = Warps >= 5 ? 2 : 1;
+
 #define __syncthreads() __syncthreads()
 template <typename Geometry, int Warps>
-__global__ void __launch_bounds__(Warps * 32) causal_attention_staged_i8_kernel(
+__global__ void __launch_bounds__(Warps * 32, kStagedMinBlocks<Warps>) causal_attention_staged_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const half* __restrict__ q_prepared,
     const std::int32_t* __restrict__ pos, const std::int8_t* __restrict__ k_pages,
     const std::int8_t* __restrict__ v_pages,
@@ -718,7 +726,11 @@ void causal_attention_direct_i8_configure() {
 #define NINFER_STAGED_CONFIGURE(TILES)                                                           \
     CUDA_CHECK(cudaFuncSetAttribute(causal_attention_staged_i8_kernel<Geometry, TILES>,          \
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,                 \
-                                    causal_attention_staged_i8_smem_bytes(TILES)));
+                                    causal_attention_staged_i8_smem_bytes(TILES)));              \
+    if (kStagedMinBlocks<TILES> > 1) {                                                           \
+        CUDA_CHECK(cudaFuncSetAttribute(causal_attention_staged_i8_kernel<Geometry, TILES>,      \
+                                        cudaFuncAttributePreferredSharedMemoryCarveout, 100));   \
+    }
     NINFER_STAGED_CONFIGURE(2) NINFER_STAGED_CONFIGURE(3) NINFER_STAGED_CONFIGURE(4)
     NINFER_STAGED_CONFIGURE(5) NINFER_STAGED_CONFIGURE(6)
 #undef NINFER_STAGED_CONFIGURE

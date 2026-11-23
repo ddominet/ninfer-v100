@@ -112,11 +112,17 @@ inline constexpr int kCausalDirectMaxSplits = 176;
 // Windows at which the keys-per-split tier, and so the split count, steps down.
 inline constexpr int kCausalDirectTierEnds[] = {3072, 4096, 12288};
 
+// Six to eight tokens run the staged kernel at two CTAs per SM (direct_i8_volta.cuh); past 120
+// splits its extra CTAs cost more in partial writes and reduction than they add in parallelism
+// (8 tokens: 90K keys 788 -> 678 us, 172K 1311 -> 1033 us against the 176 cap).
+inline constexpr int kCausalDirectWideMaxSplits = 120;
+
 __host__ __device__ constexpr int causal_direct_splits(int window, int tokens) {
     const int keys = tokens == 1 ? (window <= 4096 ? 64 : window <= 12288 ? 128 : 256)
                                  : (window <= 3072 ? 128 : window <= 12288 ? 256 : 512);
+    const int cap    = tokens >= 6 ? kCausalDirectWideMaxSplits : kCausalDirectMaxSplits;
     const int splits = (window + keys - 1) / keys;
-    return splits < 4 ? 4 : (splits > kCausalDirectMaxSplits ? kCausalDirectMaxSplits : splits);
+    return splits < 4 ? 4 : (splits > cap ? cap : splits);
 }
 
 template <typename Geometry, bool Int8>
