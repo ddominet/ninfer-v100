@@ -1,13 +1,16 @@
 // DFlash2 draft QKV projection — sm_70.
 //
 // W8G32 RowSplit [6144, 5120] -> q [4096, T], k [1024, T], v [1024, T], written directly with the
-// three-way split output policy. Runs the fork's proven warp-per-row Volta SIMT GEMM; the split
-// points 4096 and 5120 are multiples of the 8-row CTA tile.
+// three-way split output. Each slice of up to eight tokens runs the W8 quadpair tensor-core kernel
+// on FP16-staged activations (w8_volta_qpn_gemm.cuh); the warp-per-row SIMT GEMM, which read this
+// shape at about 160 GB/s, remains for a K the tensor-core kernel does not take. The split points
+// 4096 and 5120 are multiples of both kernels' row tiles.
 
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 
 #include "core/device.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/w8/w8_launch.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_simt.cuh"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
@@ -52,6 +55,13 @@ void w8_dflash2_attn_input_volta_launch(const Tensor& x, const Weight& weight, T
     const std::int32_t padded_k = weight.padded_shape[1];
 
     for_each_token_slice(x.ne[1], kColsPerWarp, [&](std::int32_t offset, std::int32_t count) {
+        if (w8_volta_qpn_supported(kParentRows, kk, count)) {
+            Tensor qs = q.slice(1, offset, count);
+            Tensor ks = k.slice(1, offset, count);
+            Tensor vs = v.slice(1, offset, count);
+            launch_w8_volta_qpn_split3(x.slice(1, offset, count), weight, qs, ks, vs, stream);
+            return;
+        }
         const auto* xslice = xp + static_cast<std::int64_t>(offset) * kk;
         Split slice{output.out0 + static_cast<std::int64_t>(offset) * kQueryRows,
                     output.out1 + static_cast<std::int64_t>(offset) * kKvRows,

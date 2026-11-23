@@ -27,6 +27,10 @@ void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& weight,
                                           cudaStream_t stream);
 [[nodiscard]] bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
+// The DFlash2 draft's [6144, K] q|k|v projection, scattered into q [4096, T], k [1024, T] and
+// v [1024, T]; T <= 8.
+void launch_w8_volta_qpn_split3(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                                Tensor& v, cudaStream_t stream);
 #endif
 
 void launch_w8_decode_r4(const Tensor&, const Weight&, Tensor&, cudaStream_t);

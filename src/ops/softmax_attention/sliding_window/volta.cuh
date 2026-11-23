@@ -41,8 +41,17 @@ sliding_window_attention_volta_octet_partial_kernel(
     constexpr float Log2E           = 1.4426950408889634074f;
     constexpr unsigned FullMask     = 0xffffffffu;
 
-    __shared__ float key_s[D];
-    __shared__ float value_s[D];
+    // Context keys are consumed 32 at a time: the CTA stages one KeyBlock of K and V (widened to
+    // FP32, rows padded to an odd stride so lane j reading row j is conflict-free) behind one
+    // barrier, each warp scores its token against all 32 keys with one key per lane, updates its
+    // running softmax once per block and accumulates P.V four dimensions per lane. The previous
+    // form took one key per iteration behind two CTA barriers and a five-step shuffle reduction,
+    // which held this ~40 MB per layer read near 35 GB/s.
+    constexpr int RowStride = D + 1;
+    __shared__ float key_s[KeyBlock * RowStride];
+    __shared__ float value_s[KeyBlock * RowStride];
+    __shared__ float query_s[Tokens * D];
+    __shared__ float prob_s[Tokens * KeyBlock];
 
     const int q_head = static_cast<int>(blockIdx.x);
     const int split  = static_cast<int>(blockIdx.y);
@@ -96,40 +105,88 @@ sliding_window_attention_volta_octet_partial_kernel(
 
     const std::int64_t lane_base =
         static_cast<std::int64_t>(lanes[batch]) * D * padded_context * kContextQueryKVHeads;
-    for (int key = key_begin; key < key_end; ++key) {
-        if (tid < D) {
-            const int slot = key & (Window - 1);
-            const std::int64_t index = lane_base + tid + static_cast<std::int64_t>(D) *
-                                                               (slot + padded_context * kv_head);
-            key_s[tid]   = __bfloat162float(context_k[index]);
-            value_s[tid] = __half2float(context_v[index]);
+
+    // This warp's query row, shared by its 32 lanes during scoring.
+    for (int d = lane; d < D; d += 32) {
+        query_s[token * D + d] =
+            live ? __bfloat162float(q[context_query_q_index(q_head, d, token)]) : 0.0f;
+    }
+
+    float* prob_w = prob_s + token * KeyBlock;
+    for (int block_key = key_begin; block_key < key_end; block_key += KeyBlock) {
+        const int count = min(KeyBlock, key_end - block_key);
+        // 32 keys x 128 dims of K and V: one 16-byte load (8 elements) per thread and plane per
+        // step, keys in cyclic-slot order so a block may wrap the 2048-slot ring.
+        constexpr int ChunksPerKey = D / 8;
+        for (int c = tid; c < KeyBlock * ChunksPerKey; c += kSlidingWindowVoltaOctetThreads) {
+            const int j     = c / ChunksPerKey;
+            const int piece = c % ChunksPerKey;
+            float* krow = key_s + j * RowStride + piece * 8;
+            float* vrow = value_s + j * RowStride + piece * 8;
+            if (j < count) {
+                const int slot = (block_key + j) & (Window - 1);
+                const std::int64_t index =
+                    lane_base + static_cast<std::int64_t>(D) * (slot + padded_context * kv_head) +
+                    piece * 8;
+                const uint4 kraw = *reinterpret_cast<const uint4*>(context_k + index);
+                const uint4 vraw = *reinterpret_cast<const uint4*>(context_v + index);
+                const auto* kb   = reinterpret_cast<const __nv_bfloat16*>(&kraw);
+                const auto* vh   = reinterpret_cast<const __half*>(&vraw);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    krow[e] = __bfloat162float(kb[e]);
+                    vrow[e] = __half2float(vh[e]);
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    krow[e] = 0.0f;
+                    vrow[e] = 0.0f;
+                }
+            }
         }
         __syncthreads();
 
+        // Lane j scores key block_key + j.
+        const float* qrow = query_s + token * D;
+        const float* krow = key_s + lane * RowStride;
         float dot = 0.0f;
+#pragma unroll 16
+        for (int d = 0; d < D; ++d) { dot += qrow[d] * krow[d]; }
+        const int key       = block_key + lane;
+        const bool allowed  = live && lane < count && abs(key - query_position) < Window;
+        const float score   = allowed ? dot * scale : -CUDART_INF_F;
+        float block_m = score;
 #pragma unroll
-        for (int item = 0; item < 4; ++item) {
-            const int d = lane + item * 32;
-            dot += q_frag[item] * key_s[d];
+        for (int off = 16; off > 0; off >>= 1) {
+            block_m = fmaxf(block_m, __shfl_xor_sync(FullMask, block_m, off));
         }
-        dot = warp_sum<32>(dot, FullMask);
-        dot = __shfl_sync(FullMask, dot, 0);
-        const bool allowed = live && abs(key - query_position) < Window;
-        const float score  = allowed ? dot * scale : -CUDART_INF_F;
-        const float next_m = fmaxf(row_m, score);
-        const float alpha  = row_m == -CUDART_INF_F ? 0.0f
-                                                     : exp2_approx((row_m - next_m) * Log2E);
-        const float probability = score == -CUDART_INF_F
-                                      ? 0.0f
-                                      : exp2_approx((score - next_m) * Log2E);
+        const float next_m = fmaxf(row_m, block_m);
+        const float alpha  = (row_m == -CUDART_INF_F || next_m == -CUDART_INF_F)
+                                 ? (row_m == -CUDART_INF_F ? 0.0f : 1.0f)
+                                 : exp2_approx((row_m - next_m) * Log2E);
+        const float probability =
+            score == -CUDART_INF_F ? 0.0f : exp2_approx((score - next_m) * Log2E);
+        float block_l = probability;
 #pragma unroll
-        for (int item = 0; item < 4; ++item) {
-            const int d = lane + item * 32;
-            acc[item] = acc[item] * alpha + probability * value_s[d];
+        for (int off = 16; off > 0; off >>= 1) {
+            block_l += __shfl_xor_sync(FullMask, block_l, off);
         }
-        row_l = row_l * alpha + probability;
+        prob_w[lane] = probability;
+        __syncwarp();
+
+#pragma unroll
+        for (int item = 0; item < 4; ++item) { acc[item] *= alpha; }
+#pragma unroll 8
+        for (int j = 0; j < KeyBlock; ++j) {
+            const float pj    = prob_w[j];
+            const float* vrow = value_s + j * RowStride;
+#pragma unroll
+            for (int item = 0; item < 4; ++item) { acc[item] += pj * vrow[lane + item * 32]; }
+        }
+        row_l = row_l * alpha + block_l;
         row_m = next_m;
-        __syncthreads();
+        __syncthreads(); // every warp is done with this block's K, V and P
     }
 
     if (owns_query) {

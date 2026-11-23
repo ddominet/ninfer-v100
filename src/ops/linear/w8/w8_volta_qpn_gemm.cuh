@@ -39,35 +39,52 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
 
 struct W8VoltaQpnSchedule {
-    static constexpr int kWarps       = 4;  // warps per CTA; they split K, not N
-    static constexpr int kColsPerCta  = 32; // output rows per CTA (mma's N axis)
-    static constexpr int kRowsPerTile = 8;  // tokens per A tile (mma's M axis)
-    static constexpr int kThreads     = kWarps * 32;
+    static constexpr int kColsPerCta    = 32; // output rows per CTA (mma's N axis)
+    static constexpr int kRowsPerTile   = 8;  // tokens per A tile (mma's M axis)
+    static constexpr int kResidentWarps = 32; // per SM, held fixed across SPLITK
 };
+
+// Where a CTA's reduced outputs go. Store writes out[token * out_ld + row]; DynamicConvAdd and
+// SwiGluUp are the DFlash2 draft's fused MLP epilogues; Split3 scatters a [6144] q|k|v parent into
+// q [4096], k [1024] and v [1024] planes (out, out1, out2), each token-major. 4096 and 5120 are
+// multiples of the 32-row CTA tile, so a CTA never straddles two planes.
+enum class W8QpnEpilogue { Store, DynamicConvAdd, SwiGluUp, Split3 };
 
 // `kTiles` is the number of 8-row A tiles (T <= 8 * kTiles); `kBlk` is how many W8 groups a lane
 // reads before consuming any, in units of kCodeBytesPerGroup. See the Q4 sibling: a lane streams
 // its own weight row, but a warp's 32 lanes stream 32 different rows at once, so consuming a whole
 // 128B line per lane per iteration is what keeps that off DRAM.
-template <int kTiles, int kBlk, bool kDynamicConvAdd = false, bool kSwiGluUp = false>
-__global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_gemm_kernel(
+//
+// `SPLITK` is the number of warps per CTA splitting K (they split K, not N), and `Activation` is
+// either the caller's BF16 rows or the FP16 copy staged by volta_stage_fp16_activation: the same
+// two knobs as the FP8 sibling, for the same reason. Four warps a CTA leave too few lines in
+// flight on the narrow (5120-row) shapes, and converting BF16 activations in the weight loop costs
+// every lane 8 conversions per row tile per group once T > 1.
+template <int kTiles, int kBlk, int SPLITK, class Activation,
+          W8QpnEpilogue kEpilogue = W8QpnEpilogue::Store>
+__global__ __launch_bounds__(SPLITK * 32, W8VoltaQpnSchedule::kResidentWarps / SPLITK)
+void w8_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
+    const Activation* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
     int padded_groups, int out_ld, const __nv_bfloat16* __restrict__ finish_delta = nullptr,
     const __nv_bfloat16* __restrict__ base = nullptr,
-    __nv_bfloat16* __restrict__ residual = nullptr, int width = 0) {
+    __nv_bfloat16* __restrict__ residual = nullptr, int width = 0,
+    __nv_bfloat16* __restrict__ out1 = nullptr, __nv_bfloat16* __restrict__ out2 = nullptr) {
     using S = W8VoltaQpnSchedule;
     constexpr int kGroupK = W8RowSplitStorage::kGroupK;
     constexpr int kCodeB  = W8RowSplitStorage::kCodeBytesPerGroup;
     static_assert(kGroupK == kCodeB, "W8 stores one code byte per k");
+    constexpr bool kDynamicConvAdd = kEpilogue == W8QpnEpilogue::DynamicConvAdd;
+    constexpr bool kSwiGluUp       = kEpilogue == W8QpnEpilogue::SwiGluUp;
 
-    __shared__ float cs[S::kWarps][kTiles * S::kRowsPerTile * S::kColsPerCta];
+    __shared__ float cs[SPLITK][kTiles * S::kRowsPerTile * S::kColsPerCta];
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -80,9 +97,11 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
     const int good = col < n;
 
     const int groups = k / kGroupK;
-    const int gq     = groups / S::kWarps;
+    // Whole kBlk-group blocks per warp, so every warp keeps the vector scale load below; the last
+    // warp takes the remainder.
+    const int gq     = (groups / kBlk / SPLITK) * kBlk;
     const int g0     = warp * gq;
-    const int gend   = (warp == S::kWarps - 1) ? groups : g0 + gq;
+    const int gend   = (warp == SPLITK - 1) ? groups : g0 + gq;
 
     const std::uint8_t* crow =
         codes + static_cast<std::int64_t>(good ? col : 0) * padded_groups * kCodeB;
@@ -163,14 +182,18 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
                     const int row = tile * S::kRowsPerTile + r;
                     half2 a[4];
                     if (row < t) {
-                        const __nv_bfloat16* xrow =
-                            x + static_cast<std::int64_t>(row) * k + kbase;
+                        const Activation* xrow = x + static_cast<std::int64_t>(row) * k + kbase;
                         const uint4 raw = *reinterpret_cast<const uint4*>(xrow);
-                        const auto* src = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                        const auto* src = reinterpret_cast<const Activation*>(&raw);
                         __half tmp[8];
+                        if constexpr (std::is_same_v<Activation, half>) {
 #pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            tmp[j] = __float2half(__bfloat162float(src[j]));
+                            for (int j = 0; j < 8; ++j) { tmp[j] = src[j]; }
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                tmp[j] = __float2half(__bfloat162float(src[j]));
+                            }
                         }
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
@@ -201,14 +224,14 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
     __syncthreads(); // the only barrier: cross-warp K reduce
 
     constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += S::kThreads) {
+    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
         const int row  = e / S::kColsPerCta;
         const int cl   = e % S::kColsPerCta;
         const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + cl;
         if (row < t && ocol < n) {
             float v = 0.0f;
 #pragma unroll
-            for (int w = 0; w < S::kWarps; ++w) { v += cs[w][e]; }
+            for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
             if constexpr (kDynamicConvAdd) {
                 // Preserve the old materialized projection boundary exactly: convolution sees
                 // BF16-rounded current and predecessor projections, even though both live in
@@ -225,7 +248,7 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
                 if ((row % width) != 0) {
                     float previous = 0.0f;
 #pragma unroll
-                    for (int w = 0; w < S::kWarps; ++w) {
+                    for (int w = 0; w < SPLITK; ++w) {
                         previous += cs[w][(row - 1) * S::kColsPerCta + cl];
                     }
                     const float projected1 = __bfloat162float(__float2bfloat16(previous));
@@ -241,6 +264,17 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
                 const float gate = __bfloat162float(out[offset]);
                 const float up = __bfloat162float(__float2bfloat16(v));
                 out[offset] = __float2bfloat16_rn(silu(gate) * up);
+            } else if constexpr (kEpilogue == W8QpnEpilogue::Split3) {
+                constexpr int kQ = 4096;
+                constexpr int kKv = 1024;
+                if (ocol < kQ) {
+                    out[static_cast<std::int64_t>(row) * kQ + ocol] = __float2bfloat16(v);
+                } else if (ocol < kQ + kKv) {
+                    out1[static_cast<std::int64_t>(row) * kKv + ocol - kQ] = __float2bfloat16(v);
+                } else {
+                    out2[static_cast<std::int64_t>(row) * kKv + ocol - kQ - kKv] =
+                        __float2bfloat16(v);
+                }
             } else {
                 out[static_cast<std::int64_t>(row) * out_ld + ocol] = __float2bfloat16(v);
             }
