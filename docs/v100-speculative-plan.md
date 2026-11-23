@@ -76,6 +76,56 @@ Reading these:
 - Its tensor-core K-quant products follow the QPN design of this engine's kernels (its
   `mmvq-qpn.cu` says so), so the weight kernels are not where it is ahead.
 
+## Progress
+
+Landed (each passed the W8/Q4 linear, attention-input, LinearSwiGLU, dynamic grouped conv add,
+top-K, sliding-window and causal attention Op tests, and a same-prompt server sweep in which no
+MTP, concurrency or prefill row got worse):
+
+- **Cheaper draft round.** Per-shape split-K and activation staging for the draft's W8 products,
+  the draft q|k|v on the tensor-core kernel (194 -> 89 us), and the draft's sliding-window
+  attention 32 keys at a time instead of one.
+- **Six- to eight-token verify attention at two CTAs per SM** and at most 120 key splits:
+  53.6 -> 50.4 ms a DFlash2 round at 89K tokens.
+- **Draft weights in the coalesced QPN layout.** The draft block's output, gate|up and down W8
+  weights are permuted at load and read with FP16-staged activations at 680-790 GB/s.
+
+Together, 3.2-6.4 ms off a DFlash2 round at every context. Same card and prompts as the table
+above (decode tok/s, mean over the requests):
+
+| Prompt tokens | This engine, MTP K=3 | This engine, DFlash2 x7 | llama-superfast, DFlash2 x7 |
+|---:|---:|---:|---:|
+| 60 | 72.8 | 82.1 | 81.7 |
+| 1.1K | 75.9 | 87.0 | 85.3 |
+| 5.9K | 77.5 | 81.7 | 85.3 |
+| 24K | 73.4 | 72.8 | 78.5 |
+| 89K | 60.1 | 58.9 | 61.2 |
+| 172K | 54.9 | 52.6 | 51.8 |
+
+Aggregate tok/s with 1 / 4 / 8 streams: MTP K=3 67.3 / 162.5 / 211.0, DFlash2 66.8 / 98.9 /
+122.0, llama-superfast 76.3 / 137.9 / 151.8.
+
+This engine's DFlash2 round now costs the same as llama-superfast's or less up to 24K tokens;
+the remaining gap from 5.9K to 89K is tokens per round (3.1-3.2 against 3.4-3.5 on these
+prompts), which depends on how well each draft predicts its own target's output.
+
+Measured and not adopted:
+
+- Seven draft tokens stay best: five and nine are slower at every context, and the full proposal
+  head instead of the 131,072-row optimised one adds about 5 ms a round for no net gain.
+- CUDA Graphs change nothing measurable on the MTP K=3 server rounds (36.5 vs 36.6 ms at 60
+  tokens, 46.0 vs 45.1 ms at 89K).
+- Wave-aligned key splits and reading the rotated queries from the global plane instead of
+  shared memory were slower in every case.
+
+Constraints found:
+
+- DFlash2's weights are 21.4 GiB resident against 19.7 GiB for MTP. On a 32 GB card it starts at
+  262,144 tokens of context with one concurrent request (0.88 GiB free), but at 262,144 tokens
+  with eight concurrent requests it is refused at startup: 11.34 GB of runtime needed, 10.79 GB
+  available (15.37 GB with CUDA Graphs). Phase 3, which would hold both drafts, does not fit that
+  configuration either.
+
 ## Phase 0: kernel profile of one DFlash2 round
 
 A per-kernel profile (`nsys`) of both engines' DFlash2 decode round at 60, 24K and 89K tokens of
