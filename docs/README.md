@@ -11,6 +11,7 @@ run the CLI or HTTP server.
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
 | [V100 performance rework](v100-rework.md) | changes from the upstream V100 port and the measured comparison |
+| [Speculative decoding plan](v100-speculative-plan.md) | comparison with llama-superfast-v100 and the plan to match its single-stream decode |
 | [V100 port](v100.md) | sm_70 build, supported surface, qualification, and preferred-SXM2 launch policy |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |

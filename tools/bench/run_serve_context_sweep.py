@@ -12,6 +12,11 @@ decodes a fixed number of tokens. One JSON record per request is appended to the
 
 Server-side flags (context, speculative decoding, concurrency) are the caller's; record them with
 the results. The script reports what the server measured in the response `timings` object.
+
+`--dialect llama` sends the same requests to a llama.cpp `llama-server` (thinking off through
+`chat_template_kwargs`, `cache_prompt` off), whose `timings` object has the same fields.
+`--sampling` replaces the greedy default, for example
+`--sampling '{"temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": 7}'`.
 """
 
 from __future__ import annotations
@@ -83,15 +88,21 @@ def document(domain: str, tokens: int, variant: int) -> str:
     return text[start:start + size]
 
 
+DIALECT = "ninfer"
+SAMPLING = {"temperature": 0.0}
+
+
 def post(url: str, content: str, max_tokens: int) -> dict:
     body = {
         "model": "qwen3.8-27b",
         "messages": [{"role": "user", "content": content}],
         "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "reasoning_effort": "none",
-        "prompt_cache_options": {"mode": "explicit"},
+        **SAMPLING,
     }
+    if DIALECT == "ninfer":
+        body.update(reasoning_effort="none", prompt_cache_options={"mode": "explicit"})
+    else:
+        body.update(chat_template_kwargs={"enable_thinking": False}, cache_prompt=False)
     request = urllib.request.Request(
         url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     started = time.monotonic()
@@ -111,6 +122,7 @@ def post(url: str, content: str, max_tokens: int) -> dict:
         "decode_tok_s": timings.get("predicted_per_second"),
         "draft_tokens": timings.get("draft_n"),
         "draft_accepted": timings.get("draft_n_accepted"),
+        "text_head": (result.get("choices") or [{}])[0].get("message", {}).get("content", "")[:200],
     }
 
 
@@ -136,7 +148,12 @@ def main() -> int:
     parser.add_argument("--streams", default="",
                         help="comma-separated concurrency levels, run with the standalone requests")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--dialect", choices=("ninfer", "llama"), default="ninfer")
+    parser.add_argument("--sampling", default='{"temperature": 0.0}')
     args = parser.parse_args()
+    global DIALECT, SAMPLING
+    DIALECT = args.dialect
+    SAMPLING = json.loads(args.sampling)
     url = args.url.rstrip("/") + "/v1/chat/completions"
 
     with args.output.open("a", encoding="utf-8") as handle:
