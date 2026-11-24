@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <array>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -133,6 +134,31 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 15,
                       "serve options did not preserve combined DFlash and Vision features");
+
+    const ServeOptions ladder = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                       "--draft-tokens", "5", "--draft-tokens-by-batch", "5,3,2",
+                                       "--no-cuda-graph"});
+    failures += check(ladder.speculative.draft_tokens_by_batch ==
+                          std::array<std::uint8_t, 8>{5, 3, 2, 2, 2, 2, 2, 2},
+                      "--draft-tokens-by-batch did not repeat its last length");
+    for (const std::vector<std::string>& rejected : std::vector<std::vector<std::string>>{
+             {"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+              "--draft-tokens-by-batch", "4", "--no-cuda-graph"},
+             {"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+              "--draft-tokens-by-batch", "3,2"},
+             {"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+              "--draft-tokens-by-batch", "3", "--no-cuda-graph"},
+             {"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+              "--draft-tokens-by-batch", "3,,2", "--no-cuda-graph"},
+             {"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+              "--draft-tokens-by-batch", "0", "--no-cuda-graph"},
+         }) {
+        bool refused = false;
+        try {
+            (void)parse(rejected);
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "an invalid --draft-tokens-by-batch was accepted");
+    }
 
     bool implicit_backend_rejected = false;
     try {

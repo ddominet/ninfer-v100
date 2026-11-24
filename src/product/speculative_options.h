@@ -2,6 +2,8 @@
 
 #include "ninfer/types.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,7 +31,51 @@ namespace ninfer::product {
     return "unknown";
 }
 
+// "5,3,2" -> {5,3,2,2,2,2,2,2}: one draft length per batch size, the last repeated to the end.
+[[nodiscard]] inline std::array<std::uint8_t, kMaximumConcurrency>
+parse_draft_tokens_by_batch(std::string_view value) {
+    std::array<std::uint8_t, kMaximumConcurrency> out{};
+    std::size_t count = 0;
+    while (!value.empty()) {
+        const std::size_t comma = value.find(',');
+        const std::string_view item = value.substr(0, comma);
+        if (item.empty() || item.size() > 2 || count == out.size() ||
+            !std::all_of(item.begin(), item.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+            throw std::invalid_argument(
+                "--draft-tokens-by-batch takes 1-8 comma-separated draft lengths");
+        }
+        const int k = std::stoi(std::string(item));
+        if (k < 1 || k > 15) {
+            throw std::invalid_argument("--draft-tokens-by-batch lengths must be positive");
+        }
+        out[count++] = static_cast<std::uint8_t>(k);
+        if (comma == std::string_view::npos) { break; }
+        value.remove_prefix(comma + 1);
+        if (value.empty()) {
+            throw std::invalid_argument("--draft-tokens-by-batch has a trailing comma");
+        }
+    }
+    if (count == 0) { throw std::invalid_argument("--draft-tokens-by-batch is empty"); }
+    for (std::size_t i = count; i < out.size(); ++i) { out[i] = out[count - 1]; }
+    return out;
+}
+
+[[nodiscard]] inline bool has_draft_tokens_by_batch(const SpeculativeOptions& options) noexcept {
+    return options.draft_tokens_by_batch[0] != 0;
+}
+
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (has_draft_tokens_by_batch(options)) {
+        if (options.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("--draft-tokens-by-batch requires --spec mtp");
+        }
+        for (const std::uint8_t k : options.draft_tokens_by_batch) {
+            if (k == 0 || k > options.draft_tokens) {
+                throw std::invalid_argument(
+                    "--draft-tokens-by-batch lengths must be in [1, --draft-tokens]");
+            }
+        }
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

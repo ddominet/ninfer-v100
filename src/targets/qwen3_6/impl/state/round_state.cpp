@@ -172,6 +172,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         add_decode(layout.mtp_lookup_decode.emplace(),
                    static_cast<std::int32_t>(kMtpLookupMaximumWidth),
                    "MTP lookup decode frame");
+        for (std::uint32_t k = 1; k < kMtpNarrowSlots; ++k) {
+            if ((layout.spec.mtp_narrow_windows & (1U << k)) == 0) { continue; }
+            add_decode(layout.mtp_narrow_decode[k].emplace(), static_cast<std::int32_t>(k + 1),
+                       "MTP narrow decode frame");
+        }
     }
     if (is_masked_draft_backend(layout.spec.backend)) {
         layout.dflash_prefill.emplace().produced_count = i32(1, "DFlash prefill produced count");
@@ -389,6 +394,14 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.mtp_lookup_decode) {
         mtp_lookup_decode.emplace(backing, *layout.mtp_lookup_decode, layout.spec.batch_capacity,
                                   kMtpLookupMaximumDrafts, layout.spec.draft_window);
+    }
+    for (std::uint32_t k = 1; k < kMtpNarrowSlots; ++k) {
+        if (layout.mtp_narrow_decode[k]) {
+            // Verify and propose k drafts; the autoregressive tensors keep the window's extent.
+            mtp_narrow_decode[k].emplace(backing, *layout.mtp_narrow_decode[k],
+                                         layout.spec.batch_capacity, k,
+                                         layout.spec.draft_window);
+        }
     }
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,

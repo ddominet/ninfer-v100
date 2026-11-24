@@ -177,6 +177,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .key_dim       = TextConfig::gdn_key_head_dim,
                              .value_dim     = TextConfig::gdn_value_head_dim,
                          });
+            for (std::uint32_t k = 1; k < plan.draft_window; ++k) {
+                if (!mtp_ladder_uses(plan.mtp_draft_ladder, k)) { continue; }
+                out.mtp_narrow_replay_records[k] = plan_gdn_replay_records(
+                    builder, GdnReplayRecordSpec{
+                                 .layers          = TextConfig::gdn_layers(),
+                                 .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                                 .width           = static_cast<std::int32_t>(k + 1U),
+                                 .conv_channels   = TextConfig::convolution_dim,
+                                 .qk_heads        = TextConfig::gdn_key_heads,
+                                 .value_heads     = TextConfig::gdn_value_heads,
+                                 .key_dim         = TextConfig::gdn_key_head_dim,
+                                 .value_dim       = TextConfig::gdn_value_head_dim,
+                             });
+            }
         }
     }
     if constexpr (Variant::supports_dflash) {
@@ -230,7 +244,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .output_rows    = TextConfig::output_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
-                                         .backend        = plan.speculative_backend});
+                                         .backend        = plan.speculative_backend,
+                                         .mtp_narrow_windows =
+                                             mtp_narrow_window_mask(plan.mtp_draft_ladder,
+                                                                    plan.draft_window)});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     if (plan.causal_scoring) {
@@ -707,9 +724,25 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,7]");
         }
+        if (options.speculative.draft_tokens_by_batch[0] != 0) {
+            for (const std::uint8_t k : options.speculative.draft_tokens_by_batch) {
+                if (k == 0 || k > options.speculative.draft_tokens) {
+                    throw std::invalid_argument(
+                        "MTP draft lengths by batch size must be in [1, draft window]");
+                }
+            }
+            // Each narrower width runs eagerly; only the full draft window has graph families.
+            if (options.use_cuda_graph) {
+                throw std::invalid_argument(
+                    "MTP draft lengths by batch size require CUDA Graphs to be disabled");
+            }
+        }
         break;
     case SpeculativeBackend::DFlash:
     case SpeculativeBackend::DFlash2:
+        if (options.speculative.draft_tokens_by_batch[0] != 0) {
+            throw std::invalid_argument("draft lengths by batch size are MTP-only");
+        }
         if (options.speculative.backend != DFlashConfig::backend) {
             throw std::invalid_argument(
                 "selected masked draft backend is not supported by this target");
@@ -749,6 +782,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->mtp_draft_ladder    = inputs.mtp_draft_ladder;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -841,6 +875,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .mtp_draft_ladder    = options.speculative.draft_tokens_by_batch,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,11 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // MTP only: the draft length to use when b requests decode together, at index b - 1, each in
+    // [1, draft_tokens]. All zero (the default) keeps draft_tokens at every batch size. Verifying
+    // more rows per request costs more than it returns once several requests share a round, so
+    // a ladder such as 5,3,2,2,2,2,2,2 keeps one request fast without slowing a full batch.
+    std::array<std::uint8_t, kMaximumConcurrency> draft_tokens_by_batch{};
 };
 
 enum class StartupPhase : std::uint8_t {
