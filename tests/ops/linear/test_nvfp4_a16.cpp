@@ -58,7 +58,7 @@ int run_nvfp4_a16() {
         Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only, true},
     };
-    for (const auto& [n, k, seed] : {std::array{17408, 5120, 711}, std::array{34816, 5120, 712},
+    for (const auto& [n, k, seed] : {std::array{34816, 5120, 712},
                                      std::array{5120, 17408, 713}, std::array{5120, 6144, 714}}) {
         ShapeCase shape{n, k, static_cast<std::uint32_t>(seed), Comparison::Sampled, true,
                         prepacked_invocations};

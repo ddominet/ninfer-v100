@@ -62,7 +62,7 @@ struct Case {
 int main(int argc, char** argv) {
     const bool sweep = argc > 1 && std::strcmp(argv[1], "--sweep") == 0;
     const Case cases[] = {
-        {"nvfp4 gate|up half 17408x5120", QType::NVFP4, 17408, 5120},
+        {"nvfp4 gate|up 34816x5120", QType::NVFP4, 34816, 5120},
         {"nvfp4 down 5120x17408", QType::NVFP4, 5120, 17408},
         {"fp8 gdn qkvz 16384x5120", QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120},
         {"fp8 attn qkgv 14336x5120", QType::FP8_E4M3FN_ROW_BF16S, 14336, 5120},
