@@ -983,11 +983,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     // inputs are expanded to P = W*B columns and the recurrent output is compacted back.
     const bool compact = active_compaction_ != nullptr && ph == Phase::Verify;
     const int P        = compact ? active_sequence_width_ * active_sequence_batch_ : T;
+    // On the record path the input projection also runs on the kept columns (projected_record
+    // below); only the in-place snapshot path needs the padded hidden.
+    const bool compact_projection = compact && gdn_state_action_ == GdnStateAction::RecordForReplay;
+    const Tensor kept_hidden      = h;
     if (compact) {
         if (active_compaction_->live != T) {
             throw std::logic_error("GDN compaction does not match the kept columns");
         }
-        h    = expand_verify_columns(h, kCfg.hidden);
+        if (!compact_projection) { h = expand_verify_columns(h, kCfg.hidden); }
         g    = expand_verify_columns(g, kCfg.gdn_v_heads);
         beta = expand_verify_columns(beta, kCfg.gdn_v_heads);
     }
@@ -1009,7 +1013,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
             throw std::logic_error("In-place batched GDN update requires width one");
         }
-        Tensor projection_input = h.view({kCfg.hidden, width, active_sequence_batch_});
+        const Tensor projection_input =
+            compact_projection ? Tensor{} : h.view({kCfg.hidden, width, active_sequence_batch_});
         Tensor query_output     = qc.view({kCfg.key_dim, width, active_sequence_batch_});
         Tensor key_output       = kc.view({kCfg.key_dim, width, active_sequence_batch_});
         Tensor value_output     = vc.view({kCfg.value_dim, width, active_sequence_batch_});
@@ -1021,10 +1026,27 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            Variant::gdn_input_projection_record(
-                projection_input, *w.projection, *w.conv1d, conv_states, valid,
-                *active_linear_state_source_slots_, records.conv, query_output, key_output,
-                value_output, gate_output, ph, work_, s);
+            if (compact_projection) {
+                // Project the kept columns, expand them into the padded record (dropped columns
+                // zero, never consumed past the valid counts) and run the convolution from it.
+                auto projection_scope = work_.scope();
+                Tensor qkv_kept  = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
+                Tensor gate_kept = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+                Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept, gate_kept, ph,
+                                              work_, s);
+                Tensor record_flat = records.conv.view({kCfg.conv_dim, P});
+                ops::gather_columns(qkv_kept, *active_compaction_->padded_slots, record_flat, s);
+                Tensor gate_flat = gate_output.view({kCfg.value_dim, P});
+                ops::gather_columns(gate_kept, *active_compaction_->padded_slots, gate_flat, s);
+                ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
+                                               *active_linear_state_source_slots_, query_output,
+                                               key_output, value_output, s);
+            } else {
+                Variant::gdn_input_projection_record(
+                    projection_input, *w.projection, *w.conv1d, conv_states, valid,
+                    *active_linear_state_source_slots_, records.conv, query_output, key_output,
+                    value_output, gate_output, ph, work_, s);
+            }
         } else {
             Variant::gdn_input_projection_snapshot(
                 projection_input, *w.projection, *w.conv1d, conv_states, valid,

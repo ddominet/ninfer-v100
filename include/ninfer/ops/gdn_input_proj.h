@@ -248,4 +248,20 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Op: gdn_projected_conv_record
+ *
+ * The convolution half of gdn_input_proj_conv_record, for a caller that has already written the
+ * projected query|key|value channels into conv_record ([channels, W, B], channels = 2*key + value
+ * rows). Applies the causal depthwise convolution with SiLU over each request's W columns from
+ * its initial convolution state, writing query, key and value [rows, W, B], and leaves conv_record
+ * holding the projected inputs the ReplaySSM fold replays. Columns at or beyond valid_columns[b]
+ * are not consumed. Used by kept-column speculative verification, which runs the projection on
+ * the kept columns only and expands it into the padded record.
+ */
+void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,
+                               const Tensor& conv_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, Tensor& query, Tensor& key,
+                               Tensor& value, cudaStream_t stream);
+
 } // namespace ninfer::ops

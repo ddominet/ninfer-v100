@@ -1094,4 +1094,19 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                   value, z, LinearPolicy::A16Only, workspace, stream);
 }
 
+void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,
+                               const Tensor& conv_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, Tensor& query, Tensor& key,
+                               Tensor& value, cudaStream_t stream) {
+    if (conv_record.dtype != DType::BF16 || query.dtype != DType::BF16 ||
+        key.dtype != DType::BF16 || value.dtype != DType::BF16 ||
+        valid_columns.dtype != DType::I32 || initial_state_slots.dtype != DType::I32 ||
+        conv_record.ne[0] != query.ne[0] + key.ne[0] + value.ne[0] ||
+        conv_record.ne[1] != query.ne[1] || conv_record.ne[2] != query.ne[2]) {
+        throw std::invalid_argument("gdn_projected_conv_record: invalid operands");
+    }
+    detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
+                                             initial_state_slots, query, key, value, stream);
+}
+
 } // namespace ninfer::ops

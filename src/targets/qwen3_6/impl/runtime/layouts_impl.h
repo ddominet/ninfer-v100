@@ -310,8 +310,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                                 plan.weights_profile, phase, batch_size, min_width, max_width));
         } else if (path == GdnWorkspacePath::ReplayRecord) {
-            scratch(layout, Variant::gdn_input_projection_record_workspace_capacity_bytes(
-                                plan.weights_profile, phase, batch_size, min_width, max_width));
+            // Kept-column verification projects through the plain input projection instead.
+            scratch(layout,
+                    std::max(Variant::gdn_input_projection_record_workspace_capacity_bytes(
+                                 plan.weights_profile, phase, batch_size, min_width, max_width),
+                             Variant::gdn_input_projection_workspace_capacity_bytes(
+                                 plan.weights_profile, phase, 1, last)));
         } else {
             (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, last);
             scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
