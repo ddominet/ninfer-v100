@@ -1031,13 +1031,17 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             throw std::logic_error("GDN compaction does not match the kept columns");
         }
         if (!compact_projection) { h = expand_verify_columns(h, kCfg.hidden); }
+        // g and beta are expanded with the projected record below (one launch) on the record
+        // path, here otherwise.
         Tensor g_padded    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
         Tensor beta_padded = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
-        const Tensor g_kept    = g.view({kCfg.gdn_v_heads, T});
-        const Tensor beta_kept = beta.view({kCfg.gdn_v_heads, T});
-        ops::gather_columns_group({&g_kept, &beta_kept, nullptr, nullptr},
-                                  {&g_padded, &beta_padded, nullptr, nullptr},
-                                  *active_compaction_->padded_slots, s);
+        g_kept_    = g.view({kCfg.gdn_v_heads, T});
+        beta_kept_ = beta.view({kCfg.gdn_v_heads, T});
+        if (!compact_projection) {
+            ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
+                                      {&g_padded, &beta_padded, nullptr, nullptr},
+                                      *active_compaction_->padded_slots, s);
+        }
         g    = g_padded;
         beta = beta_padded;
     }
@@ -1082,8 +1086,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                               work_, s);
                 Tensor record_flat = records.conv.view({kCfg.conv_dim, P});
                 Tensor gate_flat   = gate_output.view({kCfg.value_dim, P});
-                ops::gather_columns_group({&qkv_kept, &gate_kept, nullptr, nullptr},
-                                          {&record_flat, &gate_flat, nullptr, nullptr},
+                ops::gather_columns_group({&qkv_kept, &gate_kept, &g_kept_, &beta_kept_},
+                                          {&record_flat, &gate_flat, &g, &beta},
                                           *active_compaction_->padded_slots, s);
                 ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
                                                *active_linear_state_source_slots_, query_output,
