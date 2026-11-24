@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/live_status.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -109,6 +110,7 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    LiveStatusRateWindow status_rates_;
 };
 
 } // namespace ninfer::serve

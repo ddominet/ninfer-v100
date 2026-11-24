@@ -35,6 +35,8 @@ benchmark-report, and external protocol behavior. Op contract and CUDA implement
   and exclusion of arbitrary client error text;
 - `test_pretty_logging.cpp` — observable Service/Tool prefixes and separation of executable identity
   from the human-readable record body;
+- `test_live_status.cpp` — `GET /status` phase derivation, trailing-window token rates, and the
+  rendered field set;
 - `test_http_error_handler.cpp` — protocol-shaped payload-limit errors and application-error
   preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v14 reports;
