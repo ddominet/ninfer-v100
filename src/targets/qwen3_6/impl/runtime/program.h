@@ -22,6 +22,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <array>
 #include <limits>
@@ -492,6 +493,66 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
+// Round-time model for kept-column DFlash verification, fitted online by recursive least squares
+// to the rounds this engine actually runs. Features: 1, requests - 1, kept target columns past the
+// weight-bound eight, proposal-head chunks, and kept columns x mean context / 100K (attention).
+struct DFlashCostModel {
+    static constexpr int kFeatures = 5;
+    std::array<double, kFeatures> theta{};
+    std::array<double, kFeatures * kFeatures> covariance{};
+    std::uint64_t rounds = 0;
+
+    void reset(const std::array<double, kFeatures>& prior,
+               const std::array<double, kFeatures>& variance) noexcept {
+        theta = prior;
+        covariance.fill(0.0);
+        for (int i = 0; i < kFeatures; ++i) { covariance[i * kFeatures + i] = variance[i]; }
+        rounds = 0;
+    }
+
+    [[nodiscard]] static std::array<double, kFeatures>
+    features(std::size_t requests, std::size_t kept, double mean_context) noexcept {
+        const double columns = static_cast<double>(requests + kept);
+        const double head =
+            kept == 0 ? 0.0 : std::ceil(static_cast<double>(std::max<std::size_t>(kept, 5)) / 8.0);
+        return {1.0, static_cast<double>(requests) - 1.0, std::max(0.0, columns - 8.0), head,
+                columns * mean_context / 1.0e5};
+    }
+
+    [[nodiscard]] double predict(std::size_t requests, std::size_t kept,
+                                 double mean_context) const noexcept {
+        const auto x = features(requests, kept, mean_context);
+        double ms    = std::max(1.0, theta[0]);
+        for (int i = 1; i < kFeatures; ++i) { ms += std::max(0.0, theta[i]) * x[i]; }
+        return ms;
+    }
+
+    void update(std::size_t requests, std::size_t kept, double mean_context,
+                double observed_ms) noexcept {
+        constexpr double kForget = 0.995;
+        const auto x = features(requests, kept, mean_context);
+        std::array<double, kFeatures> px{};
+        for (int i = 0; i < kFeatures; ++i) {
+            for (int j = 0; j < kFeatures; ++j) { px[i] += covariance[i * kFeatures + j] * x[j]; }
+        }
+        double denominator = kForget;
+        double predicted   = 0.0;
+        for (int i = 0; i < kFeatures; ++i) {
+            denominator += x[i] * px[i];
+            predicted += theta[i] * x[i];
+        }
+        const double error = observed_ms - predicted;
+        for (int i = 0; i < kFeatures; ++i) { theta[i] += px[i] / denominator * error; }
+        for (int i = 0; i < kFeatures; ++i) {
+            for (int j = 0; j < kFeatures; ++j) {
+                covariance[i * kFeatures + j] =
+                    (covariance[i * kFeatures + j] - px[i] * px[j] / denominator) / kForget;
+            }
+        }
+        ++rounds;
+    }
+};
+
 class ProgramImplCore {
 public:
     struct PressureRecoveryScratch {
@@ -637,6 +698,9 @@ public:
     // Verify only the DFlash drafts whose expected acceptance pays for their target rows (eager
     // rounds only; NINFER_DFLASH_KEEP_ALL=1 verifies every draft as before).
     bool dflash_verify_budget = false;
+    DFlashCostModel dflash_cost;
+    std::size_t dflash_round_kept     = 0;
+    double dflash_round_context       = 0.0;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;

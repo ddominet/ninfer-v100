@@ -912,6 +912,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const char* keep_all = std::getenv("NINFER_DFLASH_KEEP_ALL");
         dflash_verify_budget = is_masked_draft_backend(speculative_backend) && !use_cuda_graph &&
                                !(keep_all != nullptr && keep_all[0] == '1');
+        // Prior: the profiled V100 costs (34 ms flat to 8 target columns, then about 1 ms a
+        // column; 1.24 ms per head chunk), refined online from the rounds this engine runs.
+        dflash_cost.reset({38.6, 1.6, 1.0, 1.24, 0.3}, {25.0, 1.0, 0.25, 0.5, 0.5});
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
@@ -12188,25 +12191,6 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 namespace {
 
-// Kept-column verification cost model, from nsys profiles of DFlash2 x7 and MTP K=3 rounds on a
-// V100. Target time is flat while the GEMMs are bound by reading the weights -- about 34 ms at 4
-// and at 8 columns -- and then grows about 1 ms per column (60 ms at 32, 86 ms at 64). Each round
-// also pays a per-request part and one 1.24 ms proposal-head read per 8 kept draft positions.
-constexpr double kDFlashRoundBaseMs        = 38.6;
-constexpr double kDFlashRoundPerRequestMs  = 1.6;
-constexpr double kDFlashFlatColumns        = 8.0;
-constexpr double kDFlashTargetColumnMs     = 1.0;
-constexpr double kDFlashHeadChunkMs        = 1.24;
-
-double dflash_round_ms(std::size_t requests, std::size_t kept_drafts) noexcept {
-    const auto columns = static_cast<double>(requests + kept_drafts);
-    const double head  = kept_drafts == 0 ? 0.0
-                                          : std::ceil(static_cast<double>(std::max<std::size_t>(
-                                                          kept_drafts, 5)) / 8.0);
-    return kDFlashRoundBaseMs + kDFlashRoundPerRequestMs * static_cast<double>(requests - 1) +
-           kDFlashTargetColumnMs * std::max(0.0, columns - kDFlashFlatColumns) +
-           kDFlashHeadChunkMs * head;
-}
 constexpr float kDFlashAcceptLearning     = 0.15F;
 constexpr float kDFlashAcceptRelax        = 0.02F;
 
@@ -12293,7 +12277,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         std::array<std::uint32_t, kMaximumConcurrency> taken{};
         std::size_t candidates = 0;
         double tokens          = static_cast<double>(lanes.size());
-        double best_rate       = tokens / dflash_round_ms(lanes.size(), 0);
+        double context_sum = 0.0;
+        for (const std::uint32_t lane : lanes) {
+            context_sum += static_cast<double>(active_sequence(lane).execution_frontier);
+        }
+        const double mean_context = context_sum / static_cast<double>(lanes.size());
+        double best_rate       = tokens / dflash_cost.predict(lanes.size(), 0, mean_context);
         std::size_t best_count = 0;
         for (;;) {
             std::size_t pick = lanes.size();
@@ -12305,7 +12294,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             if (pick == lanes.size()) { break; }
             tokens += next[pick];
             order[candidates++] = static_cast<std::uint8_t>(pick);
-            const double rate   = tokens / dflash_round_ms(lanes.size(), candidates);
+            const double rate   = tokens / dflash_cost.predict(lanes.size(), candidates,
+                                                           mean_context);
             if (rate > best_rate) {
                 best_rate  = rate;
                 best_count = candidates;
@@ -12316,7 +12306,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             next[pick] = kept < draft_limit[pick] ? std::min(next[pick], request.dflash_accept[kept])
                                                   : -1.0F;
         }
+        // Every sixteenth round verifies up to one more tile of drafts than the model wants, so
+        // the column slope keeps being observed even when the model prefers short rounds.
+        if (dflash_cost.rounds % 16 == 15) { best_count = std::min(candidates, best_count + 8); }
         for (std::size_t i = 0; i < best_count; ++i) { ++keep[order[i]]; }
+        dflash_round_kept    = best_count;
+        dflash_round_context = mean_context;
     }
 
     const auto started = Clock::now();
@@ -12461,6 +12456,15 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        if (dflash_verify_budget) {
+            const double predicted =
+                dflash_cost.predict(lanes.size(), dflash_round_kept, dflash_round_context);
+            // Skip rounds stalled by something else (a host hiccup, a first-use allocation).
+            if (seconds * 1000.0 < 3.0 * predicted) {
+                dflash_cost.update(lanes.size(), dflash_round_kept, dflash_round_context,
+                                   seconds * 1000.0);
+            }
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
             RequestControl& request       = requests[lanes[row]];
