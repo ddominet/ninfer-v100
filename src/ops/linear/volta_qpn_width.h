@@ -22,6 +22,17 @@ inline constexpr std::int32_t kVoltaQpnMaxTokens = 64;
 // 129..256 tokens, which three passes still beat and four do not.
 inline constexpr std::int32_t kVoltaCutlassMinT = 3 * kVoltaQpnMaxTokens + 1;
 
+// Resident CTAs per SM the quadpair kernels ask the compiler to fit (their __launch_bounds__
+// minimum), from a target of resident warps per SM. Three- and four-tile kernels target sixteen
+// warps, two eight-warp CTAs: at one CTA they took up to 206 registers a thread, eight warps an SM
+// could not hide their weight and activation load latency, and two CTAs measured 21% faster on the
+// 27B gate/up projection at 24 and 32 tokens (252 -> 198 and 295 -> 230 us). Six and eight tiles
+// measured no gain from a second CTA.
+constexpr int volta_qpn_min_blocks(int tiles, int splitk) {
+    const int warps = tiles == 1 ? 32 : tiles <= 4 ? 16 : 4;
+    return warps / splitk < 1 ? 1 : warps / splitk;
+}
+
 // Instantiated tile counts: 1, 2, 3, 4, 6, 8.
 constexpr int volta_qpn_tiles(int tokens) {
     return tokens <= 8    ? 1

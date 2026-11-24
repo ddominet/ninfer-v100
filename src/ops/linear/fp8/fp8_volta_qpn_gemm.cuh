@@ -34,6 +34,7 @@
 // mapping to +-480, which weights never contain.
 
 #include "ops/linear/volta_fp16_stage.h"
+#include "ops/linear/volta_qpn_width.h"
 #include "ops/linear/volta_tc_skinny.cuh"
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
@@ -114,10 +115,7 @@ struct Fp8VoltaTcDecoder {
 // simpler single-projection kernel. The shared reduce buffer is SPLITK * kTiles * 256 floats, so
 // SPLITK=16 at kTiles=4 is never instantiated (64 KB, over Volta's 48 KB static limit).
 template <int kTiles, int SPLITK, int NACC, bool Prepacked, class Activation, class OutputPolicy>
-__global__ __launch_bounds__(
-    SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
-        ? 1
-        : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK) void fp8_volta_qpn_gemm_kernel(
+__global__ __launch_bounds__(SPLITK * 32, volta_qpn_min_blocks(kTiles, SPLITK)) void fp8_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const __nv_bfloat16* __restrict__ scales,
     const Activation* __restrict__ x, int n, int k, int t, OutputPolicy output) {
     using S = Fp8VoltaQpnSchedule;

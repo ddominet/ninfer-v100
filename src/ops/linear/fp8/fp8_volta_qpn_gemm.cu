@@ -97,7 +97,8 @@ VoltaTcControl& volta_tc_control() {
     static VoltaTcControl control = [] {
         VoltaTcControl initial;
         const char* enabled = std::getenv("NINFER_VOLTA_TC");
-        initial.enabled     = enabled != nullptr && enabled[0] == '0' ? 0 : 1;
+        // Off by default: on the 27B shapes the quadpair kernels still win at 9..32 tokens.
+        initial.enabled     = enabled != nullptr && enabled[0] == '1' ? 1 : 0;
         const char* minimum = std::getenv("NINFER_VOLTA_TC_MIN_T");
         initial.min_tokens  = minimum != nullptr && std::atoi(minimum) > 0 ? std::atoi(minimum) : 9;
         return initial;

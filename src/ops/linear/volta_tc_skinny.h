@@ -9,7 +9,7 @@
 namespace ninfer::ops::detail {
 
 struct VoltaTcControl {
-    // -1: from NINFER_VOLTA_TC (default on); 0: off; 1: on.
+    // From NINFER_VOLTA_TC (default off); 0: off; 1: on.
     int enabled = -1;
     // Smallest token count the route takes (NINFER_VOLTA_TC_MIN_T, default 9: the quadpair
     // kernels own one to eight tokens).

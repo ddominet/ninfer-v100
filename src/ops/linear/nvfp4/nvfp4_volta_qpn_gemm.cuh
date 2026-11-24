@@ -46,6 +46,7 @@
 // output.
 
 #include "ops/linear/volta_fp16_stage.h"
+#include "ops/linear/volta_qpn_width.h"
 #include "ops/linear/volta_tc_skinny.cuh"
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
@@ -186,10 +187,7 @@ __device__ __forceinline__ void nvfp4_stage_pairs(const half* seq, half2* out) {
 // with the SPLITK/NACC question being asked (measured 75-141 GB/s "SPLITK8" candidates before this
 // fix, against SPLITK4's 230 -- a regression from the register budget, not from the schedule).
 template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation>
-__global__ __launch_bounds__(
-    SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
-        ? 1
-        : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK) void nvfp4_volta_qpn_gemm_kernel(
+__global__ __launch_bounds__(SPLITK * 32, volta_qpn_min_blocks(kTiles, SPLITK)) void nvfp4_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const Activation* __restrict__ x, int n, int k, int t, float inverse_weight_divisor,
     OutputPolicy output) {
@@ -345,10 +343,7 @@ __global__ __launch_bounds__(
 // the nibble order chosen so the shift decoder's structural (i,i+4) pairs become adjacent K.
 // This is v100-skinny's QPN2 main loop: no activation PRMTs and one scale byte per group.
 template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation>
-__global__ __launch_bounds__(
-    SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
-        ? 1
-        : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK)
+__global__ __launch_bounds__(SPLITK * 32, volta_qpn_min_blocks(kTiles, SPLITK))
 void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
                                       const std::uint8_t* __restrict__ scales,
                                       const Activation* __restrict__ x, int n, int k, int t,
