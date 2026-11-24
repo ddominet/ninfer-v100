@@ -30,7 +30,6 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
-#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -259,15 +258,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         Tensor flat_residual = residual.view({Config::hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, flat_residual,
                        stream);
-        // Experiment: NINFER_DFLASH_LAYERS=n proposes from the first n draft layers only (early
-        // exit; the context append still fills every layer's ring).
-        static const std::size_t layer_limit = [] {
-            const char* value = std::getenv("NINFER_DFLASH_LAYERS");
-            return value != nullptr && std::atoi(value) > 0 ? static_cast<std::size_t>(std::atoi(value))
-                                                            : std::size_t{64};
-        }();
-        const std::size_t proposal_layers = std::min(weights.layers.size(), layer_limit);
-        for (std::size_t layer_index = 0; layer_index < proposal_layers; ++layer_index) {
+        for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
             const auto& layer = weights.layers[layer_index];
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
                                           layer_index);
