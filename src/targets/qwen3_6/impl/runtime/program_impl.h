@@ -12210,12 +12210,6 @@ constexpr float kDFlashAcceptDecay       = 0.92F;  // per verified round, per po
 constexpr float kDFlashAcceptPrior       = 3.0F;   // pseudo-tries of the engine-wide rate
 constexpr float kDFlashGlobalLearning    = 0.01F;  // engine-wide rate, per verified position
 
-// Measured DFlash2 x7 conditional rates on chat and code prompts (P(at least j+1) of 0.78, 0.57,
-// 0.42, 0.27, 0.19, 0.13, 0.09): the starting engine-wide estimate.
-float dflash_conditional_prior(std::uint32_t j) noexcept {
-    constexpr float kRates[] = {0.78F, 0.73F, 0.74F, 0.64F, 0.70F, 0.68F, 0.72F};
-    return j < 7 ? kRates[j] : 0.70F;
-}
 
 } // namespace
 

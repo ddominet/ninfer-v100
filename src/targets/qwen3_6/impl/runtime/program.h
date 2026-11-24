@@ -495,6 +495,13 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
+// Measured DFlash2 x7 conditional acceptance on chat and code prompts (P(at least j+1 accepted)
+// of 0.78, 0.57, 0.42, 0.27, 0.19, 0.13, 0.09): the starting engine-wide estimate.
+[[nodiscard]] inline float dflash_conditional_prior(std::uint32_t j) noexcept {
+    constexpr float kRates[] = {0.78F, 0.73F, 0.74F, 0.64F, 0.70F, 0.68F, 0.72F};
+    return j < 7 ? kRates[j] : 0.70F;
+}
+
 // Round-time model for kept-column DFlash verification, fitted online by recursive least squares
 // to the rounds this engine actually runs. Features: 1, requests - 1, kept target columns past the
 // weight-bound eight, proposal-head chunks, requests x mean context / 100K (each request's KV is
