@@ -217,6 +217,39 @@ take MTP's numbers at full load.
 Tried and not kept: choosing the MTP draft length by batch size (reverted); FP16-staged
 activations for the Q4 head kernel (slower); hand-fitted cost constants (each suited one load).
 
+### Wider verify rows and the kept-draft policy (2026-11-25)
+
+The root cause under load is that every verify or draft row past eight costs real time on V100:
+the 27B projections were weight-bound to eight columns and then grew about 1 ms a column, and
+DFlash2 needs more rows than MTP. Changes:
+
+- NVFP4 quadpair kernels at 17..32 columns ask for two resident CTAs instead of one (they ran
+  eight warps an SM at up to 206 registers): gate/up 302 -> 263 us and down 156 -> 123 us at 32.
+- FP8 projections take a new tensor-core skinny GEMM (`volta_tc_skinny.cuh`: a prepacked weight
+  slice decoded once into shared memory, WMMA against all columns, ordered split-K fix-up) past
+  24 columns: 1.14-1.46x at 32, up to 1.7x at 64. NVFP4 stays on quadpair (its decode-to-shared
+  cost loses). `NINFER_VOLTA_TC=0` disables it.
+- DFlash-only overheads: the draft control projection's scalar remainder (124 us a call) and
+  one-CTA-a-column gathers (~12 us a call, ~100 a round) are gone.
+- The round-cost model is fitted under the constraint it predicts with (non-negative least
+  squares with a ridge toward the prior); it had overcharged wider keeps by ~10%.
+- The kept-draft choice searches the draft-block width cap: one deep keep widens the five-layer
+  draft for every request, and greedy alone lost 15% to a fixed keep of three under load.
+
+Seeded chat traffic, same card (median decode tok/s / median s per 256 tokens / throughput):
+
+| Load | MTP K=3 | DFlash2 x7 start of 11-24 | DFlash2 x7 now (two runs) |
+|---|---|---|---|
+| ~0.4 active | 72.5 / 3.60 s / 30.8 | 84.6 / 3.13 s / 30.8 | 85.2-85.8 / 3.11-3.16 s / 30.5 |
+| ~2 active | 54.2 / 4.83 s / 104.9 | 26.4 / 10.50 s / 106.2 | 49.0-49.5 / 5.33-5.43 s / 107.4 |
+| ~8 active | 40.6 / 7.99 s / 237.4 | 22.1 / 19.18 s / 154.2 | 34.7-35.5 / 9.47-9.67 s / 213-218 |
+
+At eight requests both engines now spend the same ~53 ms of GPU a round; DFlash2 verifies the
+same ~3 drafts a request with the same acceptance as MTP K=3 but pays its five-layer draft, so it
+stays about 9% behind in throughput there. Ablations that did not help: early exit from the draft
+(acceptance collapses: P(>=1) 0.74 -> 0.57 at four of five layers), a ragged draft block (~1 ms),
+tensor-core NVFP4 (slower than quadpair).
+
 ## Phase 0: kernel profile of one DFlash2 round
 
 A per-kernel profile (`nsys`) of both engines' DFlash2 decode round at 60, 24K and 89K tokens of
