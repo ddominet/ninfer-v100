@@ -162,6 +162,61 @@ speculation 33.1 / 61.3 / 109.3 / 179.7 (llama-superfast without speculation: 10
   prepacked W8 kernel's 64-row launch. Fixed in 8aaf418f (chunked launches); after the fix x8
   serves 61.1 / 82.3 / 89.6 / 106.8 tok/s at 1 / 2 / 4 / 8 streams with no errors.
 
+### Kept-column DFlash2 verification (2026-11-24)
+
+Under load DFlash2 verified all K+1 columns of every request through the target while accepting
+about 3.3 of 8; on chat traffic it fell to half of MTP K=3's per-request speed at medium load.
+Every eager DFlash round now keeps, per request, only the drafts whose expected acceptance pays
+for them, and the target runs its token-local work on the kept columns only:
+
+- Target: projections, MLPs, norms and the LM head run on kept columns; the attention core
+  (expanded to the widest kept extent + 1), the Gated DeltaNet convolution and recurrence, and
+  feature capture keep the padded per-request layout around `gather_columns(_group)`. Outputs
+  return padded, so acceptance, rollback and the DFlash context are unchanged. The real-engine
+  DFlash2 test (greedy equality with ordinary decoding, batch of eight, prefix restore, partial
+  stops) passes with it.
+- Draft: a block only as wide as the widest kept extent + 1, re-laid into the K-wide layout;
+  the proposal head scores only kept positions; draft-side fallbacks removed (control projection
+  16 columns a launch, multi-tile row-major W8 for q|k|v and the feature projection); the
+  context-append block is as wide as the widest append; the Q4 proposal head is prepacked at load
+  (1.4x on the fused top-K).
+- Choice: a goodput rule over every request's next draft, ordered by a conditional acceptance
+  estimate (decayed per-request hits and tries shrunk toward an engine-wide rate), against a round
+  cost fitted online by recursive least squares (intercept, requests, columns past the weight-bound
+  eight, head chunks, requests x context, draft-block columns). One request keeps its whole
+  block. `NINFER_DFLASH_KEEP_ALL=1` restores full verification; `NINFER_DFLASH_TRACE=1` prints
+  one line a round.
+
+Same card, production configuration. Fixed-prompt benchmark, DFlash2 x7 (MTP K=3 for reference):
+
+| | 1 stream | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| DFlash2 x7 before | 69.2 | 107.4 | 101.4 | 123.7 |
+| DFlash2 x7 now | 71.9-73.2 | 107.3-117.3 | 137.5-143.6 | 185.1-192.2 |
+| MTP K=3 | 67.2 | 117.0 | 150.3 | 202.9 |
+
+Single-prompt decode now: 83.4 / 89.1 / 83.6 / 73.1 / 57.7 / 52.4 tok/s at 60 / 1.1K / 6K / 24K /
+89K / 172K tokens (before: 81.6 / 91.3 / 81.5 / 74.0 / 59.0 / 54.5).
+
+Seeded chat traffic (Poisson arrivals, 256-1024-token answers; median per-request decode, median
+seconds per 256 tokens, throughput):
+
+| Load | MTP K=3 | DFlash2 x7 before | DFlash2 x7 now |
+|---|---|---|---|
+| about 0.4 active | 72.7 / 3.65 s / 30.5 | 84.6 / 3.13 s / 30.8 | 86.6 / 3.06 s / 30.8 |
+| about 2 active | 52.8 / 5.08 s / 106.6 | 26.4 / 10.50 s / 106.2 | 47.9 / 5.42 s / 108.4 |
+| about 8 active | 37.4 / 9.60 s / 217.9 | 22.1 / 19.18 s / 154.2 | 30.9 / 11.90 s / 197.4 |
+
+DFlash2 is now the better engine for one or two users and within 7% at medium load; at eight it
+is about 10% behind MTP K=3 in throughput. Both accept 0.597 drafts per output token on this
+traffic, so the remainder is round cost: the five-layer draft, its head and the layout copies cost
+about 4 ms a round more than MTP's head at eight requests. A ragged draft block (each request
+drafting only its own kept extent) would save about 1 ms; holding both drafts remains the way to
+take MTP's numbers at full load.
+
+Tried and not kept: choosing the MTP draft length by batch size (reverted); FP16-staged
+activations for the Q4 head kernel (slower); hand-fitted cost constants (each suited one load).
+
 ## Phase 0: kernel profile of one DFlash2 round
 
 A per-kernel profile (`nsys`) of both engines' DFlash2 decode round at 60, 24K and 89K tokens of
