@@ -920,7 +920,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // Prior: the profiled V100 costs (34 ms flat to 8 target columns, then about 1 ms a
         // column; 1.24 ms per head chunk), refined online from the rounds this engine runs.
         // Draft-block columns: about 0.45 ms per 8 (the W8 draft layers at several requests).
-        dflash_cost.reset({36.0, 1.2, 1.0, 1.24, 0.3, 0.45}, {25.0, 1.0, 0.25, 0.5, 0.5, 0.25});
+        // Context: one request's round grows about 18 ms per 100K tokens (59 vs 82 tok/s at 90K).
+        dflash_cost.reset({36.0, 1.2, 1.0, 1.24, 18.0, 0.45}, {25.0, 1.0, 0.25, 0.5, 25.0, 0.25});
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();

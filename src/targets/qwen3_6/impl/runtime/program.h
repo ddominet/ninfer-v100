@@ -495,7 +495,8 @@ struct RequestControl {
 
 // Round-time model for kept-column DFlash verification, fitted online by recursive least squares
 // to the rounds this engine actually runs. Features: 1, requests - 1, kept target columns past the
-// weight-bound eight, proposal-head chunks, kept columns x mean context / 100K (attention), and
+// weight-bound eight, proposal-head chunks, requests x mean context / 100K (each request's KV is
+// read once a round whatever its query count, so context does not make columns dearer), and
 // draft-block columns / 8 (the draft runs a block as wide as the widest kept extent + 1).
 struct DFlashCostModel {
     static constexpr int kFeatures = 6;
@@ -518,7 +519,7 @@ struct DFlashCostModel {
         const double head =
             kept == 0 ? 0.0 : std::ceil(static_cast<double>(std::max<std::size_t>(kept, 5)) / 8.0);
         return {1.0, static_cast<double>(requests) - 1.0, std::max(0.0, columns - 8.0), head,
-                columns * mean_context / 1.0e5,
+                static_cast<double>(requests) * mean_context / 1.0e5,
                 static_cast<double>((widest + 1) * requests) / 8.0};
     }
 
