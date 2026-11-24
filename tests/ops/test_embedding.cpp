@@ -4,6 +4,7 @@
 #include "core/decode_graph.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -659,6 +660,69 @@ int test_fp8() {
     return failures;
 }
 
+// The FP8 table read from pinned host memory mapped into the device address space (the
+// HostMapped artifact placement the 27B token embedding takes on Volta) must gather exactly what
+// the device-resident table gathers, eagerly and under graph replay.
+int test_fp8_host_mapped() {
+    Fp8Table table;
+    const Weight device_weight = table.weight();
+    std::vector<std::uint8_t> bytes(device_weight.payload_bytes);
+    cuda_check(cudaMemcpy(bytes.data(), device_weight.payload, bytes.size(),
+                          cudaMemcpyDeviceToHost),
+               "copy FP8 table to host");
+    void* host = nullptr;
+    cuda_check(cudaHostAlloc(&host, bytes.size(), cudaHostAllocMapped | cudaHostAllocPortable),
+               "allocate mapped host table");
+    std::memcpy(host, bytes.data(), bytes.size());
+    void* mapped = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&mapped, host, 0), "map host table");
+    Weight mapped_weight = device_weight;
+    const std::ptrdiff_t scale_offset = static_cast<const std::uint8_t*>(device_weight.scales) -
+                                        static_cast<const std::uint8_t*>(device_weight.payload);
+    mapped_weight.payload = mapped;
+    mapped_weight.qdata   = mapped;
+    mapped_weight.scales  = static_cast<const std::uint8_t*>(mapped) + scale_offset;
+
+    int failures = 0;
+    DeviceContext device;
+    for (int t : {1, 8, 64, 128, 2048}) {
+        const std::vector<std::int32_t> ids = dflash2_ids(static_cast<std::size_t>(t));
+        GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+        device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+        Tensor input(device_ids.data(), DType::I32, {t});
+        std::vector<std::vector<std::uint8_t>> outputs;
+        const std::array<const Weight*, 2> weights{&device_weight, &mapped_weight};
+        for (const Weight* weight : weights) {
+            for (int replay = 0; replay < 2; ++replay) {
+                GuardedDeviceBuffer output(static_cast<std::size_t>(kFp8D) * t * 2);
+                output.fill(0x7d);
+                Tensor result(output.data(), DType::BF16, {kFp8D, t});
+                const auto launch = [&] {
+                    ops::embedding(input, *weight, result, device.stream);
+                };
+                if (replay) {
+                    DecodeGraphDefinition definition;
+                    DecodeGraphExecutable graph;
+                    definition.capture(device.stream, launch);
+                    graph.instantiate(definition);
+                    graph.launch(device.stream);
+                } else {
+                    launch();
+                }
+                cuda_synchronize(device.stream);
+                failures += output.verify_guards("embedding FP8 host-mapped output");
+                outputs.push_back(guarded_to_host<std::uint8_t>(output, output.bytes()));
+            }
+        }
+        const std::string label = "embedding FP8 host-mapped T=" + std::to_string(t);
+        for (std::size_t i = 1; i < outputs.size(); ++i) {
+            failures += verify_exact(label.c_str(), outputs[i], outputs[0]);
+        }
+    }
+    cuda_check(cudaFreeHost(host), "free mapped host table");
+    return failures;
+}
+
 int test_dense() {
     std::vector<std::uint16_t> table(static_cast<std::size_t>(kDenseRows) * kDenseD);
     for (std::int32_t row = 0; row < kDenseRows; ++row) {
@@ -725,6 +789,7 @@ int main() {
         failures += test_q6();
         failures += test_w8();
         failures += test_fp8();
+        failures += test_fp8_host_mapped();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';
         return 1;

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <span>
@@ -493,8 +494,22 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    // The token embedding (248320 x 5120, 1.2 GiB) is read a few rows a step: one per token of
+    // a decode round, one per token of a prefill chunk. On Volta it stays in pinned host memory
+    // mapped into the device address space, and the gather reads its rows over PCIe, which frees
+    // its device memory for runtime capacity (the DFlash2 draft at 262,144 tokens of context and
+    // eight requests needs it). NINFER_HOST_TOKEN_EMBEDDING=0 keeps it on the device.
+    artifact::TensorPlacement embedding_placement = artifact::TensorPlacement::Device;
+#ifdef NINFER_VOLTA_BUILD
+    {
+        const char* value = std::getenv("NINFER_HOST_TOKEN_EMBEDDING");
+        if (value == nullptr || value[0] != '0') {
+            embedding_placement = artifact::TensorPlacement::HostMapped;
+        }
+    }
+#endif
+    out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
+                                      {248320, 5120}, embedding_placement);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:

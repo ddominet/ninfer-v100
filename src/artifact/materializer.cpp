@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -69,6 +70,10 @@ struct ReadSpan {
 
 } // namespace
 
+void MaterializedArtifact::PinnedHostFree::operator()(void* pointer) const noexcept {
+    if (pointer != nullptr) { (void)cudaFreeHost(pointer); }
+}
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
         throw ArtifactError("object handle does not name a materialized tensor");
@@ -126,6 +131,33 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         out.stats_.retained_resource_bytes += resource.size();
         out.stats_.file_bytes =
             checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
+    }
+
+    for (const HostMappedMaterialization& placement : plan.host_mapped_objects) {
+        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        if (payload.data.size() != placement.bytes) {
+            throw ArtifactError("host-mapped materialization does not match artifact payload");
+        }
+        void* host = nullptr;
+        if (cudaHostAlloc(&host, static_cast<std::size_t>(placement.bytes),
+                          cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            host == nullptr) {
+            (void)cudaGetLastError();
+            throw ArtifactError("pinned host allocation failed for a host-mapped tensor");
+        }
+        out.host_mapped_.emplace_back(host);
+        std::memcpy(host, payload.data.data(), static_cast<std::size_t>(placement.bytes));
+        void* mapped = nullptr;
+        if (cudaHostGetDevicePointer(&mapped, host, 0) != cudaSuccess || mapped == nullptr) {
+            (void)cudaGetLastError();
+            throw ArtifactError("host-mapped tensor has no device address");
+        }
+        out.objects_.at(placement.object.index).device = mapped;
+        out.stats_.host_mapped_bytes =
+            checked_add(out.stats_.host_mapped_bytes, placement.bytes,
+                        "host-mapped byte count overflows u64");
+        out.stats_.file_bytes = checked_add(out.stats_.file_bytes, placement.bytes,
+                                            "artifact read bytes overflow u64");
     }
 
     std::vector<CopyRange> ranges;

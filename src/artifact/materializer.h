@@ -18,6 +18,7 @@ struct MaterializationStats {
     std::uint64_t h2d_bytes               = 0;
     std::uint64_t device_capacity_bytes   = 0;
     std::uint64_t retained_resource_bytes = 0;
+    std::uint64_t host_mapped_bytes       = 0;
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
     std::size_t resource_count            = 0;
@@ -50,7 +51,14 @@ private:
         std::vector<std::byte> resource;
     };
 
+    struct PinnedHostFree {
+        void operator()(void* pointer) const noexcept;
+    };
+
     std::unique_ptr<DeviceArena> device_arena_;
+    // Pinned, device-mapped host buffers of HostMapped tensors; objects_[i].device holds their
+    // device-visible address.
+    std::vector<std::unique_ptr<void, PinnedHostFree>> host_mapped_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };
