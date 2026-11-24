@@ -53,47 +53,93 @@ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
 namespace {
 
 // One CTA per destination column, 16-byte copies when the column bytes allow it.
+// A column is copied by ceil(words / kGatherChunkWords) CTAs (blockIdx.z), so a call over a few
+// dozen columns of several kilobytes each still fills the GPU: one CTA a column measured ~12 us a
+// call for well under a megabyte.
 template <class Word>
 __global__ void gather_columns_kernel(const Word* __restrict__ source,
                                       const std::int32_t* __restrict__ indices,
-                                      Word* __restrict__ destination, std::int64_t words) {
+                                      Word* __restrict__ destination, std::int64_t words,
+                                      std::int64_t chunk_words) {
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
+    const std::int64_t begin  = static_cast<std::int64_t>(blockIdx.y) * chunk_words;
+    const std::int64_t end    = begin + chunk_words < words ? begin + chunk_words : words;
     const std::int32_t from   = indices[column];
     Word* out                 = destination + static_cast<std::int64_t>(column) * words;
     if (from < 0) {
-        for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = Word{}; }
+        for (std::int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) { out[i] = Word{}; }
         return;
     }
     const Word* in = source + static_cast<std::int64_t>(from) * words;
-    for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = in[i]; }
+    for (std::int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) { out[i] = in[i]; }
 }
 
-// blockIdx.y selects the pair; 4-byte words (every BF16 column here has an even row count).
+// blockIdx.y selects the pair, blockIdx.z the chunk. `Word` is uint4 when every pair is 16-byte
+// aligned and sized, else 4 bytes (every BF16 column here has an even row count).
+template <class Word>
 __global__ void gather_columns_group_kernel(GatherColumnsGroup group,
-                                            const std::int32_t* __restrict__ indices) {
-    const int pair            = static_cast<int>(blockIdx.y);
-    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
-    const std::int64_t words  = group.words[pair];
-    const std::int32_t from   = indices[column];
-    auto* out = static_cast<std::uint32_t*>(group.destination[pair]) + column * words;
+                                            const std::int32_t* __restrict__ indices,
+                                            std::int64_t chunk_words) {
+    constexpr std::int64_t kRatio = sizeof(Word) / 4;
+    const int pair                = static_cast<int>(blockIdx.y);
+    const std::int32_t column     = static_cast<std::int32_t>(blockIdx.x);
+    const std::int64_t words      = group.words[pair] / kRatio;
+    const std::int64_t begin      = static_cast<std::int64_t>(blockIdx.z) * chunk_words;
+    if (begin >= words) { return; }
+    const std::int64_t end   = begin + chunk_words < words ? begin + chunk_words : words;
+    const std::int32_t from  = indices[column];
+    auto* out = static_cast<Word*>(group.destination[pair]) + column * words;
     if (from < 0) {
-        for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = 0; }
+        for (std::int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) { out[i] = Word{}; }
         return;
     }
-    const auto* in = static_cast<const std::uint32_t*>(group.source[pair]) + from * words;
-    for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = in[i]; }
+    const auto* in = static_cast<const Word*>(group.source[pair]) + from * words;
+    for (std::int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) { out[i] = in[i]; }
 }
+
+constexpr std::int64_t kGatherChunkBytes = 8192;
 
 } // namespace
 
 void gather_columns_group_launch(const GatherColumnsGroup& group, const Tensor& indices,
                                  std::int32_t columns, cudaStream_t stream) {
     if (group.pairs <= 0 || columns <= 0) { return; }
-    const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(group.pairs));
-    gather_columns_group_kernel<<<grid, 256, 0, stream>>>(
-        group, static_cast<const std::int32_t*>(indices.data));
+    bool wide            = true;
+    std::int64_t longest = 0;
+    for (int pair = 0; pair < group.pairs; ++pair) {
+        wide = wide && group.words[pair] % 4 == 0 &&
+               ((reinterpret_cast<std::uintptr_t>(group.source[pair]) |
+                 reinterpret_cast<std::uintptr_t>(group.destination[pair])) & 0xfu) == 0;
+        longest = std::max<std::int64_t>(longest, group.words[pair]);
+    }
+    const std::int64_t word_bytes  = wide ? 16 : 4;
+    const std::int64_t chunk_words = kGatherChunkBytes / word_bytes;
+    const std::int64_t chunks      = (longest * 4 / word_bytes + chunk_words - 1) / chunk_words;
+    const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(group.pairs),
+                    static_cast<unsigned>(chunks));
+    const auto* ids = static_cast<const std::int32_t*>(indices.data);
+    if (wide) {
+        gather_columns_group_kernel<uint4><<<grid, 256, 0, stream>>>(group, ids, chunk_words);
+    } else {
+        gather_columns_group_kernel<std::uint32_t><<<grid, 256, 0, stream>>>(group, ids,
+                                                                              chunk_words);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
+
+namespace {
+template <class Word>
+void launch_gather(const void* source, const std::int32_t* ids, void* destination,
+                   std::int64_t column_bytes, std::int32_t columns, cudaStream_t stream) {
+    const std::int64_t words       = column_bytes / static_cast<std::int64_t>(sizeof(Word));
+    const std::int64_t chunk_words = kGatherChunkBytes / static_cast<std::int64_t>(sizeof(Word));
+    const std::int64_t chunks      = (words + chunk_words - 1) / chunk_words;
+    const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(chunks));
+    gather_columns_kernel<Word><<<grid, 256, 0, stream>>>(static_cast<const Word*>(source), ids,
+                                                         static_cast<Word*>(destination), words,
+                                                         chunk_words);
+}
+} // namespace
 
 void gather_columns_launch(const Tensor& source, const Tensor& indices, Tensor& destination,
                            cudaStream_t stream) {
@@ -102,18 +148,15 @@ void gather_columns_launch(const Tensor& source, const Tensor& indices, Tensor& 
     const auto aligned = ((reinterpret_cast<std::uintptr_t>(source.data) |
                            reinterpret_cast<std::uintptr_t>(destination.data)) & 0xfu) == 0;
     const auto* ids = static_cast<const std::int32_t*>(indices.data);
+    if (columns <= 0 || column_bytes <= 0) { return; }
     if (aligned && column_bytes % 16 == 0) {
-        gather_columns_kernel<uint4><<<columns, 128, 0, stream>>>(
-            static_cast<const uint4*>(source.data), ids, static_cast<uint4*>(destination.data),
-            column_bytes / 16);
+        launch_gather<uint4>(source.data, ids, destination.data, column_bytes, columns, stream);
     } else if (column_bytes % 4 == 0) {
-        gather_columns_kernel<std::uint32_t><<<columns, 128, 0, stream>>>(
-            static_cast<const std::uint32_t*>(source.data), ids,
-            static_cast<std::uint32_t*>(destination.data), column_bytes / 4);
+        launch_gather<std::uint32_t>(source.data, ids, destination.data, column_bytes, columns,
+                                     stream);
     } else {
-        gather_columns_kernel<std::uint16_t><<<columns, 128, 0, stream>>>(
-            static_cast<const std::uint16_t*>(source.data), ids,
-            static_cast<std::uint16_t*>(destination.data), column_bytes / 2);
+        launch_gather<std::uint16_t>(source.data, ids, destination.data, column_bytes, columns,
+                                     stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

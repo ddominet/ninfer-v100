@@ -14,6 +14,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -121,10 +122,12 @@ __global__ void dflash2_bf16_matvec_kernel(const __nv_bfloat16* __restrict__ w,
 // scalar fallback launches one CTA per (row, position), rereading every weight row eight times.
 // This route keeps all eight dot products in one CTA: each weight is loaded once, activations are
 // shared by cache, and the reduction tree matches the fallback's four-warp block reduction.
+// `cols` <= kCols columns are live; the rest are neither read nor written, so a remainder block
+// shares the kernel (and its per-column reduction order) with the full ones.
 template <int kCols>
 __global__ __launch_bounds__(128, 4) void dflash2_bf16_control_wide_kernel(
     const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out, int cols) {
     constexpr int kRows = 1280;
     constexpr int k     = 5120;
     constexpr int kWarps = 4;
@@ -138,8 +141,11 @@ __global__ __launch_bounds__(128, 4) void dflash2_bf16_control_wide_kernel(
         const float weight = __bfloat162float(wrow[i]);
 #pragma unroll
         for (int col = 0; col < kCols; ++col) {
-            acc[col] = fmaf(weight, __bfloat162float(x[static_cast<std::int64_t>(col) * k + i]),
-                            acc[col]);
+            if (col < cols) {
+                acc[col] = fmaf(weight,
+                                __bfloat162float(x[static_cast<std::int64_t>(col) * k + i]),
+                                acc[col]);
+            }
         }
     }
 
@@ -150,7 +156,7 @@ __global__ __launch_bounds__(128, 4) void dflash2_bf16_control_wide_kernel(
         if (lane == 0) { sums[warp][col] = acc[col]; }
     }
     __syncthreads();
-    if (warp == 0 && lane < kCols) {
+    if (warp == 0 && lane < cols) {
         // Preserve block_reduce_sum<128>'s pairwise order: (warp0 + warp2) + (warp1 + warp3).
         const float total = (sums[0][lane] + sums[2][lane]) + (sums[1][lane] + sums[3][lane]);
         out[row + static_cast<std::int64_t>(lane) * kRows] = __float2bfloat16_rn(total);
@@ -182,17 +188,21 @@ void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_b
     // blocks are four launches instead of eight). Wider launches spill the accumulators.
     int first = 0;
     if (n_rows == 1280 && k == 5120) {
-        for (; first + 16 <= cols; first += 16) {
-            dflash2_bf16_control_wide_kernel<16><<<n_rows, 128, 0, stream>>>(
-                w, x + static_cast<std::int64_t>(first) * k,
-                out + static_cast<std::int64_t>(first) * n_rows);
+        // Any remainder takes the narrowest wide form that holds it: a 15-column block (three
+        // drafts for five requests) was 8 + 7 scalar columns, the scalar part 124 us a call.
+        while (first < cols) {
+            const int block = std::min(16, cols - first);
+            if (block > 8) {
+                dflash2_bf16_control_wide_kernel<16><<<n_rows, 128, 0, stream>>>(
+                    w, x + static_cast<std::int64_t>(first) * k,
+                    out + static_cast<std::int64_t>(first) * n_rows, block);
+            } else {
+                dflash2_bf16_control_wide_kernel<8><<<n_rows, 128, 0, stream>>>(
+                    w, x + static_cast<std::int64_t>(first) * k,
+                    out + static_cast<std::int64_t>(first) * n_rows, block);
+            }
             CUDA_CHECK(cudaGetLastError());
-        }
-        for (; first + 8 <= cols; first += 8) {
-            dflash2_bf16_control_wide_kernel<8><<<n_rows, 128, 0, stream>>>(
-                w, x + static_cast<std::int64_t>(first) * k,
-                out + static_cast<std::int64_t>(first) * n_rows);
-            CUDA_CHECK(cudaGetLastError());
+            first += block;
         }
     }
     if (first == cols) { return; }

@@ -243,13 +243,14 @@ struct VoltaTcSchedule {
 // split only until about 160 CTAs are in flight (the 5120-row output projection splits in two;
 // the 14336- and 16384-row input projections do not split).
 inline VoltaTcSchedule volta_tc_schedule(int n, int k, int t) {
-    (void)t;
     const VoltaTcControl& control = volta_tc_control();
     VoltaTcSchedule schedule;
-    schedule.rows    = control.rows != 0 ? control.rows : 64;
-    const int blocks = n / schedule.rows;
-    const int chunks = k / kVoltaTcChunkK;
-    int splits       = control.splits;
+    // The 16384-row GDN input projection measured best at 128 rows up to 32 tokens (191 vs
+    // 221 us at 32).
+    schedule.rows = control.rows != 0 ? control.rows : (n >= 16384 && t <= 32 ? 128 : 64);
+    const int blocks    = n / schedule.rows;
+    const int chunks    = k / kVoltaTcChunkK;
+    int splits          = control.splits;
     if (splits == 0) {
         splits = 1;
         while (splits < 8 && blocks * splits < 160 && chunks / (splits * 2) >= 8) { splits *= 2; }
