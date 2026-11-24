@@ -19,13 +19,14 @@ int dflash2_conformance() {
 }
 
 // The draft's gate|up weight in the load-time QPN layout (w8_prepack_sm70.cu), read only by the
-// QPN split kernels at 1-64 columns.
+// QPN split kernels, one launch per 64 columns (the counts past 64 cover the chunked launches).
 int dflash2_prepacked_conformance() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
     std::vector<std::int32_t> tokens;
     for (int t = 1; t <= 64; ++t) tokens.push_back(t);
-    constexpr std::array graphs{1, 8, 16, 17, 32, 33, 64};
+    for (int t : {65, 72, 128, 129}) tokens.push_back(t);
+    constexpr std::array graphs{1, 8, 16, 17, 32, 33, 64, 72};
     Profile profile{QType::W8G32_F16S, 34816, 5120, 17408, 1607U, ActivationCompute::A16};
     profile.prepack_w8 = true;
     return run_profile("LinearSwiGLU W8_A16 DFlash2 prepacked", profile, tokens, graphs);

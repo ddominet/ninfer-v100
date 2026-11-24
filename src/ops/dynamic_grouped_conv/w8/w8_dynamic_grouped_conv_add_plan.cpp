@@ -51,8 +51,8 @@ void w8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
     const int columns = width * batch;
     require_profile(x.ne[0], width, batch);
 
-    // A load-time prepacked weight is read only by the fused QPN kernel, for any shape up to 64
-    // columns; the materialized route below reads row-major. The workspace reserved is the one
+    // A load-time prepacked weight is read only by the fused QPN kernel, for any column count
+    // (one launch per 64 columns, in whole requests); the materialized route below reads row-major. The workspace reserved is the one
     // the planner reports for the shape, so the capacity contract is the same either way.
     if (weight.layout == QuantLayout::VoltaQpnPrepacked &&
         !(width == 8 && batch == 1 && w8_volta_qpn_supported(kHidden, x.ne[0], columns))) {

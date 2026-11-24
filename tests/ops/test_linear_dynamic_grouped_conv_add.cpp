@@ -209,8 +209,6 @@ int run_profile(std::int32_t input_rows, bool prepacked = false) {
     int failures        = 0;
     for (int width = 2; width <= 16; ++width)
         for (int batch_size = 1; batch_size <= 8; ++batch_size) {
-            // The prepacked layout is read at up to 64 columns (the draft block's 8 x 8).
-            if (prepacked && width * batch_size > 64) { continue; }
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(

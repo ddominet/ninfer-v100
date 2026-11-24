@@ -98,7 +98,7 @@ std::int32_t w8_qpn_padded_groups(const Weight& w) {
     return w.padded_shape[1] / W8RowSplitStorage::kGroupK;
 }
 
-// Prepacked weights (w8_prepack_sm70.cu): one kernel for 1-64 tokens, with 1, 2, 4 or 8 row tiles,
+// Prepacked weights (w8_prepack_sm70.cu): one kernel per 64 tokens, with 1, 2, 4 or 8 row tiles,
 // so a batch of requests reads the weight once. The activation is staged as FP16 whenever staging
 // is available; on the prepacked layout that measured 1.4-2.3x faster at eight tokens (gate/up
 // 17408 x 5120: 175 -> 121 us, down 5120 x 17408: 177 -> 123 us), close to the NVFP4 kernels'
@@ -115,46 +115,71 @@ void w8_qpn_launch_packed_typed(const dim3& grid, const Activation* x, const std
                                            finish_delta, base, residual, width);
 }
 
+// One launch reads at most 64 token rows (eight row tiles). Larger batches, such as eight
+// DFlash2 requests of nine rows each, run as consecutive launches over row chunks. Each chunk
+// re-reads the weight, so it costs bandwidth but stays exact. The DynamicConvAdd epilogue reads
+// a row's predecessor from the same CTA, so its chunks hold whole requests: a multiple of width.
+constexpr int kPackedMaxRows = 64;
+
 template <W8QpnEpilogue E>
 void w8_qpn_launch_packed(const Tensor& x, const half* x_fp16, const std::uint8_t* codes,
                           const std::uint8_t* scales, __nv_bfloat16* out, int n, int out_ld,
                           cudaStream_t stream, const __nv_bfloat16* finish_delta = nullptr,
                           const __nv_bfloat16* base = nullptr, __nv_bfloat16* residual = nullptr,
                           int width = 0) {
-    const int k = x.ne[0];
-    const int t = x.ne[1];
-    const auto* x_bf16 = static_cast<const __nv_bfloat16*>(x.data);
+    const int k     = x.ne[0];
+    const int total = x.ne[1];
+    const int chunk = E == W8QpnEpilogue::DynamicConvAdd
+                          ? kPackedMaxRows / width * width
+                          : kPackedMaxRows;
+    const auto* x_bf16_all = static_cast<const __nv_bfloat16*>(x.data);
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
+    for (int start = 0; start < total; start += chunk) {
+        const int t = total - start < chunk ? total - start : chunk;
+        const std::int64_t first = start;
+        const auto* x_bf16 = x_bf16_all + first * k;
+        const half* x_half = x_fp16 != nullptr ? x_fp16 + first * k : nullptr;
+        __nv_bfloat16* out_chunk = out != nullptr ? out + first * out_ld : nullptr;
+        // Conv-add rows: two finish-delta taps of 320 groups each, one 5120-wide residual row.
+        const __nv_bfloat16* delta_chunk =
+            finish_delta != nullptr ? finish_delta + first * 640 : nullptr;
+        __nv_bfloat16* residual_chunk = residual != nullptr ? residual + first * 5120 : nullptr;
 #define NINFER_W8_PACKED(TILES, SPLITK)                                                          \
     do {                                                                                         \
-        if (x_fp16 != nullptr) {                                                                 \
-            w8_qpn_launch_packed_typed<E, TILES, SPLITK>(grid, x_fp16, codes, scales, out, n, k, \
-                                                         t, out_ld, finish_delta, base,          \
-                                                         residual, width, stream);               \
+        if (x_half != nullptr) {                                                                 \
+            w8_qpn_launch_packed_typed<E, TILES, SPLITK>(grid, x_half, codes, scales, out_chunk, \
+                                                         n, k, t, out_ld, delta_chunk, base,     \
+                                                         residual_chunk, width, stream);         \
         } else {                                                                                 \
-            w8_qpn_launch_packed_typed<E, TILES, SPLITK>(grid, x_bf16, codes, scales, out, n, k, \
-                                                         t, out_ld, finish_delta, base,          \
-                                                         residual, width, stream);               \
+            w8_qpn_launch_packed_typed<E, TILES, SPLITK>(grid, x_bf16, codes, scales, out_chunk, \
+                                                         n, k, t, out_ld, delta_chunk, base,     \
+                                                         residual_chunk, width, stream);         \
         }                                                                                        \
     } while (false)
-    if (t <= 8) {
-        NINFER_W8_PACKED(1, 8);
-    } else if (t <= 16) {
-        NINFER_W8_PACKED(2, 8);
-    } else if (t <= 32) {
-        NINFER_W8_PACKED(4, 4);
-    } else {
-        NINFER_W8_PACKED(8, 4);
-    }
+        if (t <= 8) {
+            NINFER_W8_PACKED(1, 8);
+        } else if (t <= 16) {
+            NINFER_W8_PACKED(2, 8);
+        } else if (t <= 32) {
+            NINFER_W8_PACKED(4, 4);
+        } else {
+            NINFER_W8_PACKED(8, 4);
+        }
 #undef NINFER_W8_PACKED
-    CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
-void require_w8_packed(const Weight& w, std::int32_t n, std::int32_t k, std::int32_t t) {
+void require_w8_packed(const Weight& w, std::int32_t n, std::int32_t k, std::int32_t t,
+                       std::int32_t width = 1) {
     if (!w8_volta_qpn_prepacked_supported(n, k, t)) {
         throw std::invalid_argument(
-            "W8 QPN: a prepacked weight is readable only at 1-64 tokens with N % 32 == 0 and "
-            "K % 128 == 0");
+            "W8 QPN: a prepacked weight is readable only with N % 32 == 0, K % 128 == 0 and at "
+            "least one token");
+    }
+    if (width < 1 || width > kPackedMaxRows || t % width != 0) {
+        throw std::invalid_argument(
+            "W8 QPN: a prepacked conv-add needs whole requests of 1-64 rows each");
     }
 }
 
@@ -176,7 +201,8 @@ bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noex
 }
 
 bool w8_volta_qpn_prepacked_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
-    return n > 0 && n % 32 == 0 && k > 0 && k % 128 == 0 && t >= 1 && t <= 64;
+    // Any token count: w8_qpn_launch_packed splits it into launches of at most 64 rows.
+    return n > 0 && n % 32 == 0 && k > 0 && k % 128 == 0 && t >= 1;
 }
 
 void launch_w8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -220,7 +246,7 @@ void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& w, cons
                                           const Tensor& finish_delta, Tensor& residual,
                                           std::int32_t width, cudaStream_t stream) {
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        require_w8_packed(w, residual.ne[0], x.ne[0], x.ne[1]);
+        require_w8_packed(w, residual.ne[0], x.ne[0], x.ne[1], width);
         w8_qpn_launch_packed<W8QpnEpilogue::DynamicConvAdd>(
             x, volta_stage_fp16_activation(x, stream), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), nullptr, residual.ne[0], 0, stream,

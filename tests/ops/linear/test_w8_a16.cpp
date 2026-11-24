@@ -27,10 +27,12 @@ int feature_conformance() {
 }
 
 // DFlash2 draft output and down projections in the load-time QPN layout (w8_prepack_sm70.cu),
-// read only by the QPN kernel at 1-64 tokens.
+// read only by the QPN kernel: one launch per 64 tokens, so the counts past 64 cover the chunked
+// launches (eight DFlash2 requests of nine rows are 72).
 int w8_prepacked_conformance() {
     std::vector<Invocation> calls;
     for (int t = 1; t <= 64; ++t) calls.push_back(a16(t));
+    for (int t : {65, 72, 100, 128, 129, 200}) calls.push_back(a16(t));
     int failures = 0;
     ShapeCase output{5120, 4096, 331U, Comparison::Sampled, true, calls};
     output.prepack_w8 = true;
