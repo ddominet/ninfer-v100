@@ -543,7 +543,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         append_positions = Tensor(append_positions.data, DType::I32, {append_width, batch_size});
         Tensor compact_features = state.execution.work.alloc(
             DType::BF16, {Variant::DFlashConfig::feature_rows, append_width, batch_size});
-        ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
+        // Each lane's pending features start at column 0, so the narrowed view keeps every live
+        // prefix (counts never exceed append_width).
+        const Tensor pending = dflash_state(state).pending_features.slice(1, 0, append_width);
+        ops::prepare_ragged_prefix(pending, active_lanes,
                                    context_starts, frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
