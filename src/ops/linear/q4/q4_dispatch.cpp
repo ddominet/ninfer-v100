@@ -130,6 +130,9 @@ constexpr std::int32_t kVoltaMmaSplitKMaxT = 64;
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        throw std::invalid_argument("Q4 linear: a prepacked weight is readable only by fused top-K");
+    }
 #ifdef NINFER_VOLTA_BUILD
     // Quadpair-split-N maps T to the 8-row axis instead of the 32-row one, so it is the right
     // geometry exactly where the companion kernel pads its A rows away. Needs no workspace at

@@ -4,6 +4,8 @@
 
 #include <cuda_bf16.h>
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
 
 #ifdef NINFER_VOLTA_BUILD
@@ -24,6 +26,9 @@ bool q4_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noex
 
 void launch_q4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
                          std::int32_t weight_row_offset) {
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        throw std::invalid_argument("Q4 QPN: a prepacked weight is readable only by fused top-K");
+    }
     const std::int32_t n      = out.ne[0];
     const std::int32_t k      = x.ne[0];
     const std::int32_t t      = x.ne[1];
@@ -60,10 +65,20 @@ void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
     const std::int32_t t = x.ne[1];
     const std::int32_t padded_groups = w.padded_shape[1] / Q4RowSplitStorage::kGroupK;
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
-    q4_volta_qpn_gemm_kernel<1, 4, true><<<grid, S::kThreads, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
-        static_cast<const std::int32_t*>(row_to_global_ids.data), partial_keys, producer_groups);
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        // Two groups a lane per block measured best on the prepacked layout (770 vs 913 us).
+        q4_volta_qpn_gemm_kernel<1, 2, true, true><<<grid, S::kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
+            static_cast<const std::int32_t*>(row_to_global_ids.data), partial_keys,
+            producer_groups);
+    } else {
+        q4_volta_qpn_gemm_kernel<1, 4, true><<<grid, S::kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
+            static_cast<const std::int32_t*>(row_to_global_ids.data), partial_keys,
+            producer_groups);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

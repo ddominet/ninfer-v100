@@ -5,6 +5,7 @@
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #include "ops/linear/w8/w8_prepack_sm70.h"
+#include "ops/linear/q4/q4_prepack_sm70.h"
 #endif
 
 #include <algorithm>
@@ -654,6 +655,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                            NumericFormat::Q4G64_F16S, 131072, 5120);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
+#ifdef NINFER_VOLTA_BUILD
+        // DFlash2 reads the proposal head only through linear_topk's fused route, which reads the
+        // load-time quadpair layout 1.4x faster. MTP reads it row-major, so it stays as stored.
+        if (plan.features.dflash2()) {
+            ::ninfer::ops::detail::q4_prepack_qpn_sm70(proposal.head);
+        }
+#endif
     }
 
     if (plan.features.mtp()) {

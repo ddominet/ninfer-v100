@@ -99,7 +99,12 @@ void require_w8(const Weight& head) {
 
 void require_q4(const Weight& head) {
     const bool common =
-        head.qtype == QType::Q4G64_F16S && head.layout == QuantLayout::RowSplit &&
+        head.qtype == QType::Q4G64_F16S &&
+        (head.layout == QuantLayout::RowSplit
+#ifdef NINFER_VOLTA_BUILD
+         || head.layout == QuantLayout::VoltaQpnPrepacked
+#endif
+         ) &&
         head.scale_dtype == DType::FP16 && head.group_size == 64 && head.group == 64 &&
         head.ndim == 2 && head.n == detail::kLinearTopKOptimizedRows &&
         head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
@@ -130,8 +135,11 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
     // BF16 logits route below writes and re-reads a 131,072-row logit plane per column instead.
     const std::int32_t total = hidden.ne[1];
     const std::int32_t chunks = (total + detail::kVoltaQpnMaxT - 1) / detail::kVoltaQpnMaxT;
-    if (profile == HeadProfile::Q4Optimized && total >= detail::kVoltaQpnMinT &&
-        total / chunks >= detail::kVoltaQpnMinT) {
+    // A load-time prepacked head is readable only by the fused route, so it takes every column
+    // count (chunks below five columns are correct, only slower than the dense route).
+    const bool prepacked = head.layout == QuantLayout::VoltaQpnPrepacked;
+    if (profile == HeadProfile::Q4Optimized &&
+        (prepacked || (total >= detail::kVoltaQpnMinT && total / chunks >= detail::kVoltaQpnMinT))) {
         for (std::int32_t chunk = 0, first = 0; chunk < chunks; ++chunk) {
             // Balanced chunk sizes: the first total % chunks chunks take one extra column.
             const std::int32_t columns = total / chunks + (chunk < total % chunks ? 1 : 0);
@@ -178,9 +186,8 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
     const std::int32_t chunk = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
     std::size_t capacity = static_cast<std::size_t>(head_rows) * chunk * sizeof(std::uint16_t);
 #ifdef NINFER_VOLTA_BUILD
-    // Any count of at least five columns may run as fused chunks of at most eight.
-    if (qtype == QType::Q4G64_F16S && head_rows == detail::kLinearTopKOptimizedRows &&
-        max_columns >= detail::kVoltaQpnMinT) {
+    // Fused chunks of at most eight columns (a prepacked head takes every count).
+    if (qtype == QType::Q4G64_F16S && head_rows == detail::kLinearTopKOptimizedRows) {
         const int columns = std::min(max_columns, detail::kVoltaQpnMaxT);
         WorkspaceLayoutBuilder layout;
         (void)detail::allocate_linear_topk_workspace(

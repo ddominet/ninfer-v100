@@ -3,6 +3,9 @@
 #include "core/device.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/q4/q4_prepack_sm70.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -393,11 +396,18 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
     return failures;
 }
 
-int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
+int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score,
+           bool prepacked = false) {
     FixtureWeight fixture = make_rowsplit(QType::Q4G64_F16S, kShortRows);
     for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
         patch_rowsplit_row(fixture, QType::Q4G64_F16S, kShortWinnerRows[index], factor_for(index));
     }
+#ifdef NINFER_VOLTA_BUILD
+    // The DFlash2 load-time layout: every column count must run the fused route.
+    if (prepacked) { ops::detail::q4_prepack_qpn_sm70(fixture.weight); }
+#else
+    if (prepacked) { return 0; }
+#endif
     std::vector<std::int32_t> host_map(kShortRows);
     for (std::int32_t row = 0; row < kShortRows; ++row) { host_map[row] = kValidRows - 1 - row; }
     DeviceBuffer map(host_map.size() * sizeof(std::int32_t));
@@ -431,7 +441,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, ids_tensor, scores_tensor,
                          point_workspace, nullptr);
         cuda_synchronize();
-        failures += verify_invocation("q4-optimized", columns, ids_tensor, scores_tensor,
+        failures += verify_invocation(prepacked ? "q4-prepacked" : "q4-optimized", columns, ids_tensor, scores_tensor,
                                       base_score, expected);
         failures += out_ids.verify_guards("ids tail");
         failures += out_scores.verify_guards("scores tail");
@@ -491,6 +501,7 @@ int main() {
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16S, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16S, host_hidden));
         failures += run_q4(hidden, base_scores(QType::Q4G64_F16S, host_hidden));
+        failures += run_q4(hidden, base_scores(QType::Q4G64_F16S, host_hidden), true);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

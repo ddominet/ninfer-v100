@@ -74,7 +74,11 @@ struct Q4VoltaQpnSchedule {
 //
 // `kBlk` is how many Q4 groups a lane reads before consuming any of them; kBlk * kCodeB bytes.
 // It trades registers for read efficiency and the right value depends on n -- see the launcher.
-template <int kTiles, int kBlk, bool kProduceTopK = false>
+//
+// `kPrepacked` reads the load-time order of q4_prepack_sm70.cu: codes [tile][group][lane][32 B]
+// and scales [tile][group][lane], so a warp's 32 lanes read one contiguous 1 KB line per group
+// instead of 32 rows a row pitch apart (1.4x on the 131,072-row DFlash2 proposal head).
+template <int kTiles, int kBlk, bool kProduceTopK = false, bool kPrepacked = false>
 __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
@@ -103,11 +107,19 @@ __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_
     const int g0     = warp * gq;
     const int gend   = (warp == S::kWarps - 1) ? groups : g0 + gq;
 
+    // Per-group strides: one row's adjacent groups (row-major) or one tile's lane-interleaved
+    // groups (prepacked).
+    constexpr std::int64_t kGroupStride = kPrepacked ? 32 : 1;
     const std::uint8_t* crow =
-        codes + static_cast<std::int64_t>(good ? col : 0) * padded_groups * kCodeB;
-    const std::uint16_t* srow = reinterpret_cast<const std::uint16_t*>(
-        scales + static_cast<std::int64_t>(good ? col : 0) * padded_groups *
-                     Q4RowSplitStorage::kScaleBytesPerGroup);
+        kPrepacked ? codes + (static_cast<std::int64_t>(blockIdx.x) * padded_groups * 32 + lane) *
+                                 kCodeB
+                   : codes + static_cast<std::int64_t>(good ? col : 0) * padded_groups * kCodeB;
+    const std::uint16_t* srow =
+        kPrepacked ? reinterpret_cast<const std::uint16_t*>(scales) +
+                         static_cast<std::int64_t>(blockIdx.x) * padded_groups * 32 + lane
+                   : reinterpret_cast<const std::uint16_t*>(
+                         scales + static_cast<std::int64_t>(good ? col : 0) * padded_groups *
+                                      Q4RowSplitStorage::kScaleBytesPerGroup);
 
     float c[kTiles][8];
 #pragma unroll
@@ -145,10 +157,11 @@ __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_
 #pragma unroll
         for (int e = 0; e < kBlk; ++e) {
             const int g           = min(gb + e, last);
-            const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * kCodeB;
+            const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * kGroupStride * kCodeB;
             cw[2 * e]             = __ldg(reinterpret_cast<const uint4*>(p));
             cw[2 * e + 1]         = __ldg(reinterpret_cast<const uint4*>(p + 16));
-            scv[e]                = good ? srow[g] : static_cast<std::uint16_t>(0);
+            scv[e] = good ? srow[static_cast<std::int64_t>(g) * kGroupStride]
+                          : static_cast<std::uint16_t>(0);
         }
 
     for (int e = 0; e < blk; ++e) {
