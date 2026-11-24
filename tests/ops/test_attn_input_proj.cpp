@@ -460,8 +460,8 @@ int run_w8_target() {
     return failures;
 }
 
-int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens) {
-    constexpr std::int32_t kHidden      = 2048;
+int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens,
+                          std::int32_t kHidden = 2048, const char* name = "companion") {
     constexpr std::int32_t kQRows       = 4096;
     constexpr std::int32_t kKvRows      = 1024;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 301U + tokens);
@@ -478,7 +478,7 @@ int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens) {
     ops::attn_input_proj(x, parent.view(), q, k, v, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " W8 companion A16 T=" + std::to_string(tokens);
+    const std::string suffix = std::string(" W8 ") + name + " A16 T=" + std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens);
@@ -503,6 +503,20 @@ int run_w8_companion() {
     return failures;
 }
 
+// The DFlash2 draft's [6144, 5120] q|k|v: one request's block is 8 tokens, eight requests' 64.
+// Above 8 tokens the tensor-core kernel runs several row tiles a launch, in chunks of 32.
+int run_w8_dflash2() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 6144, kHidden, 409U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 40, 56, 63, 64, 65,
+                                      72, 96, 128, 129}) {
+        failures += run_w8_companion_case(parent, tokens, kHidden, "dflash2");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -518,6 +532,7 @@ int main() {
     failures += run_fp8_target();
     failures += run_w8_target();
     failures += run_w8_companion();
+    failures += run_w8_dflash2();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

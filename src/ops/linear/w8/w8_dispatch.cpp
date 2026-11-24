@@ -255,6 +255,13 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
         // The fused tensor-core route displaces both of those inside its band; see
         // w8_volta_mma_gemm.cuh and the band constants above.
         if (w8_uses_volta_qpn(n, k, t)) { return launch_w8_volta_qpn; }
+        // The DFlash2 feature projection when several requests append context: one row-major
+        // QPN launch per 32 tokens measured 491-543 us at 16-32 tokens against 845 us for the
+        // general tensor-core route (w8_volta_qpn_gemm.cu).
+        if (n == 5120 && k == 25600 && t > kVoltaQpnMaxCols &&
+            w8_volta_qpn_tiled_supported(n, k, t)) {
+            return launch_w8_volta_qpn;
+        }
         if (w8_uses_volta_mma(n, k, t)) { return launch_w8_volta_mma; }
         if (w8_launch_needs_volta_fallback(launch)) { return launch_w8_small_t; }
 #endif

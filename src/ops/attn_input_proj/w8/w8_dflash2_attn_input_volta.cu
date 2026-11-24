@@ -1,7 +1,7 @@
 // DFlash2 draft QKV projection — sm_70.
 //
 // W8G32 RowSplit [6144, 5120] -> q [4096, T], k [1024, T], v [1024, T], written directly with the
-// three-way split output. Each slice of up to eight tokens runs the W8 quadpair tensor-core kernel
+// three-way split output. Each slice of up to 64 tokens runs the W8 quadpair tensor-core kernel
 // on FP16-staged activations (w8_volta_qpn_gemm.cuh); the warp-per-row SIMT GEMM, which read this
 // shape at about 160 GB/s, remains for a K the tensor-core kernel does not take. The split points
 // 4096 and 5120 are multiples of both kernels' row tiles.
@@ -54,22 +54,29 @@ void w8_dflash2_attn_input_volta_launch(const Tensor& x, const Weight& weight, T
     const std::int32_t kk       = x.ne[0];
     const std::int32_t padded_k = weight.padded_shape[1];
 
-    for_each_token_slice(x.ne[1], kColsPerWarp, [&](std::int32_t offset, std::int32_t count) {
-        if (w8_volta_qpn_supported(kParentRows, kk, count)) {
-            Tensor qs = q.slice(1, offset, count);
-            Tensor ks = k.slice(1, offset, count);
-            Tensor vs = v.slice(1, offset, count);
-            launch_w8_volta_qpn_split3(x.slice(1, offset, count), weight, qs, ks, vs, stream);
-            return;
+    // Up to 64 tokens a call through the tensor-core kernel, which tiles them itself (eight
+    // requests' K=7 blocks are 64 tokens); the outer slices only bound the SIMT grid.
+    for_each_token_slice(x.ne[1], kColsPerWarp, [&](std::int32_t offset, std::int32_t whole) {
+        for (std::int32_t done = 0; done < whole;) {
+            const std::int32_t at    = offset + done;
+            const std::int32_t count = whole - done < 64 ? whole - done : 64;
+            done += count;
+            if (w8_volta_qpn_tiled_supported(kParentRows, kk, count)) {
+                Tensor qs = q.slice(1, at, count);
+                Tensor ks = k.slice(1, at, count);
+                Tensor vs = v.slice(1, at, count);
+                launch_w8_volta_qpn_split3(x.slice(1, at, count), weight, qs, ks, vs, stream);
+                continue;
+            }
+            const auto* xslice = xp + static_cast<std::int64_t>(at) * kk;
+            Split slice{output.out0 + static_cast<std::int64_t>(at) * kQueryRows,
+                        output.out1 + static_cast<std::int64_t>(at) * kKvRows,
+                        output.out2 + static_cast<std::int64_t>(at) * kKvRows};
+            const bool aligned_x =
+                (kk % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xslice) & 0xfu) == 0;
+            const std::int32_t full_slabs = aligned_x ? kk / 1024 : 0;
+            launch_tile(xslice, codes, scales, slice, kk, count, padded_k, full_slabs, stream);
         }
-        const auto* xslice = xp + static_cast<std::int64_t>(offset) * kk;
-        Split slice{output.out0 + static_cast<std::int64_t>(offset) * kQueryRows,
-                    output.out1 + static_cast<std::int64_t>(offset) * kKvRows,
-                    output.out2 + static_cast<std::int64_t>(offset) * kKvRows};
-        const bool aligned_x =
-            (kk % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xslice) & 0xfu) == 0;
-        const std::int32_t full_slabs = aligned_x ? kk / 1024 : 0;
-        launch_tile(xslice, codes, scales, slice, kk, count, padded_k, full_slabs, stream);
     });
 }
 

@@ -174,13 +174,24 @@ void dflash2_dynamic_conv_prepare_launch(const __nv_bfloat16* n, const __nv_bflo
 void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_bfloat16* x,
                                            int n_rows, int k, int cols, __nv_bfloat16* out,
                                            cudaStream_t stream) {
-    if (n_rows == 1280 && k == 5120 && cols == 8) {
-        dflash2_bf16_control_w8_kernel<<<n_rows, 128, 0, stream>>>(w, x, out);
-        CUDA_CHECK(cudaGetLastError());
-        return;
+    // Several K=7 requests project 8 positions each: run the eight-column kernel once per request
+    // block (one weight read each, about 37 us) instead of the scalar fallback, which rereads every
+    // weight row per column and measured 0.9 ms a call at eight requests. Same per-column
+    // reduction order, so the outputs match the fallback's bit for bit.
+    int first = 0;
+    if (n_rows == 1280 && k == 5120) {
+        for (; first + 8 <= cols; first += 8) {
+            dflash2_bf16_control_w8_kernel<<<n_rows, 128, 0, stream>>>(
+                w, x + static_cast<std::int64_t>(first) * k,
+                out + static_cast<std::int64_t>(first) * n_rows);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
-    const dim3 grid(static_cast<unsigned>(n_rows), static_cast<unsigned>(cols));
-    dflash2_bf16_matvec_kernel<<<grid, 128, 0, stream>>>(w, x, n_rows, k, cols, out);
+    if (first == cols) { return; }
+    const dim3 grid(static_cast<unsigned>(n_rows), static_cast<unsigned>(cols - first));
+    dflash2_bf16_matvec_kernel<<<grid, 128, 0, stream>>>(
+        w, x + static_cast<std::int64_t>(first) * k, n_rows, k, cols - first,
+        out + static_cast<std::int64_t>(first) * n_rows);
     CUDA_CHECK(cudaGetLastError());
 }
 

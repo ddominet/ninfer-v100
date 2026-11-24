@@ -94,6 +94,40 @@ void w8_qpn_launch(const W8QpnActivation& a, int splitk, const std::uint8_t* cod
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Row-major weights at 9-64 tokens: one launch reads the weight once for up to four 8-row tiles
+// (32 tokens), so a batch of draft requests no longer falls back to the SIMT or general
+// tensor-core kernels. Measured on the DFlash2 draft shapes against 8-token chunks of the one-tile
+// kernel (identical outputs at the same split): q|k|v 6144 x 5120 at 64 tokens 285 us (chunks:
+// 870 us; the SIMT route it replaces: 932 us), feature projection 5120 x 25600 at 24 tokens
+// 491-532 us (the general tensor-core route: 845 us).
+template <W8QpnEpilogue E, int TILES, int SPLITK, class Activation>
+void w8_qpn_launch_rm(const Activation* x, const std::uint8_t* codes, const std::uint8_t* scales,
+                      __nv_bfloat16* out, int n, int k, int t, int padded_groups, int out_ld,
+                      __nv_bfloat16* out1, __nv_bfloat16* out2, cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
+    w8_volta_qpn_gemm_kernel<TILES, 4, SPLITK, Activation, E><<<grid, SPLITK * 32, 0, stream>>>(
+        codes, scales, x, out, n, k, t, padded_groups, out_ld, nullptr, nullptr, nullptr, 0, out1,
+        out2);
+}
+
+// One chunk of at most 32 tokens at a fixed split; the tile count follows the chunk.
+template <W8QpnEpilogue E, int SPLITK, class Activation>
+void w8_qpn_launch_rm_chunk(const Activation* x, const std::uint8_t* codes,
+                            const std::uint8_t* scales, __nv_bfloat16* out, int n, int k, int t,
+                            int padded_groups, int out_ld, __nv_bfloat16* out1,
+                            __nv_bfloat16* out2, cudaStream_t stream) {
+    if (t <= 8) {
+        w8_qpn_launch_rm<E, 1, SPLITK>(x, codes, scales, out, n, k, t, padded_groups, out_ld,
+                                       out1, out2, stream);
+    } else if (t <= 16) {
+        w8_qpn_launch_rm<E, 2, SPLITK>(x, codes, scales, out, n, k, t, padded_groups, out_ld,
+                                       out1, out2, stream);
+    } else {
+        w8_qpn_launch_rm<E, 4, SPLITK>(x, codes, scales, out, n, k, t, padded_groups, out_ld,
+                                       out1, out2, stream);
+    }
+}
+
 std::int32_t w8_qpn_padded_groups(const Weight& w) {
     return w.padded_shape[1] / W8RowSplitStorage::kGroupK;
 }
@@ -200,6 +234,11 @@ bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noex
     return t <= S::kRowsPerTile;
 }
 
+bool w8_volta_qpn_tiled_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    // The single-tile domain's weight checks, at up to 64 tokens (the FP16 staging limit).
+    return w8_volta_qpn_supported(n, k, 1) && t >= 1 && t <= 64;
+}
+
 bool w8_volta_qpn_prepacked_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
     // Any token count: w8_qpn_launch_packed splits it into launches of at most 64 rows.
     return n > 0 && n % 32 == 0 && k > 0 && k % 128 == 0 && t >= 1;
@@ -218,6 +257,23 @@ void launch_w8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStre
             out_ld, stream);
         return;
     }
+    if (t > S::kRowsPerTile) {
+        const half* staged = volta_stage_fp16_activation(x, stream);
+        if (staged == nullptr) {
+            throw std::logic_error("W8 QPN: tiled launch needs the FP16-staged activation");
+        }
+        auto* o = static_cast<__nv_bfloat16*>(out.data);
+        for (std::int32_t first = 0; first < t; first += 32) {
+            const std::int32_t chunk = t - first < 32 ? t - first : 32;
+            w8_qpn_launch_rm_chunk<W8QpnEpilogue::Store, 4>(
+                staged + static_cast<std::int64_t>(first) * k,
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), o + static_cast<std::int64_t>(first) * out_ld,
+                n, k, chunk, w8_qpn_padded_groups(w), out_ld, nullptr, nullptr, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const W8QpnLaunch launch  = w8_qpn_launch_settings(n, k);
     w8_qpn_launch<W8QpnEpilogue::Store>(
         w8_qpn_activation(x, launch, stream), launch.splitk,
@@ -234,6 +290,28 @@ void launch_w8_volta_qpn_split3(const Tensor& x, const Weight& w, Tensor& q, Ten
         throw std::invalid_argument("W8 QPN split3: the q|k|v weight must stay row-major");
     }
     const W8QpnLaunch launch = w8_qpn_launch_settings(kParentRows, x.ne[0]);
+    if (x.ne[1] > S::kRowsPerTile) {
+        // The draft's measured setting (split 8, BF16 activations) at every chunk, so a request's
+        // q|k|v rows are bit-identical whether it decodes alone or in a batch.
+        if (launch.splitk != 8 || launch.stage_fp16) {
+            throw std::logic_error("W8 QPN split3: tiled launch expects split 8 on BF16");
+        }
+        const std::int32_t kk = x.ne[0];
+        const auto* xb = static_cast<const __nv_bfloat16*>(x.data);
+        auto* qp = static_cast<__nv_bfloat16*>(q.data);
+        auto* kp = static_cast<__nv_bfloat16*>(k.data);
+        auto* vp = static_cast<__nv_bfloat16*>(v.data);
+        for (std::int32_t first = 0; first < x.ne[1]; first += 32) {
+            const std::int32_t t = x.ne[1] - first < 32 ? x.ne[1] - first : 32;
+            w8_qpn_launch_rm_chunk<W8QpnEpilogue::Split3, 8>(
+                xb + static_cast<std::int64_t>(first) * kk,
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), qp + first * 4096LL, kParentRows, kk,
+                t, w8_qpn_padded_groups(w), 0, kp + first * 1024LL, vp + first * 1024LL, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     w8_qpn_launch<W8QpnEpilogue::Split3>(
         w8_qpn_activation(x, launch, stream), launch.splitk,
         static_cast<const std::uint8_t*>(w.qdata),
