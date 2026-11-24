@@ -510,14 +510,19 @@ struct RequestControl {
 struct DFlashCostModel {
     static constexpr int kFeatures = 6;
     std::array<double, kFeatures> theta{};
-    std::array<double, kFeatures * kFeatures> covariance{};
+    std::array<double, kFeatures> prior{};
+    std::array<double, kFeatures> ridge{};
+    std::array<double, kFeatures * kFeatures> gram{}; // forgotten sum of x x^T
+    std::array<double, kFeatures> moment{};           // forgotten sum of x * observed ms
     std::uint64_t rounds = 0;
 
-    void reset(const std::array<double, kFeatures>& prior,
+    void reset(const std::array<double, kFeatures>& initial,
                const std::array<double, kFeatures>& variance) noexcept {
-        theta = prior;
-        covariance.fill(0.0);
-        for (int i = 0; i < kFeatures; ++i) { covariance[i * kFeatures + i] = variance[i]; }
+        theta = initial;
+        prior = initial;
+        for (int i = 0; i < kFeatures; ++i) { ridge[i] = 1.0 / variance[i]; }
+        gram.fill(0.0);
+        moment.fill(0.0);
         rounds = 0;
     }
 
@@ -535,40 +540,37 @@ struct DFlashCostModel {
     [[nodiscard]] double predict(std::size_t requests, std::size_t kept, double mean_context,
                                  std::size_t widest) const noexcept {
         const auto x = features(requests, kept, mean_context, widest);
-        double ms    = std::max(1.0, theta[0]);
-        for (int i = 1; i < kFeatures; ++i) { ms += std::max(0.0, theta[i]) * x[i]; }
+        double ms    = 0.0;
+        for (int i = 0; i < kFeatures; ++i) { ms += theta[i] * x[i]; }
         return ms;
     }
 
+    // Constrained least squares on forgetting-weighted normal equations, with a fixed ridge toward
+    // the prior: every cost term non-negative and the intercept at least 1 ms, in the fit as in
+    // the prediction. (An unconstrained recursive fit settled the correlated column and
+    // draft-width terms at a positive and a negative weight; clamping only the prediction then
+    // overcharged wider keeps, and clamping inside the recursion diverged.) Six unknowns: a few
+    // coordinate-descent sweeps from the previous solution converge.
     void update(std::size_t requests, std::size_t kept, double mean_context, std::size_t widest,
                 double observed_ms) noexcept {
         constexpr double kForget = 0.995;
-        const auto x = features(requests, kept, mean_context, widest);
-        std::array<double, kFeatures> px{};
+        const auto x             = features(requests, kept, mean_context, widest);
         for (int i = 0; i < kFeatures; ++i) {
-            for (int j = 0; j < kFeatures; ++j) { px[i] += covariance[i * kFeatures + j] * x[j]; }
-        }
-        double denominator = kForget;
-        double predicted   = 0.0;
-        for (int i = 0; i < kFeatures; ++i) {
-            denominator += x[i] * px[i];
-            predicted += theta[i] * x[i];
-        }
-        const double error = observed_ms - predicted;
-        for (int i = 0; i < kFeatures; ++i) { theta[i] += px[i] / denominator * error; }
-        for (int i = 0; i < kFeatures; ++i) {
+            moment[i] = kForget * moment[i] + x[i] * observed_ms;
             for (int j = 0; j < kFeatures; ++j) {
-                covariance[i * kFeatures + j] =
-                    (covariance[i * kFeatures + j] - px[i] * px[j] / denominator) / kForget;
+                gram[i * kFeatures + j] = kForget * gram[i * kFeatures + j] + x[i] * x[j];
             }
         }
-        // Project onto the constraint predict() applies (no cost term below zero). Unprojected,
-        // the correlated column and draft-width terms settled at a large positive and a negative
-        // weight that fit the observed rounds, while predict() clamped the negative one away:
-        // wider keeps were overcharged ~10% at four to six requests and the choice under-kept
-        // (141 tok/s at four streams against 155 for a fixed keep of three).
-        theta[0] = std::max(1.0, theta[0]);
-        for (int i = 1; i < kFeatures; ++i) { theta[i] = std::max(0.0, theta[i]); }
+        for (int sweep = 0; sweep < 16; ++sweep) {
+            for (int i = 0; i < kFeatures; ++i) {
+                double numerator = moment[i] + ridge[i] * prior[i];
+                for (int j = 0; j < kFeatures; ++j) {
+                    if (j != i) { numerator -= gram[i * kFeatures + j] * theta[j]; }
+                }
+                const double value = numerator / (gram[i * kFeatures + i] + ridge[i]);
+                theta[i]           = std::max(i == 0 ? 1.0 : 0.0, value);
+            }
+        }
         ++rounds;
     }
 };
