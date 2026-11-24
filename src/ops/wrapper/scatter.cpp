@@ -30,6 +30,27 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
     detail::scatter_launch(src, indices, dst, stream);
 }
 
+void gather_columns(const Tensor& source, const Tensor& indices, Tensor& destination,
+                    cudaStream_t stream) {
+    if ((source.dtype != DType::BF16 && source.dtype != DType::I32 &&
+         source.dtype != DType::FP32) ||
+        destination.dtype != source.dtype || indices.dtype != DType::I32) {
+        throw std::invalid_argument("gather_columns: BF16, I32 or FP32 data with I32 indices");
+    }
+    if (source.ne[2] != 1 || source.ne[3] != 1 || destination.ne[2] != 1 ||
+        destination.ne[3] != 1 || indices.ne[1] != 1 || indices.ne[2] != 1 ||
+        indices.ne[3] != 1 || source.ne[0] != destination.ne[0] ||
+        indices.ne[0] != destination.ne[1] || source.ne[0] <= 0 || source.ne[1] <= 0) {
+        throw std::invalid_argument("gather_columns: expected source [D,S], indices [T], dst [D,T]");
+    }
+    if (destination.ne[1] == 0) { return; }
+    if (!source.is_contiguous() || !indices.is_contiguous() || !destination.is_contiguous() ||
+        source.data == nullptr || indices.data == nullptr || destination.data == nullptr) {
+        throw std::invalid_argument("gather_columns: tensors must be contiguous and non-null");
+    }
+    detail::gather_columns_launch(source, indices, destination, stream);
+}
+
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
                         Tensor& destination, cudaStream_t stream) {
     const std::int32_t width = source.ne[1];

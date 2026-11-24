@@ -126,6 +126,8 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    // Kept draft columns only (DFlash eager rounds); null verifies every padded column.
+    const VerifyCompaction* compaction     = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

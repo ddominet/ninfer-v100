@@ -631,6 +631,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 const std::int32_t aggregate = verify * batch;
                 WorkspaceLayoutBuilder target;
                 matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                if (!plan.use_cuda_graph) {
+                    // Kept-column verification (TextContext VerifyCompaction): kept RoPE
+                    // positions and tokens, the padded feature-capture copy, the kept final
+                    // hidden and logits, and the padded blocks expanded around the attention core
+                    // and the Gated DeltaNet input projection and recurrence. Over-reserved at
+                    // the full aggregate.
+                    matrix(target, DType::I32, 2, aggregate);
+                    matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                    matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                    matrix(target, DType::BF16, TextConfig::output_rows, aggregate);
+                    matrix(target, DType::BF16,
+                           2 * TextConfig::query_size + 2 * TextConfig::kv_size, aggregate);
+                    matrix(target, DType::BF16, TextConfig::hidden + 2 * TextConfig::value_dim,
+                           aggregate);
+                    matrix(target, DType::FP32, 2 * TextConfig::gdn_value_heads, aggregate);
+                }
                 target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =

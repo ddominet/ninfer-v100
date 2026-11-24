@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -905,6 +907,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             (speculative_backend == SpeculativeBackend::Mtp) ||
         mtp_lookup_replay_fold.has_value() != mtp_lookup_replay_records.has_value()) {
         throw std::logic_error("MTP lookup ReplaySSM records do not match the sequence plan");
+    }
+    {
+        const char* keep_all = std::getenv("NINFER_DFLASH_KEEP_ALL");
+        dflash_verify_budget = is_masked_draft_backend(speculative_backend) && !use_cuda_graph &&
+                               !(keep_all != nullptr && keep_all[0] == '1');
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
@@ -11396,8 +11403,9 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({TextConfig::token_domain});
-    request.sampling_host     = config;
-    request.speculative_stats = SpeculativeStats{
+    request.sampling_host       = config;
+    request.dflash_accept_ready = false;
+    request.speculative_stats   = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
@@ -12178,6 +12186,24 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     }
 }
 
+namespace {
+
+// Kept-column verification cost model, fitted on a V100 to the DFlash2 and MTP round times at one
+// to eight requests: a round costs a fixed part (weights, draft, the first request) plus a
+// per-request part, plus about 2.3 ms for every target row verified.
+constexpr double kDFlashVerifyRowMs       = 2.32;
+constexpr double kDFlashRoundBaseMs       = 33.0;
+constexpr double kDFlashRoundPerRequestMs = 1.6;
+constexpr float kDFlashAcceptLearning     = 0.15F;
+constexpr float kDFlashAcceptRelax        = 0.02F;
+
+// Starting estimate, before a request has history: P(at least j + 1 drafts accepted).
+float dflash_accept_prior(std::uint32_t j) noexcept {
+    return 0.75F * std::pow(0.72F, static_cast<float>(j));
+}
+
+} // namespace
+
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets,
@@ -12195,6 +12221,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     const std::uint32_t width           = draft_window + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
+    std::array<std::uint32_t, kMaximumConcurrency> draft_limit{};
+    std::array<std::uint32_t, kMaximumConcurrency> keep{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -12227,6 +12255,50 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
+        draft_limit[row] = extent;
+        keep[row]        = extent;
+    }
+
+    // Keep a draft's verify row only while its expected accepted tokens pay for it: start every
+    // request at its bonus row and greedily add the most likely next draft while
+    // P(row accepted) / row cost exceeds the round's tokens per millisecond so far.
+    if (dflash_verify_budget) {
+        const auto batch = static_cast<double>(lanes.size());
+        double tokens    = batch;
+        double millis    = kDFlashRoundBaseMs + kDFlashRoundPerRequestMs * (batch - 1.0) +
+                        kDFlashVerifyRowMs * batch;
+        std::array<float, kMaximumConcurrency> next{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            RequestControl& request = requests[lanes[row]];
+            if (!request.dflash_accept_ready) {
+                for (std::uint32_t j = 0; j < request.dflash_accept.size(); ++j) {
+                    request.dflash_accept[j] = dflash_accept_prior(j);
+                }
+                request.dflash_accept_ready = true;
+            }
+            keep[row] = 0;
+            next[row] = draft_limit[row] > 0 ? request.dflash_accept[0] : -1.0F;
+        }
+        for (;;) {
+            std::size_t best = lanes.size();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (next[row] >= 0.0F && (best == lanes.size() || next[row] > next[best])) {
+                    best = row;
+                }
+            }
+            if (best == lanes.size() ||
+                static_cast<double>(next[best]) * millis <= kDFlashVerifyRowMs * tokens) {
+                break;
+            }
+            tokens += next[best];
+            millis += kDFlashVerifyRowMs;
+            const RequestControl& request = requests[lanes[best]];
+            const std::uint32_t kept      = ++keep[best];
+            // Joint estimates are kept non-increasing along the block.
+            next[best] = kept < draft_limit[best]
+                             ? std::min(next[best], request.dflash_accept[kept])
+                             : -1.0F;
+        }
     }
 
     const auto started = Clock::now();
@@ -12257,8 +12329,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
-            const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            const std::uint32_t extent = keep[row];
+            (void)max_by_budget;
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -12283,6 +12355,30 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
+        }
+
+        // Kept columns: request row's columns 0..extent, in padded order j + width * row.
+        dflash_host_ingress->verify_live = 0;
+        {
+            std::int32_t live = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                for (std::uint32_t column = 0; column < width; ++column) {
+                    const auto padded = static_cast<std::int32_t>(column + width * row);
+                    if (column <= keep[row]) {
+                        dflash_host_ingress->verify_live_columns[static_cast<std::size_t>(live)] =
+                            padded;
+                        dflash_host_ingress->verify_padded_slots[static_cast<std::size_t>(padded)] =
+                            live++;
+                    } else {
+                        dflash_host_ingress->verify_padded_slots[static_cast<std::size_t>(padded)] =
+                            -1;
+                    }
+                }
+            }
+            if (dflash_verify_budget &&
+                live < static_cast<std::int32_t>(width * lanes.size())) {
+                dflash_host_ingress->verify_live = live;
+            }
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12329,6 +12425,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (dflash_verify_budget && request.dflash_accept_ready) {
+                for (std::uint32_t j = 0; j < request.dflash_accept.size(); ++j) {
+                    float& estimate = request.dflash_accept[j];
+                    if (j < extent) {
+                        const float observed = accepted_i > static_cast<std::int32_t>(j) ? 1.0F
+                                                                                        : 0.0F;
+                        estimate += kDFlashAcceptLearning * (observed - estimate);
+                    } else {
+                        // Unverified positions drift back toward the prior so they get retried.
+                        estimate += kDFlashAcceptRelax * (dflash_accept_prior(j) - estimate);
+                    }
+                }
+            }
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {

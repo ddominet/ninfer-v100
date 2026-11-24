@@ -75,4 +75,30 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream);
 
+/**
+ * Op: gather_columns
+ *
+ * Math / indexing:
+ *   destination[:, j] = indices[j] >= 0 ? source[:, indices[j]] : 0, for 0 <= j < T.
+ *
+ * Logical shapes:
+ *   source [D,S] and destination [D,T] of one dtype, BF16, I32 or FP32; I32 indices [T]; all
+ *   contiguous. Every index is -1 or in [0,S).
+ *
+ * Numeric:
+ *   Exact element copies; a negative index writes zeros.
+ *
+ * Effects:
+ *   Overwrites the whole destination. Source and destination must not alias. Graph-capturable;
+ *   the indices are read on device.
+ *
+ * Workspace:
+ *   None.
+ *
+ * Used to run speculative verification on only the kept draft columns: compact a padded
+ * [D, W*B] block to its live columns and expand the result back.
+ */
+void gather_columns(const Tensor& source, const Tensor& indices, Tensor& destination,
+                    cudaStream_t stream);
+
 } // namespace ninfer::ops

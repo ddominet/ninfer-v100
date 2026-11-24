@@ -120,6 +120,18 @@ struct NullTap {
     static constexpr bool enabled = false;
 };
 
+// Verification over only the kept draft columns of a padded [W, B] block. live_columns [C] holds
+// each kept column's padded index (W*b + j, ascending); padded_slots [W*B] holds each padded
+// column's compact index or -1. Token-local work (projections, MLPs, norms, the LM head) runs on
+// the C kept columns; the attention core, the Gated DeltaNet input projection, convolution and
+// recurrence, and feature capture keep the padded layout, whose dropped columns are masked by the
+// per-request valid column counts. Outputs are returned padded.
+struct VerifyCompaction {
+    const Tensor* live_columns = nullptr;
+    const Tensor* padded_slots = nullptr;
+    std::int32_t live          = 0;
+};
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
@@ -219,12 +231,14 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens,
+                             const VerifyCompaction* compaction = nullptr);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink,
+                             const VerifyCompaction* compaction = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -261,7 +275,13 @@ private:
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens, Tap& tap,
+                                  const VerifyCompaction* compaction);
+    // Padded [rows, W*B] copy of a compact [rows, C] tensor (dropped columns zero) and back.
+    [[nodiscard]] Tensor expand_verify_columns(const Tensor& compact, std::int32_t rows);
+    [[nodiscard]] Tensor compact_verify_columns(const Tensor& padded, std::int32_t rows);
+    template <class Tap>
+    void capture_verify_layer(Tap& tap, int layer, const Tensor& x);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -317,6 +337,8 @@ private:
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
+    const VerifyCompaction* active_compaction_                                     = nullptr;
+    Tensor active_tap_scratch_;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;

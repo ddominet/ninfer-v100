@@ -464,6 +464,10 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    // DFlash kept-column verification: running estimate, per draft position j, of the probability
+    // that at least j + 1 drafts are accepted (the j-th draft's verify row pays off).
+    std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_accept{};
+    bool dflash_accept_ready = false;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -630,6 +634,9 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
+    // Verify only the DFlash drafts whose expected acceptance pays for their target rows (eager
+    // rounds only; NINFER_DFLASH_KEEP_ALL=1 verifies every draft as before).
+    bool dflash_verify_budget = false;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;

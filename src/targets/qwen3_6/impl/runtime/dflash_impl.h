@@ -533,6 +533,20 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          &state.text_cache);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, active_lanes, valid_columns, width, batch_size);
+        const std::int32_t live = state.host_ingress.verify_live;
+        const auto* ingress_bytes = static_cast<unsigned char*>(frame.ingress.data);
+        const Tensor live_columns(
+            const_cast<unsigned char*>(ingress_bytes) +
+                offsetof(qwen3_6::DFlashDecodeIngress, verify_live_columns),
+            DType::I32, {static_cast<std::int32_t>(kMaximumConcurrency * kDFlashDecodeMaximumWidth)});
+        const Tensor padded_slots(
+            const_cast<unsigned char*>(ingress_bytes) +
+                offsetof(qwen3_6::DFlashDecodeIngress, verify_padded_slots),
+            DType::I32, {static_cast<std::int32_t>(kMaximumConcurrency * kDFlashDecodeMaximumWidth)});
+        const VerifyCompaction compaction{&live_columns, &padded_slots, live};
+        if (live < 0 || live > width * batch_size) {
+            throw std::logic_error("DFlash kept verify columns are out of range");
+        }
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);
@@ -565,6 +579,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .replay_records  = state.execution.replay_records,
                     .sampling        = frame.sampling,
                     .feature_sink    = &sink,
+                    .compaction      = live > 0 && live < width * batch_size ? &compaction : nullptr,
                 },
                 target_envelope);
         }

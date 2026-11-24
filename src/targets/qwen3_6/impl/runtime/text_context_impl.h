@@ -696,7 +696,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& linear_state_source_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                           Tap& tap) {
+                                           Tap& tap, const VerifyCompaction* compaction) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -732,34 +732,96 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
-        Tensor x        = work_.alloc(DType::BF16, {kCfg.hidden, columns});
         Tensor flat_ids = ids.view({columns});
-        ops::embedding(flat_ids, *embed_, x, stream);
-        if constexpr (Tap::enabled) { tap.begin(x); }
-        run_layers(x, Phase::Verify, tap);
-        if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
-            tap.capture_positions(cache_positions, stream);
-        }
         Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        if (compaction == nullptr || compaction->live == columns) {
+            Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, columns});
+            ops::embedding(flat_ids, *embed_, x, stream);
+            if constexpr (Tap::enabled) { tap.begin(x); }
+            run_layers(x, Phase::Verify, tap);
+            if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
+                tap.capture_positions(cache_positions, stream);
+            }
+            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        } else {
+            const std::int32_t live = compaction->live;
+            if (live <= 0 || live > columns || compaction->live_columns == nullptr ||
+                compaction->padded_slots == nullptr ||
+                compaction->live_columns->ne[0] < live ||
+                compaction->padded_slots->ne[0] < columns) {
+                throw std::invalid_argument("target verify compaction is invalid");
+            }
+            const Tensor live_columns = compaction->live_columns->slice(0, 0, live);
+            const Tensor padded_slots = compaction->padded_slots->slice(0, 0, columns);
+            const VerifyCompaction bound{&live_columns, &padded_slots, live};
+            ScopedValue<const VerifyCompaction*> compaction_binding(active_compaction_, &bound);
+            // RoPE runs on the kept columns; the attention core keeps the padded cache positions.
+            Tensor compact_rope = work_.alloc(DType::I32, {1, live});
+            ops::gather_columns(rope_positions.view({1, columns}), live_columns, compact_rope,
+                                stream);
+            const Tensor compact_rope_flat = compact_rope.view({live});
+            ScopedPositions compact_rope_binding(active_rope_positions_, compact_rope_flat);
+
+            Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, live});
+            {
+                auto scope   = work_.scope();
+                Tensor ids_c = work_.alloc(DType::I32, {1, live});
+                ops::gather_columns(ids.view({1, columns}), live_columns, ids_c, stream);
+                ops::embedding(ids_c.view({live}), *embed_, x, stream);
+            }
+            if constexpr (Tap::enabled) {
+                active_tap_scratch_ = work_.alloc(DType::BF16, {kCfg.hidden, columns});
+                ops::gather_columns(x, padded_slots, active_tap_scratch_, stream);
+                tap.begin(active_tap_scratch_);
+            }
+            run_layers(x, Phase::Verify, tap);
+            if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
+                tap.capture_positions(cache_positions, stream);
+            }
+            Tensor hidden_c = work_.alloc(DType::BF16, {kCfg.hidden, live});
+            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden_c, stream);
+            ops::gather_columns(hidden_c, padded_slots, flat_hidden, stream);
+            Tensor logits_c = work_.alloc(DType::BF16, {kCfg.vocab, live});
+            ops::linear(hidden_c, *lm_head_, logits_c, stream);
+            ops::gather_columns(logits_c, padded_slots, flat_logits, stream);
+            Tensor tokens_c = work_.alloc(DType::I32, {live});
+            ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
+            Tensor flat_tokens_row = flat_tokens.view({1, columns});
+            ops::gather_columns(tokens_c.view({1, live}), padded_slots, flat_tokens_row, stream);
+            active_tap_scratch_ = Tensor{};
+        }
     }
     work_.reset();
 }
 
-void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
-                                      const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows,
-                                      const Tensor& linear_state_source_slots,
-                                      ops::CausalAttentionExecutionEnvelope envelope,
-                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
-    NullTap tap;
-    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+Tensor TextContext::expand_verify_columns(const Tensor& compact, std::int32_t rows) {
+    const std::int32_t columns = active_sequence_width_ * active_sequence_batch_;
+    Tensor padded = work_.alloc(compact.dtype, {rows, columns});
+    ops::gather_columns(compact.view({rows, active_compaction_->live}),
+                        *active_compaction_->padded_slots, padded, ctx_.stream);
+    return padded;
+}
+
+Tensor TextContext::compact_verify_columns(const Tensor& padded, std::int32_t rows) {
+    const std::int32_t columns = active_sequence_width_ * active_sequence_batch_;
+    Tensor compact = work_.alloc(padded.dtype, {rows, active_compaction_->live});
+    ops::gather_columns(padded.view({rows, columns}), *active_compaction_->live_columns, compact,
+                        ctx_.stream);
+    return compact;
+}
+
+template <class Tap>
+void TextContext::capture_verify_layer(Tap& tap, int layer, const Tensor& x) {
+    if (active_compaction_ == nullptr) {
+        tap.capture_layer(layer, x, ctx_.stream);
+        return;
+    }
+    ops::gather_columns(x, *active_compaction_->padded_slots, active_tap_scratch_, ctx_.stream);
+    tap.capture_layer(layer, active_tap_scratch_, ctx_.stream);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -768,10 +830,24 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      const VerifyCompaction* compaction) {
+    NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+                             tap, compaction);
+}
+
+void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                                      const Tensor& rope_positions, const Tensor& valid_columns,
+                                      const Tensor& kv_table_rows,
+                                      const Tensor& linear_state_source_slots,
+                                      ops::CausalAttentionExecutionEnvelope envelope,
+                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens,
+                                      DFlashFeatureSink& sink,
+                                      const VerifyCompaction* compaction) {
+    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
+                             sink, compaction);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -854,19 +930,32 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
-        if (width <= 0 || width * active_sequence_batch_ != T) {
+        const bool compact = active_compaction_ != nullptr && ph == Phase::Verify;
+        if (width <= 0 || (!compact && width * active_sequence_batch_ != T) ||
+            (compact && active_compaction_->live != T)) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
         }
-        Tensor q_batch        = qn.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
-        Tensor k_batch        = kn.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
+        // Kept columns only: the attention core reads the padded per-request blocks, so q, k and
+        // v are expanded around it (dropped columns zero, masked by the valid counts).
+        const Tensor qp = compact ? expand_verify_columns(qn, kCfg.q_size) : qn;
+        const Tensor kp = compact ? expand_verify_columns(kn, kCfg.kv_size) : kn;
+        const Tensor vp = compact ? expand_verify_columns(v, kCfg.kv_size) : v;
+        Tensor ap = compact ? work_.alloc(DType::BF16, {kCfg.q_size, width * active_sequence_batch_})
+                            : a;
+        Tensor q_batch        = qp.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
+        Tensor k_batch        = kp.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
+        Tensor v_batch        = vp.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
+        Tensor a_batch        = ap.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
                                       kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a_batch, s);
+        if (compact) {
+            Tensor a_flat = a.view({kCfg.q_size, T});
+            ops::gather_columns(ap, *active_compaction_->live_columns, a_flat, s);
+        }
     } else {
         ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
@@ -889,8 +978,22 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
                                          work_, ctx_.execution_view());
 
-    const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
-    Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    // Kept-column verification: the control projection above ran on the C kept columns; the
+    // input projection, convolution and recurrence below read padded per-request blocks, so their
+    // inputs are expanded to P = W*B columns and the recurrent output is compacted back.
+    const bool compact = active_compaction_ != nullptr && ph == Phase::Verify;
+    const int P        = compact ? active_sequence_width_ * active_sequence_batch_ : T;
+    if (compact) {
+        if (active_compaction_->live != T) {
+            throw std::logic_error("GDN compaction does not match the kept columns");
+        }
+        h    = expand_verify_columns(h, kCfg.hidden);
+        g    = expand_verify_columns(g, kCfg.gdn_v_heads);
+        beta = expand_verify_columns(beta, kCfg.gdn_v_heads);
+    }
+
+    const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, P);
+    Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, P});
     Tensor qc             = projection.query;
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
@@ -900,7 +1003,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 "Verify GDN requires an explicit sequence batch and state slots");
         }
         const std::int32_t width = active_sequence_width_;
-        if (width <= 0 || width * active_sequence_batch_ != T) {
+        if (width <= 0 || width * active_sequence_batch_ != P) {
             throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
         }
         if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
@@ -938,12 +1041,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state_in, conv_state_out, qc, kc, vc, s);
     }
 
-    Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
-    Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
+    Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, P});
+    Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, P});
 
-    Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
-        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, P});
+    Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, P).view(
+        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, P});
     if (ph == Phase::Verify) {
         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
         const std::int32_t width = active_sequence_width_;
@@ -979,6 +1082,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                              o, s);
     }
 
+    if (compact) {
+        o = compact_verify_columns(o, kCfg.value_dim).view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        z = compact_verify_columns(z, kCfg.value_dim).view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    }
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
@@ -1032,7 +1139,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph, next_projection_hints(layer));
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                if constexpr (Tap::enabled) { capture_verify_layer(tap, layer, x); }
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -1053,7 +1160,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph, next_projection_hints(layer));
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                if constexpr (Tap::enabled) { capture_verify_layer(tap, layer, x); }
             }
         }
     }

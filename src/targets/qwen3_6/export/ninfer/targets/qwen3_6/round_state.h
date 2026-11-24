@@ -90,6 +90,12 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // Kept-column verification (TextContext VerifyCompaction): verify_live > 0 verifies only the
+    // listed padded columns (j + W*b, ascending); verify_padded_slots maps every padded column to
+    // its kept index or -1. Zero verifies the whole padded block.
+    std::int32_t verify_live = 0;
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> verify_live_columns{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> verify_padded_slots{};
 };
 
 struct DFlashDecodeEgress {

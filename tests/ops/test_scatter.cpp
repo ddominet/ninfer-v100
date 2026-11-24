@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -156,6 +157,45 @@ int continuation_case(int width, int batch) {
     return failures;
 }
 
+// gather_columns: compact a padded block to its live columns and expand it back, BF16 and I32,
+// with a -1 index writing zeros.
+template <class T>
+int gather_case(DType dtype, std::int32_t rows, const std::vector<std::int32_t>& indices,
+                std::int32_t source_columns) {
+    const std::int32_t columns = static_cast<std::int32_t>(indices.size());
+    const auto pattern = bit_pattern(static_cast<std::size_t>(rows) * source_columns *
+                                         (sizeof(T) / sizeof(std::uint16_t)),
+                                     0x5151'2020u + static_cast<std::uint32_t>(rows));
+    std::vector<T> source(static_cast<std::size_t>(rows) * source_columns);
+    std::memcpy(source.data(), pattern.data(), source.size() * sizeof(T));
+    std::vector<T> expected(static_cast<std::size_t>(rows) * columns, T{});
+    for (std::int32_t j = 0; j < columns; ++j) {
+        const std::int32_t from = indices[static_cast<std::size_t>(j)];
+        if (from < 0) { continue; }
+        std::copy_n(source.data() + static_cast<std::size_t>(from) * rows, rows,
+                    expected.data() + static_cast<std::size_t>(j) * rows);
+    }
+    GuardedDeviceBuffer device_source(source.size() * sizeof(T));
+    GuardedDeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_destination(expected.size() * sizeof(T));
+    device_source.copy_from_host(source.data(), source.size() * sizeof(T));
+    device_indices.copy_from_host(indices.data(), indices.size() * sizeof(std::int32_t));
+    device_destination.fill(0x5a);
+    cuda_synchronize();
+    Tensor source_tensor(device_source.data(), dtype, {rows, source_columns});
+    Tensor indices_tensor(device_indices.data(), DType::I32, {columns});
+    Tensor destination_tensor(device_destination.data(), dtype, {rows, columns});
+    ops::gather_columns(source_tensor, indices_tensor, destination_tensor, nullptr);
+    cuda_synchronize();
+    std::vector<T> actual(expected.size());
+    device_destination.copy_to_host(actual.data(), actual.size() * sizeof(T));
+    const bool same = std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(T)) == 0;
+    if (!same) {
+        std::cerr << "gather_columns D=" << rows << " T=" << columns << " mismatch\n";
+    }
+    return (same ? 0 : 1) + device_destination.verify_guards("gather_columns destination");
+}
+
 } // namespace
 
 int main() {
@@ -172,6 +212,14 @@ int main() {
     failures += scatter_case(2048, {5, 1, 3}, 7);
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
+    // Compact eight width-8 requests to ragged prefixes, then expand back with -1 holes.
+    failures += gather_case<std::uint16_t>(DType::BF16, 5120, {0, 1, 2, 8, 9, 16, 24, 25, 26, 63},
+                                           64);
+    failures += gather_case<std::uint16_t>(DType::BF16, 5120, {0, -1, 1, -1, 2, 3, -1, -1}, 4);
+    failures += gather_case<std::uint16_t>(DType::BF16, 6, {2, -1, 0}, 3);
+    failures += gather_case<std::int32_t>(DType::I32, 1, {7, 0, -1, 3}, 8);
+    failures += gather_case<std::int32_t>(DType::I32, 16, {1, 0, -1}, 2);
+    failures += gather_case<std::int32_t>(DType::FP32, 48, {3, -1, 0, 1, -1}, 4);
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }

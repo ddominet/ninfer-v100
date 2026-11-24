@@ -2,6 +2,7 @@
 
 #include "ops/kernel/scatter.cuh"
 #include "core/device.h"
+#include "core/dtype.h"
 
 #include <cstdint>
 #include <algorithm>
@@ -46,6 +47,49 @@ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
         source.ne[0] / 8, source.ne[1],
         destination.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
         destination.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
+// One CTA per destination column, 16-byte copies when the column bytes allow it.
+template <class Word>
+__global__ void gather_columns_kernel(const Word* __restrict__ source,
+                                      const std::int32_t* __restrict__ indices,
+                                      Word* __restrict__ destination, std::int64_t words) {
+    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t from   = indices[column];
+    Word* out                 = destination + static_cast<std::int64_t>(column) * words;
+    if (from < 0) {
+        for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = Word{}; }
+        return;
+    }
+    const Word* in = source + static_cast<std::int64_t>(from) * words;
+    for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = in[i]; }
+}
+
+} // namespace
+
+void gather_columns_launch(const Tensor& source, const Tensor& indices, Tensor& destination,
+                           cudaStream_t stream) {
+    const std::int64_t column_bytes = static_cast<std::int64_t>(source.ne[0]) * dtype_size(source.dtype);
+    const std::int32_t columns      = destination.ne[1];
+    const auto aligned = ((reinterpret_cast<std::uintptr_t>(source.data) |
+                           reinterpret_cast<std::uintptr_t>(destination.data)) & 0xfu) == 0;
+    const auto* ids = static_cast<const std::int32_t*>(indices.data);
+    if (aligned && column_bytes % 16 == 0) {
+        gather_columns_kernel<uint4><<<columns, 128, 0, stream>>>(
+            static_cast<const uint4*>(source.data), ids, static_cast<uint4*>(destination.data),
+            column_bytes / 16);
+    } else if (column_bytes % 4 == 0) {
+        gather_columns_kernel<std::uint32_t><<<columns, 128, 0, stream>>>(
+            static_cast<const std::uint32_t*>(source.data), ids,
+            static_cast<std::uint32_t*>(destination.data), column_bytes / 4);
+    } else {
+        gather_columns_kernel<std::uint16_t><<<columns, 128, 0, stream>>>(
+            static_cast<const std::uint16_t*>(source.data), ids,
+            static_cast<std::uint16_t*>(destination.data), column_bytes / 2);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
