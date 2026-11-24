@@ -913,6 +913,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const char* keep_all = std::getenv("NINFER_DFLASH_KEEP_ALL");
         dflash_verify_budget = is_masked_draft_backend(speculative_backend) && !use_cuda_graph &&
                                !(keep_all != nullptr && keep_all[0] == '1');
+        for (std::uint32_t j = 0; j < dflash_global_accept.size(); ++j) {
+            dflash_global_accept[j] = dflash_conditional_prior(j);
+        }
         const char* trace    = std::getenv("NINFER_DFLASH_TRACE");
         dflash_trace         = trace != nullptr && trace[0] == '1';
         const char* force    = std::getenv("NINFER_DFLASH_FORCE_KEEP");
@@ -12198,12 +12201,20 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 namespace {
 
-constexpr float kDFlashAcceptLearning     = 0.15F;
-constexpr float kDFlashAcceptRelax        = 0.02F;
+// Acceptance model for kept-column verification. Per position j the conditional rate
+// P(draft j accepted | drafts 0..j-1 accepted) is estimated per request from decayed hits/tries,
+// shrunk toward the engine-wide rate with kDFlashAcceptPrior pseudo-tries, so a position a request
+// has not verified lately follows what every other request has seen there. The joint
+// probability a draft row pays off is the product of the rates before it.
+constexpr float kDFlashAcceptDecay       = 0.92F;  // per verified round, per position
+constexpr float kDFlashAcceptPrior       = 3.0F;   // pseudo-tries of the engine-wide rate
+constexpr float kDFlashGlobalLearning    = 0.01F;  // engine-wide rate, per verified position
 
-// Starting estimate, before a request has history: P(at least j + 1 drafts accepted).
-float dflash_accept_prior(std::uint32_t j) noexcept {
-    return 0.75F * std::pow(0.72F, static_cast<float>(j));
+// Measured DFlash2 x7 conditional rates on chat and code prompts (P(at least j+1) of 0.78, 0.57,
+// 0.42, 0.27, 0.19, 0.13, 0.09): the starting engine-wide estimate.
+float dflash_conditional_prior(std::uint32_t j) noexcept {
+    constexpr float kRates[] = {0.78F, 0.73F, 0.74F, 0.64F, 0.70F, 0.68F, 0.72F};
+    return j < 7 ? kRates[j] : 0.70F;
 }
 
 } // namespace
@@ -12269,16 +12280,25 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // it keeps its whole block; a full batch drops the drafts least likely to be accepted.
     if (dflash_verify_budget) {
         std::array<float, kMaximumConcurrency> next{};
+        std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency>
+            joint_accept{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             RequestControl& request = requests[lanes[row]];
             if (!request.dflash_accept_ready) {
-                for (std::uint32_t j = 0; j < request.dflash_accept.size(); ++j) {
-                    request.dflash_accept[j] = dflash_accept_prior(j);
-                }
+                request.dflash_hits.fill(0.0F);
+                request.dflash_tries.fill(0.0F);
                 request.dflash_accept_ready = true;
             }
+            // Joint P(at least j + 1 accepted) along the block, from blended conditional rates.
+            float joint = 1.0F;
+            for (std::uint32_t j = 0; j < joint_accept[row].size(); ++j) {
+                const float rate = (request.dflash_hits[j] + kDFlashAcceptPrior * dflash_global_accept[j]) /
+                                   (request.dflash_tries[j] + kDFlashAcceptPrior);
+                joint *= rate;
+                joint_accept[row][j] = joint;
+            }
             keep[row] = 0;
-            next[row] = draft_limit[row] > 0 ? request.dflash_accept[0] : -1.0F;
+            next[row] = draft_limit[row] > 0 ? joint_accept[row][0] : -1.0F;
         }
         std::array<std::uint8_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> order{};
         std::array<std::uint32_t, kMaximumConcurrency> taken{};
@@ -12309,11 +12329,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 best_rate  = rate;
                 best_count = candidates;
             }
-            const RequestControl& request = requests[lanes[pick]];
-            const std::uint32_t kept      = ++taken[pick];
-            // Joint estimates are kept non-increasing along the block.
-            next[pick] = kept < draft_limit[pick] ? std::min(next[pick], request.dflash_accept[kept])
-                                                  : -1.0F;
+            const std::uint32_t kept = ++taken[pick];
+            next[pick] = kept < draft_limit[pick] ? joint_accept[pick][kept] : -1.0F;
         }
         // Every sixteenth round verifies up to one more tile of drafts than the model wants, so
         // the column slope keeps being observed even when the model prefers short rounds.
@@ -12582,16 +12599,15 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
             if (dflash_verify_budget && request.dflash_accept_ready) {
-                for (std::uint32_t j = 0; j < request.dflash_accept.size(); ++j) {
-                    float& estimate = request.dflash_accept[j];
-                    if (j < extent) {
-                        const float observed = accepted_i > static_cast<std::int32_t>(j) ? 1.0F
-                                                                                        : 0.0F;
-                        estimate += kDFlashAcceptLearning * (observed - estimate);
-                    } else {
-                        // Unverified positions drift back toward the prior so they get retried.
-                        estimate += kDFlashAcceptRelax * (dflash_accept_prior(j) - estimate);
-                    }
+                // Position j was reached when the drafts before it were accepted (j <= accepted)
+                // and verified (j < extent); it hit when draft j was accepted too.
+                const auto reached = std::min<std::uint32_t>(
+                    extent, static_cast<std::uint32_t>(accepted_i) + 1U);
+                for (std::uint32_t j = 0; j < reached; ++j) {
+                    const float hit = static_cast<std::int32_t>(j) < accepted_i ? 1.0F : 0.0F;
+                    request.dflash_hits[j]  = kDFlashAcceptDecay * request.dflash_hits[j] + hit;
+                    request.dflash_tries[j] = kDFlashAcceptDecay * request.dflash_tries[j] + 1.0F;
+                    dflash_global_accept[j] += kDFlashGlobalLearning * (hit - dflash_global_accept[j]);
                 }
             }
             if (extent == 0) {

@@ -465,9 +465,11 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
-    // DFlash kept-column verification: running estimate, per draft position j, of the probability
-    // that at least j + 1 drafts are accepted (the j-th draft's verify row pays off).
-    std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_accept{};
+    // DFlash kept-column verification: decayed per-position evidence for this request's conditional
+    // acceptance, P(draft j accepted | drafts before it accepted): hits and tries at each position
+    // it verified. Blended with the engine-wide rate where its own evidence is thin.
+    std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_hits{};
+    std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_tries{};
     bool dflash_accept_ready = false;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
@@ -702,6 +704,9 @@ public:
     // Verify only the DFlash drafts whose expected acceptance pays for their target rows (eager
     // rounds only; NINFER_DFLASH_KEEP_ALL=1 verifies every draft as before).
     bool dflash_verify_budget = false;
+    // Engine-wide conditional acceptance per draft position, updated by every request's verified
+    // positions; the prior for positions a request has not verified recently.
+    std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_global_accept{};
     DFlashCostModel dflash_cost;
     std::size_t dflash_round_kept     = 0;
     std::size_t dflash_round_widest   = 0;
