@@ -12188,14 +12188,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 namespace {
 
-// Kept-column verification cost model, from nsys profiles of DFlash2 x7 and MTP K=3 rounds at one
-// and eight requests on a V100. The target's GEMMs work in 8-column tiles, so a round costs a
-// fixed part, a per-request part, about 6.5 ms per 8 kept target columns and 0.25 ms per column
-// (attention, recurrence, copies), plus one 1.24 ms proposal-head read per 8 kept draft positions.
-constexpr double kDFlashRoundBaseMs        = 31.8;
+// Kept-column verification cost model, from nsys profiles of DFlash2 x7 and MTP K=3 rounds on a
+// V100. Target time is flat while the GEMMs are bound by reading the weights -- about 34 ms at 4
+// and at 8 columns -- and then grows about 1 ms per column (60 ms at 32, 86 ms at 64). Each round
+// also pays a per-request part and one 1.24 ms proposal-head read per 8 kept draft positions.
+constexpr double kDFlashRoundBaseMs        = 38.6;
 constexpr double kDFlashRoundPerRequestMs  = 1.6;
-constexpr double kDFlashTargetTileMs       = 6.5;
-constexpr double kDFlashTargetColumnMs     = 0.25;
+constexpr double kDFlashFlatColumns        = 8.0;
+constexpr double kDFlashTargetColumnMs     = 1.0;
 constexpr double kDFlashHeadChunkMs        = 1.24;
 
 double dflash_round_ms(std::size_t requests, std::size_t kept_drafts) noexcept {
@@ -12204,7 +12204,7 @@ double dflash_round_ms(std::size_t requests, std::size_t kept_drafts) noexcept {
                                           : std::ceil(static_cast<double>(std::max<std::size_t>(
                                                           kept_drafts, 5)) / 8.0);
     return kDFlashRoundBaseMs + kDFlashRoundPerRequestMs * static_cast<double>(requests - 1) +
-           kDFlashTargetTileMs * std::ceil(columns / 8.0) + kDFlashTargetColumnMs * columns +
+           kDFlashTargetColumnMs * std::max(0.0, columns - kDFlashFlatColumns) +
            kDFlashHeadChunkMs * head;
 }
 constexpr float kDFlashAcceptLearning     = 0.15F;
