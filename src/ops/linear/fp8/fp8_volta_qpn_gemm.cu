@@ -1,4 +1,5 @@
 #include "ops/linear/volta_fp16_stage.h"
+#include "ops/linear/volta_tc_skinny.h"
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
@@ -90,6 +91,60 @@ __global__ void volta_stage_group_major_kernel(const __nv_bfloat16* __restrict__
 
 void* volta_stream_scratch(cudaStream_t stream, std::size_t bytes) {
     return volta_stage_scratch(stream, bytes, 1);
+}
+
+VoltaTcControl& volta_tc_control() {
+    static VoltaTcControl control = [] {
+        VoltaTcControl initial;
+        const char* enabled = std::getenv("NINFER_VOLTA_TC");
+        initial.enabled     = enabled != nullptr && enabled[0] == '0' ? 0 : 1;
+        const char* minimum = std::getenv("NINFER_VOLTA_TC_MIN_T");
+        initial.min_tokens  = minimum != nullptr && std::atoi(minimum) > 0 ? std::atoi(minimum) : 9;
+        return initial;
+    }();
+    return control;
+}
+
+bool volta_tc_applies(int n, int k, int t) {
+    const VoltaTcControl& control = volta_tc_control();
+    return control.enabled == 1 && t >= control.min_tokens && t <= 64 && n > 0 && n % 64 == 0 &&
+           k > 0 && k % 128 == 0;
+}
+
+VoltaTcSplitWorkspace volta_tc_split_workspace(cudaStream_t stream, std::size_t partial_floats,
+                                               std::size_t semaphores) {
+    // FP32 partials of the widest split shape (17408 rows x 64 tokens is 4.25 MiB) and one
+    // semaphore per row block, allocated and zeroed once per stream and never freed (pointers
+    // baked into captured graphs stay valid).
+    constexpr std::size_t kPartialBytes   = std::size_t{17408} * 64 * sizeof(float);
+    constexpr std::size_t kSemaphoreCount = 1024;
+    struct Workspace {
+        void* data = nullptr;
+        bool tried = false;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<cudaStream_t, Workspace> workspace_by_stream;
+    if (partial_floats * sizeof(float) > kPartialBytes || semaphores > kSemaphoreCount) {
+        return {};
+    }
+    const std::lock_guard<std::mutex> lock(mutex);
+    Workspace& workspace = workspace_by_stream[stream];
+    if (!workspace.tried) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture != cudaStreamCaptureStatusNone) { return {}; }
+        workspace.tried         = true;
+        const std::size_t bytes = kPartialBytes + kSemaphoreCount * sizeof(unsigned);
+        if (cudaMalloc(&workspace.data, bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            workspace.data = nullptr;
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(workspace.data, 0, bytes, stream));
+        }
+    }
+    if (workspace.data == nullptr) { return {}; }
+    return {static_cast<float*>(workspace.data),
+            reinterpret_cast<unsigned*>(static_cast<char*>(workspace.data) + kPartialBytes)};
 }
 
 const half* volta_stage_fp16_activation(const Tensor& x, cudaStream_t stream) {

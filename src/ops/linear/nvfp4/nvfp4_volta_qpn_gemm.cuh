@@ -46,6 +46,7 @@
 // output.
 
 #include "ops/linear/volta_fp16_stage.h"
+#include "ops/linear/volta_tc_skinny.cuh"
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
@@ -105,6 +106,54 @@ __device__ __forceinline__ half2 nvfp4_decode_e4m3_scale(std::uint8_t b) {
                              static_cast<std::uint16_t>((b & 0x7Fu) << 7);
     return __half2half2(__ushort_as_half(hb));
 }
+
+// Prepacked NVFP4 (nvfp4_prepack_sm70.cu: codes [N/32 tile][K/16 group][lane] x 8 bytes in the
+// order that decodes to adjacent-k pairs, scales [tile][group][lane] x 1 E4M3 byte) for the
+// tensor-core route (volta_tc_skinny.cuh). One item is two adjacent lanes of one group: 16 code
+// bytes and 2 scale bytes. Decoding matches nvfp4_volta_qpn_prepacked_kernel value for value.
+struct Nvfp4VoltaTcDecoder {
+    const std::uint8_t* codes;
+    const std::uint8_t* scales;
+    int groups; // K / 16
+    float inverse_weight_divisor;
+
+    static constexpr int kItemsPerTileChunk = 64; // 4 groups x 16 lane pairs
+    struct Raw {
+        uint4 q;
+        std::uint16_t s;
+    };
+
+    __device__ __forceinline__ Raw load(int tile, int chunk, int item) const {
+        const std::int64_t index =
+            (static_cast<std::int64_t>(tile) * groups + chunk * 4 + (item >> 4)) * 32 +
+            (item & 15) * 2;
+        return {__ldg(reinterpret_cast<const uint4*>(codes + index * 8)),
+                __ldg(reinterpret_cast<const std::uint16_t*>(scales + index))};
+    }
+    __device__ __forceinline__ void store(const Raw& raw, int item, half* tile, int lds) const {
+        const half2 rebias   = __float2half2_rn(16384.0f);
+        const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int lane = (item & 15) * 2 + h;
+            const half2 sc2 = __hmul2(
+                nvfp4_decode_e4m3_scale(static_cast<std::uint8_t>(h != 0 ? raw.s >> 8 : raw.s & 0xffu)),
+                divisor2);
+            half2 b[8];
+            nvfp4_decode_e2m1_quad(h != 0 ? raw.q.z : raw.q.x, rebias,
+                                   *reinterpret_cast<half2(*)[4]>(&b[0]));
+            nvfp4_decode_e2m1_quad(h != 0 ? raw.q.w : raw.q.y, rebias,
+                                   *reinterpret_cast<half2(*)[4]>(&b[4]));
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { b[j] = __hmul2(b[j], sc2); }
+            auto* destination =
+                reinterpret_cast<uint4*>(tile + volta_tc_lane_row(lane) * lds + (item >> 4) * 16);
+            destination[0] = reinterpret_cast<const uint4*>(b)[0];
+            destination[1] = reinterpret_cast<const uint4*>(b)[1];
+        }
+    }
+    __device__ __forceinline__ float finish(int, float value) const { return value; }
+};
 
 // Reorders eight sequential-k activations into the decoder's (j, j+4) grouping -- two PRMTs,
 // register-only. `seq` and `out` do not alias.
@@ -498,6 +547,15 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked;
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
+    // Past one 8-row tile, a prepacked weight goes through the tensor-core route: one weight read
+    // for all T columns instead of one per 8-row tile.
+    if (prepacked && t > S::kRowsPerTile &&
+        launch_volta_tc_skinny(
+            Nvfp4VoltaTcDecoder{codes, scales, k / S::kGroupK, inverse_weight_divisor}, xd, n, k,
+            t, std::is_same_v<Activation, VoltaGroupMajorHalf> ? volta_group_major_tiles(t) : 0,
+            output, stream)) {
+        return;
+    }
     if (t <= S::kRowsPerTile) {
         if (t == 1 && split_half) {
             // T=1 gate/up half, checksum-locked: SPLITK 16 / NACC 2 is 326 GB/s and

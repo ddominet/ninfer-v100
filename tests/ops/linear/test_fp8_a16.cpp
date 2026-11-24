@@ -29,6 +29,23 @@ int run_fp8_a16() {
     };
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {16384, 5120, 817U, Comparison::Sampled, true, gdn_invocations});
+    // Speculative verify widths on the target projection shapes: the tensor-core route, split K
+    // on the 5120-row residual projection.
+    constexpr std::array verify_invocations{
+        Invocation{9, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{40, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+    };
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {14336, 5120, 831U, Comparison::Sampled, true, verify_invocations});
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {16384, 5120, 832U, Comparison::Sampled, true, verify_invocations});
+    failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                          {5120, 6144, 833U, Comparison::Sampled, true, verify_invocations});
     constexpr std::array mlp_invocations{
         Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
         Invocation{2, CallForm::A16Convenience, ops::LinearPolicy::A16Only},

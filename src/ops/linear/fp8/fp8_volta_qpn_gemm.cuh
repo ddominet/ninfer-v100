@@ -34,6 +34,7 @@
 // mapping to +-480, which weights never contain.
 
 #include "ops/linear/volta_fp16_stage.h"
+#include "ops/linear/volta_tc_skinny.cuh"
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
@@ -69,6 +70,40 @@ __device__ __forceinline__ void fp8_decode_quad(std::uint32_t word, half2& lo, h
     lo                            = *reinterpret_cast<const half2*>(&v0);
     hi                            = *reinterpret_cast<const half2*>(&v1);
 }
+
+// Prepacked FP8 ([N/32 tile][K/128 block][8 slices][lane] x 16 bytes, fp8_prepack_sm70.cu) for the
+// tensor-core route (volta_tc_skinny.cuh): one item is one lane's 16-byte slice of a 64-K chunk.
+// Values decode to 2^-8 times their magnitude, as in the quadpair kernel; the row scale and the
+// 256 are applied once per output.
+struct Fp8VoltaTcDecoder {
+    const uint4* codes;
+    const __nv_bfloat16* scales;
+    int blocks; // K / 128
+
+    static constexpr int kItemsPerTileChunk = 128;
+    struct Raw {
+        uint4 q;
+    };
+
+    __device__ __forceinline__ Raw load(int tile, int chunk, int item) const {
+        const std::int64_t block = static_cast<std::int64_t>(tile) * blocks + (chunk >> 1);
+        return {__ldg(codes + (block * 8 + (chunk & 1) * 4 + (item >> 5)) * 32 + (item & 31))};
+    }
+    __device__ __forceinline__ void store(const Raw& raw, int item, half* tile, int lds) const {
+        auto* destination =
+            reinterpret_cast<half2*>(tile + volta_tc_lane_row(item & 31) * lds + (item >> 5) * 16);
+        half2 values[8];
+        fp8_decode_quad(raw.q.x, values[0], values[1]);
+        fp8_decode_quad(raw.q.y, values[2], values[3]);
+        fp8_decode_quad(raw.q.z, values[4], values[5]);
+        fp8_decode_quad(raw.q.w, values[6], values[7]);
+        reinterpret_cast<uint4*>(destination)[0] = reinterpret_cast<const uint4*>(values)[0];
+        reinterpret_cast<uint4*>(destination)[1] = reinterpret_cast<const uint4*>(values)[1];
+    }
+    __device__ __forceinline__ float finish(int row, float value) const {
+        return value * (__bfloat162float(scales[row]) * 256.0f);
+    }
+};
 
 // `kTiles` is the number of 8-row A tiles, so T <= 8 * kTiles. Each tile adds eight float
 // accumulators and an A fragment per lane, so the resident-CTA target has to come down with it or
@@ -237,6 +272,16 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const __nv_bfloat16*>(w.scales);
     const bool prepacked = w.layout == QuantLayout::VoltaQpnPrepacked;
+    // Past one 8-row tile, a prepacked weight goes through the tensor-core route: one weight read
+    // for all T columns instead of one per 8-row tile.
+    if constexpr (std::is_same_v<Activation, half> || std::is_same_v<Activation, __nv_bfloat16>) {
+        if (prepacked && t > S::kRowsPerTile &&
+            launch_volta_tc_skinny(
+                Fp8VoltaTcDecoder{reinterpret_cast<const uint4*>(codes), scales, k / 128}, xd, n,
+                k, t, 0, output, stream)) {
+            return;
+        }
+    }
     // Generation-2 winners from a private sweep (bench/ops/fp8_qpn8_splitk_sweep.cu, deleted):
     // SPLITK8 NACC1 wins at every kTiles on attn input, GDN input, and the 17408-K residual shape
     // (1.08-1.55x over SPLITK4). The 6144-K residual shape is the one exception -- SPLITK16 wins

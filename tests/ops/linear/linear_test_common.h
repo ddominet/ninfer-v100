@@ -42,6 +42,8 @@ struct ShapeCase {
     std::span<const Invocation> invocations;
     // Permute a W8 weight to the load-time QPN layout before every invocation (Volta only).
     bool prepack_w8 = false;
+    // Permute an NVFP4 weight to the load-time QPN layout (Volta only).
+    bool prepack_nvfp4 = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,

@@ -42,6 +42,30 @@ int run_nvfp4_a16() {
                           {5120, 6144, 705U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
+    // The runtime prepacks the MLP weights; past eight tokens they take the tensor-core route
+    // (one 16-token tile per 16 columns, split K on the 5120-row shape).
+    constexpr std::array prepacked_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{9, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{49, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+    };
+    for (const auto& [n, k, seed] : {std::array{17408, 5120, 711}, std::array{34816, 5120, 712},
+                                     std::array{5120, 17408, 713}, std::array{5120, 6144, 714}}) {
+        ShapeCase shape{n, k, static_cast<std::uint32_t>(seed), Comparison::Sampled, true,
+                        prepacked_invocations};
+        shape.prepack_nvfp4 = true;
+        failures += run_shape("NVFP4_A16 prepacked", ActivationCompute::A16, make_nvfp4_weight,
+                              shape);
+    }
     return failures;
 }
 
