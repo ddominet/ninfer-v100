@@ -562,6 +562,13 @@ struct DFlashCostModel {
                     (covariance[i * kFeatures + j] - px[i] * px[j] / denominator) / kForget;
             }
         }
+        // Project onto the constraint predict() applies (no cost term below zero). Unprojected,
+        // the correlated column and draft-width terms settled at a large positive and a negative
+        // weight that fit the observed rounds, while predict() clamped the negative one away:
+        // wider keeps were overcharged ~10% at four to six requests and the choice under-kept
+        // (141 tok/s at four streams against 155 for a fixed keep of three).
+        theta[0] = std::max(1.0, theta[0]);
+        for (int i = 1; i < kFeatures; ++i) { theta[i] = std::max(0.0, theta[i]); }
         ++rounds;
     }
 };

@@ -12565,6 +12565,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                  dflash_host_ingress->proposal_extents[row],
                                  row + 1 < lanes.size() ? "," : "\n");
                 }
+                if (dflash_cost.rounds % 64 == 0) {
+                    const auto& t = dflash_cost.theta;
+                    std::fprintf(stderr, "dflash-theta %.3f %.3f %.3f %.3f %.3f %.3f\n", t[0],
+                                 t[1], t[2], t[3], t[4], t[5]);
+                }
             }
             // Skip rounds stalled by something else (a host hiccup, a first-use allocation).
             if (seconds * 1000.0 < 3.0 * predicted) {
