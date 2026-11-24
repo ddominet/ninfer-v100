@@ -12273,7 +12273,6 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // with the best expected tokens / modelled round time. One request fits one target tile, so
     // it keeps its whole block; a full batch drops the drafts least likely to be accepted.
     if (dflash_verify_budget) {
-        std::array<float, kMaximumConcurrency> next{};
         std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency>
             joint_accept{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -12292,43 +12291,80 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 joint_accept[row][j] = joint;
             }
             keep[row] = 0;
-            next[row] = draft_limit[row] > 0 ? joint_accept[row][0] : -1.0F;
         }
-        std::array<std::uint8_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> order{};
-        std::array<std::uint32_t, kMaximumConcurrency> taken{};
-        std::size_t candidates = 0;
-        double tokens          = static_cast<double>(lanes.size());
         double context_sum = 0.0;
         for (const std::uint32_t lane : lanes) {
             context_sum += static_cast<double>(active_sequence(lane).execution_frontier);
         }
         const double mean_context = context_sum / static_cast<double>(lanes.size());
-        double best_rate = tokens / dflash_cost.predict(lanes.size(), 0, mean_context, 1);
-        std::size_t widest = 1;
-        std::size_t best_count = 0;
-        for (;;) {
-            std::size_t pick = lanes.size();
+        std::uint32_t limit_max   = 0;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            limit_max = std::max(limit_max, draft_limit[row]);
+        }
+        // Greedy within a draft-block width cap: every request's next draft (each request's
+        // drafts stay a prefix, at most `cap` deep) in order of its acceptance estimate; returns
+        // the best expected tokens per modelled millisecond over the greedy prefixes and the
+        // prefix length, and with `apply` keeps that many. The cap is searched explicitly because
+        // one deep keep widens the five-layer draft block for every request: greedy alone handed a
+        // fourth draft to one request before a third to another, and under load lost 15% of its
+        // throughput to a fixed keep of three.
+        auto greedy = [&](std::uint32_t cap, std::size_t apply_count, bool apply) {
+            std::array<float, kMaximumConcurrency> next_draft{};
+            std::array<std::uint32_t, kMaximumConcurrency> taken{};
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                if (next[row] >= 0.0F && (pick == lanes.size() || next[row] > next[pick])) {
-                    pick = row;
-                }
+                next_draft[row] =
+                    std::min(cap, draft_limit[row]) > 0 ? joint_accept[row][0] : -1.0F;
             }
-            if (pick == lanes.size()) { break; }
-            tokens += next[pick];
-            order[candidates++] = static_cast<std::uint8_t>(pick);
-            widest = std::max<std::size_t>(widest, taken[pick] + 1U);
-            const double rate =
-                tokens / dflash_cost.predict(lanes.size(), candidates, mean_context, widest);
+            double tokens       = static_cast<double>(lanes.size());
+            double best         = tokens / dflash_cost.predict(lanes.size(), 0, mean_context, 0);
+            std::size_t count   = 0;
+            std::size_t chosen  = 0;
+            std::size_t widest  = 1; // the draft block is at least anchor + one draft wide
+            for (;;) {
+                if (apply && count == apply_count) { break; }
+                std::size_t pick = lanes.size();
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    if (next_draft[row] >= 0.0F &&
+                        (pick == lanes.size() || next_draft[row] > next_draft[pick])) {
+                        pick = row;
+                    }
+                }
+                if (pick == lanes.size()) { break; }
+                tokens += next_draft[pick];
+                ++count;
+                const std::uint32_t kept = ++taken[pick];
+                if (apply) { ++keep[pick]; }
+                widest = std::max<std::size_t>(widest, kept);
+                const double rate =
+                    tokens / dflash_cost.predict(lanes.size(), count, mean_context, widest);
+                if (rate > best) {
+                    best   = rate;
+                    chosen = count;
+                }
+                next_draft[pick] = kept < std::min(cap, draft_limit[pick])
+                                       ? joint_accept[pick][kept]
+                                       : -1.0F;
+            }
+            return std::pair<double, std::size_t>{best, apply ? count : chosen};
+        };
+        double best_rate       = -1.0;
+        std::uint32_t best_cap = 0;
+        std::size_t best_count = 0;
+        for (std::uint32_t cap = 1; cap <= limit_max; ++cap) {
+            const auto [rate, count] = greedy(cap, 0, false);
             if (rate > best_rate) {
                 best_rate  = rate;
-                best_count = candidates;
+                best_cap   = cap;
+                best_count = count;
             }
-            const std::uint32_t kept = ++taken[pick];
-            next[pick] = kept < draft_limit[pick] ? joint_accept[pick][kept] : -1.0F;
         }
-        // Every sixteenth round verifies up to one more tile of drafts than the model wants, so
-        // the column slope keeps being observed even when the model prefers short rounds.
-        if (dflash_cost.rounds % 16 == 15) { best_count = std::min(candidates, best_count + 8); }
+        // Every sixteenth round verifies one draft deeper than the model wants (up to a draft more
+        // per request), so the column and width slopes keep being observed when the model prefers
+        // short rounds.
+        if (dflash_cost.rounds % 16 == 15 && best_cap < limit_max) {
+            best_cap += 1;
+            best_count += lanes.size();
+        }
         if (dflash_force_keep >= 0) {
             // Experiment: every request keeps the same number of drafts (cost-curve sweeps).
             best_count = 0;
@@ -12337,11 +12373,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     static_cast<std::uint32_t>(dflash_force_keep));
                 best_count += keep[row];
             }
-            candidates = 0;
         }
-        if (dflash_force_keep < 0) {
-            for (std::size_t i = 0; i < best_count; ++i) { ++keep[order[i]]; }
-        }
+        if (dflash_force_keep < 0) { best_count = greedy(best_cap, best_count, true).second; }
         dflash_round_kept    = best_count;
         dflash_round_context = mean_context;
         dflash_round_widest  = 1;
