@@ -771,7 +771,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      mtp_draft_ladder(plan.mtp_draft_ladder), speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
+      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -906,23 +906,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         mtp_lookup_replay_fold.has_value() != mtp_lookup_replay_records.has_value()) {
         throw std::logic_error("MTP lookup ReplaySSM records do not match the sequence plan");
     }
-    for (std::uint32_t k = 1; k < qwen3_6::kMtpNarrowSlots; ++k) {
-        const bool expected = speculative_backend == SpeculativeBackend::Mtp &&
-                              k < draft_window && qwen3_6::mtp_ladder_uses(mtp_draft_ladder, k);
-        if (plan.persistent.mtp_narrow_replay_records[k].has_value() != expected) {
-            throw std::logic_error("MTP narrow ReplaySSM records do not match the sequence plan");
-        }
-        if (expected) {
-            mtp_narrow_replay_records[k].emplace(backing,
-                                                 *plan.persistent.mtp_narrow_replay_records[k]);
-            mtp_narrow_replay_fold[k].emplace(*mtp_narrow_replay_records[k],
-                                              state_images->linear().all_layers_view());
-        }
-    }
-    if (qwen3_6::has_mtp_ladder(mtp_draft_ladder) &&
-        (speculative_backend != SpeculativeBackend::Mtp || use_cuda_graph)) {
-        throw std::logic_error("MTP draft lengths by batch size need MTP without CUDA Graphs");
-    }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
         if (local == nullptr) {
@@ -989,11 +972,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (io.mtp_lookup_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("MTP lookup decode frame does not match the sequence plan");
-    }
-    for (std::uint32_t k = 1; k < qwen3_6::kMtpNarrowSlots; ++k) {
-        if (io.mtp_narrow_decode[k].has_value() != mtp_narrow_replay_records[k].has_value()) {
-            throw std::logic_error("MTP narrow decode frame does not match the sequence plan");
-        }
     }
     if (io.ordinary.has_value() != (speculative_backend == SpeculativeBackend::None)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
@@ -10135,22 +10113,11 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     if (!replay_fold) {
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
-    // MTP rounds recorded at the width they ran: the window, lookup (16), or a narrower ladder
-    // draft length. The fold must read the record set that round wrote.
-    const std::uint32_t pending_width = requests[lanes.front()].pending.row_stride;
     const bool lookup_pending = speculative_backend == SpeculativeBackend::Mtp &&
-                                pending_width == qwen3_6::kMtpLookupMaximumWidth;
-    const bool narrow_pending = speculative_backend == SpeculativeBackend::Mtp &&
-                                !lookup_pending && pending_width != draft_window + 1U;
-    if (narrow_pending &&
-        (pending_width < 2U || pending_width - 1U >= qwen3_6::kMtpNarrowSlots ||
-         !mtp_narrow_replay_fold[pending_width - 1U])) {
-        throw std::logic_error("speculative pending batch has an unplanned MTP width");
-    }
+                                requests[lanes.front()].pending.row_stride ==
+                                    qwen3_6::kMtpLookupMaximumWidth;
     ops::GdnReplayFoldPlan& active_replay_fold =
-        lookup_pending   ? *mtp_lookup_replay_fold
-        : narrow_pending ? *mtp_narrow_replay_fold[pending_width - 1U]
-                         : *replay_fold;
+        lookup_pending ? *mtp_lookup_replay_fold : *replay_fold;
 
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
@@ -10162,7 +10129,8 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             throw std::logic_error("speculative pending batch no longer matches Program state");
         }
         const PendingCandidate& pending = requests[lane].pending;
-        if (speculative_backend == SpeculativeBackend::Mtp && pending.row_stride != pending_width) {
+        if (speculative_backend == SpeculativeBackend::Mtp &&
+            ((pending.row_stride == qwen3_6::kMtpLookupMaximumWidth) != lookup_pending)) {
             throw std::logic_error("speculative pending rows use different verification frames");
         }
         const SequenceState& sequence   = active_sequence(lane);
@@ -10226,10 +10194,10 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             Tensor selected;
             Tensor destinations;
             if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
+                const bool lookup = requests[lanes.front()].pending.row_stride ==
+                                    qwen3_6::kMtpLookupMaximumWidth;
                 qwen3_6::MtpDecodeState& frame =
-                    lookup_pending   ? *io.mtp_lookup_decode
-                    : narrow_pending ? *io.mtp_narrow_decode[pending_width - 1U]
-                                     : *io.mtp_decode;
+                    lookup ? *io.mtp_lookup_decode : *io.mtp_decode;
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
@@ -12048,26 +12016,12 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
     }
 
-    // The learned draft length for this batch size: the full window, or a narrower ladder entry
-    // with its own frame and ReplaySSM records (eager only; checked at construction).
-    const std::uint32_t learned_k =
-        qwen3_6::mtp_draft_length(mtp_draft_ladder, draft_window, lanes.size());
-    const bool narrow = !use_lookup && learned_k != draft_window;
-    if (narrow && (learned_k == 0 || learned_k > draft_window ||
-                   !io.mtp_narrow_decode[learned_k] || !mtp_narrow_replay_records[learned_k] ||
-                   use_cuda_graph)) {
-        throw std::logic_error("MTP draft length has no narrow frame");
-    }
     const std::uint32_t verify_k =
-        use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : learned_k;
-    const std::uint32_t proposal_k = use_lookup ? 1U : learned_k;
+        use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : draft_window;
+    const std::uint32_t proposal_k = use_lookup ? 1U : draft_window;
     const std::uint32_t width = verify_k + 1;
-    qwen3_6::MtpDecodeState& frame = use_lookup ? *io.mtp_lookup_decode
-                                     : narrow   ? *io.mtp_narrow_decode[learned_k]
-                                                : *io.mtp_decode;
-    GdnReplayRecords& round_records = use_lookup ? *mtp_lookup_replay_records
-                                      : narrow   ? *mtp_narrow_replay_records[learned_k]
-                                                 : *replay_records;
+    qwen3_6::MtpDecodeState& frame =
+        use_lookup ? *io.mtp_lookup_decode : *io.mtp_decode;
     DecodeGraphFamily& graph_family = use_lookup ? mtp_lookup_graphs : mtp_graphs;
 
     const auto started = Clock::now();
@@ -12100,7 +12054,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 use_lookup
                     ? std::min({verify_k, max_by_budget,
                                 capacity - sequence.execution_frontier - 1})
-                    : std::min({sequence.mtp_draft_count, verify_k, max_by_budget,
+                    : std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                                 capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -12135,7 +12089,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
-                                                  &round_records,
+                                                  use_lookup ? &*mtp_lookup_replay_records
+                                                             : &*replay_records,
                                                   io,
                                                   prefill_hidden, prefill_chunk, proposal_head},
                                                  decoder->text_kv,

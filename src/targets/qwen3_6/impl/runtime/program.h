@@ -629,7 +629,6 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
-    const std::array<std::uint8_t, kMaximumConcurrency> mtp_draft_ladder;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -659,9 +658,6 @@ public:
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<GdnReplayRecords> mtp_lookup_replay_records;
     std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
-    std::array<std::optional<GdnReplayRecords>, qwen3_6::kMtpNarrowSlots> mtp_narrow_replay_records;
-    std::array<std::optional<ops::GdnReplayFoldPlan>, qwen3_6::kMtpNarrowSlots>
-        mtp_narrow_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;

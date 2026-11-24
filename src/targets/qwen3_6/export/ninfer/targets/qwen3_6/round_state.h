@@ -19,51 +19,12 @@ inline constexpr std::uint32_t kMtpLookupMaximumWidth     = kMtpLookupMaximumDra
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
-// MTP draft lengths narrower than the draft window, chosen per round by batch size, each get
-// their own decode frame and ReplaySSM records, indexed by the draft length (1..7; slot 0 unused).
-inline constexpr std::size_t kMtpNarrowSlots = kMtpDecodeMaximumDrafts + 1;
-
-// The MTP draft length for a batch of `batch` requests: the ladder's entry, or the draft window
-// when no ladder is configured.
-[[nodiscard]] inline std::uint32_t
-mtp_draft_length(const std::array<std::uint8_t, kMaximumConcurrency>& ladder,
-                 std::uint32_t draft_window, std::size_t batch) noexcept {
-    if (ladder[0] == 0 || batch == 0) { return draft_window; }
-    const std::size_t index = batch > ladder.size() ? ladder.size() - 1 : batch - 1;
-    return ladder[index];
-}
-
-[[nodiscard]] inline bool
-has_mtp_ladder(const std::array<std::uint8_t, kMaximumConcurrency>& ladder) noexcept {
-    return ladder[0] != 0;
-}
-
-[[nodiscard]] inline bool mtp_ladder_uses(const std::array<std::uint8_t, kMaximumConcurrency>& ladder,
-                                          std::uint32_t k) noexcept {
-    for (const std::uint8_t entry : ladder) {
-        if (entry == k) { return true; }
-    }
-    return false;
-}
-
-// Bit k set: the ladder uses draft length k < draft_window, which needs a narrow frame.
-[[nodiscard]] inline std::uint32_t
-mtp_narrow_window_mask(const std::array<std::uint8_t, kMaximumConcurrency>& ladder,
-                       std::uint32_t draft_window) noexcept {
-    std::uint32_t mask = 0;
-    for (std::uint32_t k = 1; k < draft_window && k < kMtpNarrowSlots; ++k) {
-        if (mtp_ladder_uses(ladder, k)) { mask |= 1U << k; }
-    }
-    return mask;
-}
-
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
-    std::uint32_t mtp_narrow_windows = 0; // mtp_narrow_window_mask
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -207,7 +168,6 @@ struct RoundStateLayout {
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
     std::optional<MtpDecodeStateLayout> mtp_lookup_decode;
-    std::array<std::optional<MtpDecodeStateLayout>, kMtpNarrowSlots> mtp_narrow_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
     bool complete = false;
 };
@@ -349,7 +309,6 @@ struct RoundState {
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
     std::optional<MtpDecodeState> mtp_lookup_decode;
-    std::array<std::optional<MtpDecodeState>, kMtpNarrowSlots> mtp_narrow_decode;
     std::optional<DFlashDecodeState> dflash_decode;
 
     RoundState() = default;

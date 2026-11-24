@@ -1,6 +1,5 @@
 #include "ninfer/engine.h"
 
-#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -1665,88 +1664,6 @@ int exercise_concurrent_resource_settlement(const char* artifact,
     return 0;
 }
 
-// MTP draft lengths by batch size. Each narrower length verifies through its own frame and
-// ReplaySSM records; committing a round through the wrong record set would corrupt the Gated
-// DeltaNet state and the greedy output would leave the non-speculative one within a few tokens.
-ninfer::EngineOptions mtp_ladder_engine_options(const char* artifact, ninfer::SpeculativeBackend backend,
-                                                std::array<std::uint8_t, 8> ladder) {
-    ninfer::EngineOptions options;
-    options.artifact_path                    = artifact;
-    options.max_context                      = 2048;
-    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(8192);
-    options.prefill_chunk                    = 512;
-    options.kv_cache                         = ninfer::KvCacheStorage::Int8Group64;
-    options.speculative.backend              = backend;
-    options.speculative.draft_tokens         = backend == ninfer::SpeculativeBackend::Mtp ? 5 : 0;
-    options.speculative.proposal_head        = backend == ninfer::SpeculativeBackend::Mtp
-                                                   ? ninfer::ProposalHead::Optimized
-                                                   : ninfer::ProposalHead::Full;
-    options.speculative.draft_tokens_by_batch = ladder;
-    options.use_cuda_graph                   = false;
-    options.max_concurrency                  = 4;
-    options.max_pending_requests             = 4;
-    options.context_cache.device_state_slots = 4;
-    return options;
-}
-
-std::vector<ninfer::TokenId> ladder_prompt(std::uint32_t row) {
-    return {248045, 846, 198, static_cast<ninfer::TokenId>(2000 + 37 * row), 11, 3555, 248046, 198};
-}
-
-int exercise_mtp_draft_ladder(const char* artifact) {
-    constexpr std::uint32_t kRows   = 4;
-    constexpr std::uint32_t kTokens = 64;
-    constexpr std::uint32_t kPrefix = 12;
-    std::array<std::vector<ninfer::TokenId>, kRows> reference;
-    {
-        ninfer::Engine engine(
-            mtp_ladder_engine_options(artifact, ninfer::SpeculativeBackend::None, {}));
-        for (std::uint32_t row = 0; row < kRows; ++row) {
-            reference[row] = engine.generate(engine.prepare_tokens(ladder_prompt(row)),
-                                             fixed_output(kTokens, false))
-                                 .generated_token_ids;
-        }
-    }
-    // Narrow at every batch size: one request verifies at K=2, two at K=3, three or more at K=1;
-    // five is the planned window and is never used, so every round runs through a narrow frame.
-    ninfer::Engine engine(mtp_ladder_engine_options(artifact, ninfer::SpeculativeBackend::Mtp,
-                                                    {2, 3, 1, 1, 1, 1, 1, 1}));
-    int failures = 0;
-    for (std::uint32_t row = 0; row < kRows; ++row) {
-        const auto alone = engine.generate(engine.prepare_tokens(ladder_prompt(row)),
-                                           fixed_output(kTokens, false))
-                               .generated_token_ids;
-        if (alone != reference[row]) {
-            std::cerr << "MTP ladder: single request " << row
-                      << " left the non-speculative greedy output\n";
-            ++failures;
-        }
-    }
-    for (const std::uint32_t concurrent : {2U, 4U}) {
-        std::vector<ninfer::GenerationHandle> handles;
-        for (std::uint32_t row = 0; row < concurrent; ++row) {
-            handles.push_back(engine.submit(engine.prepare_tokens(ladder_prompt(row)),
-                                            fixed_output(kTokens, false)));
-        }
-        for (std::uint32_t row = 0; row < concurrent; ++row) {
-            const auto out = handles[row].wait().generated_token_ids;
-            std::size_t same = 0;
-            while (same < out.size() && same < reference[row].size() &&
-                   out[same] == reference[row][same]) {
-                ++same;
-            }
-            std::cout << "MTP ladder: " << concurrent << " concurrent, row " << row << ": " << same
-                      << "/" << kTokens << " tokens match the non-speculative output\n";
-            if (out.size() != kTokens || same < kPrefix) {
-                std::cerr << "MTP ladder: concurrent row " << row
-                          << " diverged early or ended short\n";
-                ++failures;
-            }
-        }
-    }
-    return failures == 0 ? 0 : 1;
-}
-
 int verify_loaded_product(const ninfer::Engine& engine, std::string_view expected_target) {
     const ninfer::LoadSummary load = engine.load_summary();
     if (load.target != expected_target ||
@@ -1840,15 +1757,6 @@ int main() {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
-    }
-    if (scenario != nullptr && std::string_view(scenario) == "mtp-draft-ladder") {
-        if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {
-            std::cerr << "mtp-draft-ladder requires NINFER_QWEN3_8_27B_NVFP4_WEIGHTS\n";
-            return 1;
-        }
-        const int result = exercise_mtp_draft_ladder(qwen38_nvfp4);
-        if (result == 0) { std::cout << "ok\n"; }
-        return result;
     }
     if (scenario != nullptr && std::string_view(scenario) == "pressure-resume") {
         if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {
