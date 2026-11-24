@@ -96,6 +96,11 @@ struct DFlashDecodeIngress {
     std::int32_t verify_live = 0;
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> verify_live_columns{};
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> verify_padded_slots{};
+    // The same for the proposal head over the K draft positions (i + K*b): proposal_live > 0
+    // scores only the listed positions; the rest get zero candidates the round never accepts.
+    std::int32_t proposal_live = 0;
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> proposal_live_columns{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> proposal_slots{};
 };
 
 struct DFlashDecodeEgress {

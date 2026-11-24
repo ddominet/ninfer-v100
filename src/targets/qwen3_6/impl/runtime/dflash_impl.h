@@ -310,12 +310,34 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
         Tensor ids_flat   = candidates.view({16, mask_columns});
         Tensor scores     = work.alloc(DType::FP32, {16, mask_columns});
-        if (state.execution.proposal_head == ProposalHead::Full) {
-            ops::linear_topk(hidden, state.execution.model.output_head, TextConfig::token_domain,
-                             ids_flat, scores, work, stream);
+        const auto score_head = [&](const Tensor& rows, Tensor& out_ids, Tensor& out_scores) {
+            if (state.execution.proposal_head == ProposalHead::Full) {
+                ops::linear_topk(rows, state.execution.model.output_head,
+                                 TextConfig::token_domain, out_ids, out_scores, work, stream);
+            } else {
+                const auto& head = *state.execution.model.optimized_proposal;
+                ops::linear_topk(rows, head.head, head.token_ids, out_ids, out_scores, work,
+                                 stream);
+            }
+        };
+        const std::int32_t head_live = state.host_ingress.proposal_live;
+        if (head_live > 0 && head_live < mask_columns) {
+            // Kept draft positions only: one head read per chunk of them instead of per request.
+            auto* ingress = static_cast<unsigned char*>(frame.ingress.data);
+            const Tensor live(ingress + offsetof(qwen3_6::DFlashDecodeIngress,
+                                                 proposal_live_columns),
+                              DType::I32, {head_live});
+            const Tensor slots(ingress + offsetof(qwen3_6::DFlashDecodeIngress, proposal_slots),
+                               DType::I32, {mask_columns});
+            Tensor kept_hidden = work.alloc(DType::BF16, {Config::hidden, head_live});
+            ops::gather_columns(hidden, live, kept_hidden, stream);
+            Tensor kept_ids    = work.alloc(DType::I32, {16, head_live});
+            Tensor kept_scores = work.alloc(DType::FP32, {16, head_live});
+            score_head(kept_hidden, kept_ids, kept_scores);
+            ops::gather_columns(kept_ids, slots, ids_flat, stream);
+            ops::gather_columns(kept_scores, slots, scores, stream);
         } else {
-            const auto& head = *state.execution.model.optimized_proposal;
-            ops::linear_topk(hidden, head.head, head.token_ids, ids_flat, scores, work, stream);
+            score_head(hidden, ids_flat, scores);
         }
         Tensor projected = work.alloc(DType::BF16, {256, mask_columns});
         ops::linear(hidden, weights.candidate_selector.hidden_projection, projected, stream);

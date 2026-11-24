@@ -575,6 +575,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     const auto mask_columns = drafts * batch;
                     matrix(layout, DType::BF16, DFlashConfig::hidden, mask_columns);
                     matrix(layout, DType::FP32, 16, mask_columns);
+                    if (!plan.use_cuda_graph) {
+                        // Kept-position proposal head: gathered rows, their ids and scores.
+                        matrix(layout, DType::BF16, DFlashConfig::hidden, mask_columns);
+                        matrix(layout, DType::I32, 16, mask_columns);
+                        matrix(layout, DType::FP32, 16, mask_columns);
+                    }
                     if (plan.proposal_head == ProposalHead::Optimized) {
                         scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                                             QType::Q4G64_F16S, Variant::draft_head_rows,

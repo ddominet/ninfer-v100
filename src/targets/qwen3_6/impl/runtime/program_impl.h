@@ -12188,12 +12188,25 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 namespace {
 
-// Kept-column verification cost model, fitted on a V100 to the DFlash2 and MTP round times at one
-// to eight requests: a round costs a fixed part (weights, draft, the first request) plus a
-// per-request part, plus about 2.3 ms for every target row verified.
-constexpr double kDFlashVerifyRowMs       = 2.32;
-constexpr double kDFlashRoundBaseMs       = 33.0;
-constexpr double kDFlashRoundPerRequestMs = 1.6;
+// Kept-column verification cost model, from nsys profiles of DFlash2 x7 and MTP K=3 rounds at one
+// and eight requests on a V100. The target's GEMMs work in 8-column tiles, so a round costs a
+// fixed part, a per-request part, about 6.5 ms per 8 kept target columns and 0.25 ms per column
+// (attention, recurrence, copies), plus one 1.24 ms proposal-head read per 8 kept draft positions.
+constexpr double kDFlashRoundBaseMs        = 31.8;
+constexpr double kDFlashRoundPerRequestMs  = 1.6;
+constexpr double kDFlashTargetTileMs       = 6.5;
+constexpr double kDFlashTargetColumnMs     = 0.25;
+constexpr double kDFlashHeadChunkMs        = 1.24;
+
+double dflash_round_ms(std::size_t requests, std::size_t kept_drafts) noexcept {
+    const auto columns = static_cast<double>(requests + kept_drafts);
+    const double head  = kept_drafts == 0 ? 0.0
+                                          : std::ceil(static_cast<double>(std::max<std::size_t>(
+                                                          kept_drafts, 5)) / 8.0);
+    return kDFlashRoundBaseMs + kDFlashRoundPerRequestMs * static_cast<double>(requests - 1) +
+           kDFlashTargetTileMs * std::ceil(columns / 8.0) + kDFlashTargetColumnMs * columns +
+           kDFlashHeadChunkMs * head;
+}
 constexpr float kDFlashAcceptLearning     = 0.15F;
 constexpr float kDFlashAcceptRelax        = 0.02F;
 
@@ -12259,14 +12272,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         keep[row]        = extent;
     }
 
-    // Keep a draft's verify row only while its expected accepted tokens pay for it: start every
-    // request at its bonus row and greedily add the most likely next draft while
-    // P(row accepted) / row cost exceeds the round's tokens per millisecond so far.
+    // Keep the drafts that maximise expected tokens per millisecond: order every request's next
+    // draft by its acceptance estimate (each request's drafts stay a prefix), then pick the count
+    // with the best expected tokens / modelled round time. One request fits one target tile, so
+    // it keeps its whole block; a full batch drops the drafts least likely to be accepted.
     if (dflash_verify_budget) {
-        const auto batch = static_cast<double>(lanes.size());
-        double tokens    = batch;
-        double millis    = kDFlashRoundBaseMs + kDFlashRoundPerRequestMs * (batch - 1.0) +
-                        kDFlashVerifyRowMs * batch;
         std::array<float, kMaximumConcurrency> next{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             RequestControl& request = requests[lanes[row]];
@@ -12279,26 +12289,34 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             keep[row] = 0;
             next[row] = draft_limit[row] > 0 ? request.dflash_accept[0] : -1.0F;
         }
+        std::array<std::uint8_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> order{};
+        std::array<std::uint32_t, kMaximumConcurrency> taken{};
+        std::size_t candidates = 0;
+        double tokens          = static_cast<double>(lanes.size());
+        double best_rate       = tokens / dflash_round_ms(lanes.size(), 0);
+        std::size_t best_count = 0;
         for (;;) {
-            std::size_t best = lanes.size();
+            std::size_t pick = lanes.size();
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                if (next[row] >= 0.0F && (best == lanes.size() || next[row] > next[best])) {
-                    best = row;
+                if (next[row] >= 0.0F && (pick == lanes.size() || next[row] > next[pick])) {
+                    pick = row;
                 }
             }
-            if (best == lanes.size() ||
-                static_cast<double>(next[best]) * millis <= kDFlashVerifyRowMs * tokens) {
-                break;
+            if (pick == lanes.size()) { break; }
+            tokens += next[pick];
+            order[candidates++] = static_cast<std::uint8_t>(pick);
+            const double rate   = tokens / dflash_round_ms(lanes.size(), candidates);
+            if (rate > best_rate) {
+                best_rate  = rate;
+                best_count = candidates;
             }
-            tokens += next[best];
-            millis += kDFlashVerifyRowMs;
-            const RequestControl& request = requests[lanes[best]];
-            const std::uint32_t kept      = ++keep[best];
+            const RequestControl& request = requests[lanes[pick]];
+            const std::uint32_t kept      = ++taken[pick];
             // Joint estimates are kept non-increasing along the block.
-            next[best] = kept < draft_limit[best]
-                             ? std::min(next[best], request.dflash_accept[kept])
-                             : -1.0F;
+            next[pick] = kept < draft_limit[pick] ? std::min(next[pick], request.dflash_accept[kept])
+                                                  : -1.0F;
         }
+        for (std::size_t i = 0; i < best_count; ++i) { ++keep[order[i]]; }
     }
 
     const auto started = Clock::now();
@@ -12378,6 +12396,44 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             if (dflash_verify_budget &&
                 live < static_cast<std::int32_t>(width * lanes.size())) {
                 dflash_host_ingress->verify_live = live;
+            }
+            // Proposal head positions i + K*b for the kept drafts, padded with dropped positions
+            // to a count the fused head route takes (5..8 per chunk).
+            dflash_host_ingress->proposal_live = 0;
+            const auto positions = static_cast<std::int32_t>(draft_window * lanes.size());
+            std::int32_t kept_positions = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                kept_positions += static_cast<std::int32_t>(keep[row]);
+            }
+            const auto head_ok = [](std::int32_t n) {
+                return n >= 5 && n / ((n + 7) / 8) >= 5;
+            };
+            std::int32_t target = kept_positions;
+            while (target < positions && !head_ok(target)) { ++target; }
+            if (dflash_verify_budget && target < positions && head_ok(target)) {
+                std::array<bool, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> chosen{};
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    for (std::uint32_t i = 0; i < keep[row]; ++i) {
+                        chosen[i + draft_window * row] = true;
+                    }
+                }
+                for (std::int32_t p = 0, extra = target - kept_positions; p < positions && extra > 0;
+                     ++p) {
+                    if (!chosen[static_cast<std::size_t>(p)]) {
+                        chosen[static_cast<std::size_t>(p)] = true;
+                        --extra;
+                    }
+                }
+                std::int32_t n = 0;
+                for (std::int32_t p = 0; p < positions; ++p) {
+                    if (chosen[static_cast<std::size_t>(p)]) {
+                        dflash_host_ingress->proposal_live_columns[static_cast<std::size_t>(n)] = p;
+                        dflash_host_ingress->proposal_slots[static_cast<std::size_t>(p)] = n++;
+                    } else {
+                        dflash_host_ingress->proposal_slots[static_cast<std::size_t>(p)] = -1;
+                    }
+                }
+                dflash_host_ingress->proposal_live = n;
             }
         }
 
