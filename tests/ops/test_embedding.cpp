@@ -696,6 +696,9 @@ int test_fp8_host_mapped() {
             for (int replay = 0; replay < 2; ++replay) {
                 GuardedDeviceBuffer output(static_cast<std::size_t>(kFp8D) * t * 2);
                 output.fill(0x7d);
+                // fill() is a legacy-stream cudaMemset; the context's compute stream is
+                // non-blocking, so order it explicitly before the embedding writes the buffer.
+                cuda_check(cudaDeviceSynchronize(), "order the output fill before embedding");
                 Tensor result(output.data(), DType::BF16, {kFp8D, t});
                 const auto launch = [&] {
                     ops::embedding(input, *weight, result, device.stream);
