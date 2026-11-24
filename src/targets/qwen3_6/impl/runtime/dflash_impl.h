@@ -626,7 +626,23 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             const_cast<unsigned char*>(ingress_bytes) +
                 offsetof(qwen3_6::DFlashDecodeIngress, verify_padded_slots),
             DType::I32, {static_cast<std::int32_t>(kMaximumConcurrency * kDFlashDecodeMaximumWidth)});
-        const VerifyCompaction compaction{&live_columns, &padded_slots, live};
+        const auto ingress_tensor = [&](std::size_t offset) {
+            return Tensor(const_cast<unsigned char*>(ingress_bytes) + offset, DType::I32,
+                          {static_cast<std::int32_t>(kMaximumConcurrency * kDFlashDecodeMaximumWidth)});
+        };
+        const Tensor attention_slots =
+            ingress_tensor(offsetof(qwen3_6::DFlashDecodeIngress, attention_slots));
+        const Tensor attention_live =
+            ingress_tensor(offsetof(qwen3_6::DFlashDecodeIngress, attention_live));
+        const Tensor attention_source =
+            ingress_tensor(offsetof(qwen3_6::DFlashDecodeIngress, attention_source));
+        VerifyCompaction compaction{&live_columns, &padded_slots, live};
+        if (state.host_ingress.attention_width > 0) {
+            compaction.attention_width  = state.host_ingress.attention_width;
+            compaction.attention_slots  = &attention_slots;
+            compaction.attention_live   = &attention_live;
+            compaction.attention_source = &attention_source;
+        }
         if (live < 0 || live > width * batch_size) {
             throw std::logic_error("DFlash kept verify columns are out of range");
         }

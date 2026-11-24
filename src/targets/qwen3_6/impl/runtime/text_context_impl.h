@@ -757,7 +757,24 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             }
             const Tensor live_columns = compaction->live_columns->slice(0, 0, live);
             const Tensor padded_slots = compaction->padded_slots->slice(0, 0, columns);
-            const VerifyCompaction bound{&live_columns, &padded_slots, live};
+            VerifyCompaction bound{&live_columns, &padded_slots, live};
+            const std::int32_t narrow = compaction->attention_width;
+            Tensor attention_slots;
+            Tensor attention_live;
+            Tensor attention_positions;
+            if (narrow > 0 && narrow < width && compaction->attention_slots != nullptr) {
+                attention_slots = compaction->attention_slots->slice(0, 0, narrow * batch);
+                attention_live  = compaction->attention_live->slice(0, 0, live);
+                // Cache positions of the narrow layout, gathered once for every attention layer.
+                attention_positions = work_.alloc(DType::I32, {1, narrow * batch});
+                ops::gather_columns(cache_positions.view({1, columns}),
+                                    compaction->attention_source->slice(0, 0, narrow * batch),
+                                    attention_positions, stream);
+                bound.attention_width  = narrow;
+                bound.attention_slots  = &attention_slots;
+                bound.attention_live   = &attention_live;
+                bound.attention_source = &attention_positions; // narrow cache positions
+            }
             ScopedValue<const VerifyCompaction*> compaction_binding(active_compaction_, &bound);
             // RoPE runs on the kept columns; the attention core keeps the padded cache positions.
             Tensor compact_rope = work_.alloc(DType::I32, {1, live});
@@ -941,8 +958,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor qp = qn;
         Tensor kp = kn;
         Tensor vp = v;
+        const bool narrow = compact && active_compaction_->attention_width > 0;
+        const std::int32_t core_width = narrow ? active_compaction_->attention_width : width;
         if (compact) {
-            const std::int32_t padded = width * active_sequence_batch_;
+            const std::int32_t padded = core_width * active_sequence_batch_;
             qp = work_.alloc(DType::BF16, {kCfg.q_size, padded});
             kp = work_.alloc(DType::BF16, {kCfg.kv_size, padded});
             vp = work_.alloc(DType::BF16, {kCfg.kv_size, padded});
@@ -950,15 +969,20 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
             const Tensor kc = kn.view({kCfg.kv_size, T});
             const Tensor vc = v.view({kCfg.kv_size, T});
             ops::gather_columns_group({&qc, &kc, &vc, nullptr}, {&qp, &kp, &vp, nullptr},
-                                      *active_compaction_->padded_slots, s);
+                                      narrow ? *active_compaction_->attention_slots
+                                             : *active_compaction_->padded_slots,
+                                      s);
         }
-        Tensor ap = compact ? work_.alloc(DType::BF16, {kCfg.q_size, width * active_sequence_batch_})
+        Tensor ap = compact ? work_.alloc(DType::BF16,
+                                          {kCfg.q_size, core_width * active_sequence_batch_})
                             : a;
-        Tensor q_batch        = qp.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
-        Tensor k_batch        = kp.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor v_batch        = vp.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor a_batch        = ap.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
-        Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
+        Tensor q_batch = qp.view({kCfg.head_dim, kCfg.n_q, core_width, active_sequence_batch_});
+        Tensor k_batch = kp.view({kCfg.head_dim, kCfg.n_kv, core_width, active_sequence_batch_});
+        Tensor v_batch = vp.view({kCfg.head_dim, kCfg.n_kv, core_width, active_sequence_batch_});
+        Tensor a_batch = ap.view({kCfg.head_dim, kCfg.n_q, core_width, active_sequence_batch_});
+        Tensor position_batch =
+            narrow ? active_compaction_->attention_source->view({core_width, active_sequence_batch_})
+                   : cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
                                       kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
@@ -966,7 +990,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                                       *active_causal_attention_envelope_, work_, a_batch, s);
         if (compact) {
             Tensor a_flat = a.view({kCfg.q_size, T});
-            ops::gather_columns(ap, *active_compaction_->live_columns, a_flat, s);
+            ops::gather_columns(ap,
+                                narrow ? *active_compaction_->attention_live
+                                       : *active_compaction_->live_columns,
+                                a_flat, s);
         }
     } else {
         ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,

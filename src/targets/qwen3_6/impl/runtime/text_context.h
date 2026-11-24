@@ -130,6 +130,14 @@ struct VerifyCompaction {
     const Tensor* live_columns = nullptr;
     const Tensor* padded_slots = nullptr;
     std::int32_t live          = 0;
+    // Optional narrower layout for the attention core: width attention_width (the widest kept
+    // extent + 1) instead of W. attention_slots [A*B] maps narrow column j + A*b to its kept index
+    // or -1, attention_live [C] maps kept columns to narrow ones, and attention_source [A*B] maps
+    // narrow columns to padded ones (for their cache positions).
+    std::int32_t attention_width   = 0;
+    const Tensor* attention_slots  = nullptr;
+    const Tensor* attention_live   = nullptr;
+    const Tensor* attention_source = nullptr;
 };
 
 struct PrefillChunkResult {

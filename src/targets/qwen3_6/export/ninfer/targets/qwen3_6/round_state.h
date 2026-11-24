@@ -106,6 +106,12 @@ struct DFlashDecodeIngress {
     // positions as any request keeps; draft_expand maps each K-wide draft column i + K*b to its
     // narrow column i + k'*b, or -1.
     std::int32_t draft_width = 0;
+    // Attention-core layout of kept-column verification (TextContext VerifyCompaction): width
+    // attention_width (0 = the verify width) with its slot, kept and source-column maps.
+    std::int32_t attention_width = 0;
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> attention_slots{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> attention_live{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> attention_source{};
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> draft_expand{};
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> proposal_live_columns{};
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> proposal_slots{};

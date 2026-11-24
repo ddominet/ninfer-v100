@@ -12436,9 +12436,33 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     }
                 }
             }
+            dflash_host_ingress->attention_width = 0;
             if (dflash_verify_budget &&
                 live < static_cast<std::int32_t>(width * lanes.size())) {
                 dflash_host_ingress->verify_live = live;
+                // Attention core at the widest kept extent + 1 instead of the verify width.
+                std::uint32_t narrow = 1;
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    narrow = std::max(narrow, keep[row] + 1U);
+                }
+                if (narrow < width) {
+                    std::int32_t kept = 0;
+                    for (std::size_t row = 0; row < lanes.size(); ++row) {
+                        for (std::uint32_t column = 0; column < narrow; ++column) {
+                            const std::size_t at = column + narrow * row;
+                            dflash_host_ingress->attention_source[at] =
+                                static_cast<std::int32_t>(column + width * row);
+                            if (column <= keep[row]) {
+                                dflash_host_ingress->attention_live[static_cast<std::size_t>(
+                                    kept)]                             = static_cast<std::int32_t>(at);
+                                dflash_host_ingress->attention_slots[at] = kept++;
+                            } else {
+                                dflash_host_ingress->attention_slots[at] = -1;
+                            }
+                        }
+                    }
+                    dflash_host_ingress->attention_width = static_cast<std::int32_t>(narrow);
+                }
             }
             // Narrow draft block and its expansion back to the K-wide draft layout.
             dflash_host_ingress->draft_width = 0;
