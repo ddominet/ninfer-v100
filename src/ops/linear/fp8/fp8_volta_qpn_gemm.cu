@@ -97,19 +97,19 @@ VoltaTcControl& volta_tc_control() {
     static VoltaTcControl control = [] {
         VoltaTcControl initial;
         const char* enabled = std::getenv("NINFER_VOLTA_TC");
-        // Off by default: on the 27B shapes the quadpair kernels still win at 9..32 tokens.
-        initial.enabled     = enabled != nullptr && enabled[0] == '1' ? 1 : 0;
+        initial.enabled     = enabled != nullptr && enabled[0] == '0' ? 0 : 1;
         const char* minimum = std::getenv("NINFER_VOLTA_TC_MIN_T");
-        initial.min_tokens  = minimum != nullptr && std::atoi(minimum) > 0 ? std::atoi(minimum) : 9;
+        initial.min_tokens  = minimum != nullptr && std::atoi(minimum) > 0 ? std::atoi(minimum) : 0;
         return initial;
     }();
     return control;
 }
 
-bool volta_tc_applies(int n, int k, int t) {
+bool volta_tc_applies(int n, int k, int t, int format_min_tokens) {
     const VoltaTcControl& control = volta_tc_control();
-    return control.enabled == 1 && t >= control.min_tokens && t <= 64 && n > 0 && n % 64 == 0 &&
-           k > 0 && k % 128 == 0;
+    const int floor = control.min_tokens > 0 ? control.min_tokens : format_min_tokens;
+    return control.enabled == 1 && t >= floor && t <= 64 && n > 0 && n % 64 == 0 && k > 0 &&
+           k % 128 == 0;
 }
 
 VoltaTcSplitWorkspace volta_tc_split_workspace(cudaStream_t stream, std::size_t partial_floats,

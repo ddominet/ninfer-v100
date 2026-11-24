@@ -119,6 +119,7 @@ struct Nvfp4VoltaTcDecoder {
     float inverse_weight_divisor;
 
     static constexpr int kItemsPerTileChunk = 64; // 4 groups x 16 lane pairs
+    static constexpr int kMinTokens         = kVoltaTcNvfp4MinTokens;
     struct Raw {
         uint4 q;
         std::uint16_t s;

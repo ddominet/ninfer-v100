@@ -239,21 +239,20 @@ struct VoltaTcSchedule {
     int splits = 1;
 };
 
-// Measured on the DFlash2 draft and 27B target shapes (volta_tc_skinny_bench): 128-row CTAs while
-// the activation slice is at most 32 tokens, 64-row CTAs past it (the 48- and 64-token forms are
-// shared-memory bound), and K split until about a thousand CTAs are in flight.
+// Measured on the 27B FP8 projection shapes (volta_tc_skinny_bench --sweep): 64-row CTAs, and K
+// split only until about 160 CTAs are in flight (the 5120-row output projection splits in two;
+// the 14336- and 16384-row input projections do not split).
 inline VoltaTcSchedule volta_tc_schedule(int n, int k, int t) {
+    (void)t;
     const VoltaTcControl& control = volta_tc_control();
     VoltaTcSchedule schedule;
-    schedule.rows = control.rows != 0 ? control.rows : (t <= 32 && n % 128 == 0 ? 128 : 64);
+    schedule.rows    = control.rows != 0 ? control.rows : 64;
     const int blocks = n / schedule.rows;
     const int chunks = k / kVoltaTcChunkK;
     int splits       = control.splits;
     if (splits == 0) {
         splits = 1;
-        while (splits < 8 && blocks * splits * 2 <= 1100 && chunks / (splits * 2) >= 8) {
-            splits *= 2;
-        }
+        while (splits < 8 && blocks * splits < 160 && chunks / (splits * 2) >= 8) { splits *= 2; }
     }
     schedule.splits = splits;
     return schedule;
@@ -301,7 +300,7 @@ void launch_volta_tc_skinny_rows(const Decoder& decoder, const Activation* x, in
 template <class Decoder, class Activation, class OutputPolicy>
 bool launch_volta_tc_skinny(const Decoder& decoder, const Activation* x, int n, int k, int t,
                             int x_tiles, OutputPolicy output, cudaStream_t stream) {
-    if (!volta_tc_applies(n, k, t)) { return false; }
+    if (!volta_tc_applies(n, k, t, Decoder::kMinTokens)) { return false; }
     if (reinterpret_cast<std::uintptr_t>(x) % 16 != 0) { return false; }
     const VoltaTcSchedule schedule = volta_tc_schedule(n, k, t);
     if (schedule.rows != 64 && schedule.rows != 128) { return false; }

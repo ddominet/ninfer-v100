@@ -82,6 +82,7 @@ struct Fp8VoltaTcDecoder {
     int blocks; // K / 128
 
     static constexpr int kItemsPerTileChunk = 128;
+    static constexpr int kMinTokens         = kVoltaTcFp8MinTokens;
     struct Raw {
         uint4 q;
     };
