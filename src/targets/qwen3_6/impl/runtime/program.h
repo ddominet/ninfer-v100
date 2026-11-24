@@ -700,6 +700,8 @@ public:
     bool dflash_verify_budget = false;
     DFlashCostModel dflash_cost;
     std::size_t dflash_round_kept     = 0;
+    bool dflash_trace                 = false; // NINFER_DFLASH_TRACE=1: one stderr line a round
+    int dflash_force_keep             = -1;    // NINFER_DFLASH_FORCE_KEEP=n: experiments only
     double dflash_round_context       = 0.0;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;

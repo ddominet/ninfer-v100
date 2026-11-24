@@ -18,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <iterator>
@@ -912,6 +913,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const char* keep_all = std::getenv("NINFER_DFLASH_KEEP_ALL");
         dflash_verify_budget = is_masked_draft_backend(speculative_backend) && !use_cuda_graph &&
                                !(keep_all != nullptr && keep_all[0] == '1');
+        const char* trace    = std::getenv("NINFER_DFLASH_TRACE");
+        dflash_trace         = trace != nullptr && trace[0] == '1';
+        const char* force    = std::getenv("NINFER_DFLASH_FORCE_KEEP");
+        dflash_force_keep    = force != nullptr ? std::atoi(force) : -1;
         // Prior: the profiled V100 costs (34 ms flat to 8 target columns, then about 1 ms a
         // column; 1.24 ms per head chunk), refined online from the rounds this engine runs.
         dflash_cost.reset({38.6, 1.6, 1.0, 1.24, 0.3}, {25.0, 1.0, 0.25, 0.5, 0.5});
@@ -12309,7 +12314,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         // Every sixteenth round verifies up to one more tile of drafts than the model wants, so
         // the column slope keeps being observed even when the model prefers short rounds.
         if (dflash_cost.rounds % 16 == 15) { best_count = std::min(candidates, best_count + 8); }
-        for (std::size_t i = 0; i < best_count; ++i) { ++keep[order[i]]; }
+        if (dflash_force_keep >= 0) {
+            // Experiment: every request keeps the same number of drafts (cost-curve sweeps).
+            best_count = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                keep[row] = std::min<std::uint32_t>(draft_limit[row],
+                                                    static_cast<std::uint32_t>(dflash_force_keep));
+                best_count += keep[row];
+            }
+            candidates = 0;
+        }
+        if (dflash_force_keep < 0) {
+            for (std::size_t i = 0; i < best_count; ++i) { ++keep[order[i]]; }
+        }
         dflash_round_kept    = best_count;
         dflash_round_context = mean_context;
     }
@@ -12472,6 +12489,18 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         if (dflash_verify_budget) {
             const double predicted =
                 dflash_cost.predict(lanes.size(), dflash_round_kept, dflash_round_context);
+            if (dflash_trace) {
+                std::fprintf(stderr,
+                             "dflash-round requests=%zu kept=%zu context=%.0f head=%d ms=%.3f "
+                             "predicted=%.3f accepted=",
+                             lanes.size(), dflash_round_kept, dflash_round_context,
+                             dflash_host_ingress->proposal_live, seconds * 1000.0, predicted);
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    std::fprintf(stderr, "%d/%d%s", dflash_host_egress->accepted_drafts[row],
+                                 dflash_host_ingress->proposal_extents[row],
+                                 row + 1 < lanes.size() ? "," : "\n");
+                }
+            }
             // Skip rounds stalled by something else (a host hiccup, a first-use allocation).
             if (seconds * 1000.0 < 3.0 * predicted) {
                 dflash_cost.update(lanes.size(), dflash_round_kept, dflash_round_context,
