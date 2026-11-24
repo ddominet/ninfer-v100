@@ -121,12 +121,12 @@ __global__ void dflash2_bf16_matvec_kernel(const __nv_bfloat16* __restrict__ w,
 // scalar fallback launches one CTA per (row, position), rereading every weight row eight times.
 // This route keeps all eight dot products in one CTA: each weight is loaded once, activations are
 // shared by cache, and the reduction tree matches the fallback's four-warp block reduction.
-__global__ __launch_bounds__(128, 4) void dflash2_bf16_control_w8_kernel(
+template <int kCols>
+__global__ __launch_bounds__(128, 4) void dflash2_bf16_control_wide_kernel(
     const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ out) {
     constexpr int kRows = 1280;
     constexpr int k     = 5120;
-    constexpr int kCols = 8;
     constexpr int kWarps = 4;
     const int row = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -178,10 +178,18 @@ void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_b
     // block (one weight read each, about 37 us) instead of the scalar fallback, which rereads every
     // weight row per column and measured 0.9 ms a call at eight requests. Same per-column
     // reduction order, so the outputs match the fallback's bit for bit.
+    // Up to 16 columns per launch: each weight row is read once for all of them (eight requests'
+    // blocks are four launches instead of eight). Wider launches spill the accumulators.
     int first = 0;
     if (n_rows == 1280 && k == 5120) {
+        for (; first + 16 <= cols; first += 16) {
+            dflash2_bf16_control_wide_kernel<16><<<n_rows, 128, 0, stream>>>(
+                w, x + static_cast<std::int64_t>(first) * k,
+                out + static_cast<std::int64_t>(first) * n_rows);
+            CUDA_CHECK(cudaGetLastError());
+        }
         for (; first + 8 <= cols; first += 8) {
-            dflash2_bf16_control_w8_kernel<<<n_rows, 128, 0, stream>>>(
+            dflash2_bf16_control_wide_kernel<8><<<n_rows, 128, 0, stream>>>(
                 w, x + static_cast<std::int64_t>(first) * k,
                 out + static_cast<std::int64_t>(first) * n_rows);
             CUDA_CHECK(cudaGetLastError());

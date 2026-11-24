@@ -1,6 +1,7 @@
 #include "ninfer/ops/scatter.h"
 
 #include "core/device.h"
+#include "core/dtype.h"
 #include "ops/launcher/scatter.h"
 
 #include <cstddef>
@@ -49,6 +50,28 @@ void gather_columns(const Tensor& source, const Tensor& indices, Tensor& destina
         throw std::invalid_argument("gather_columns: tensors must be contiguous and non-null");
     }
     detail::gather_columns_launch(source, indices, destination, stream);
+}
+
+void gather_columns_group(const Tensor* const (&sources)[4], Tensor* const (&destinations)[4],
+                          const Tensor& indices, cudaStream_t stream) {
+    detail::GatherColumnsGroup group;
+    const std::int32_t columns = indices.ne[0];
+    for (int i = 0; i < 4; ++i) {
+        if (sources[i] == nullptr) { break; }
+        const Tensor& source = *sources[i];
+        Tensor& destination  = *destinations[i];
+        const std::int64_t bytes = static_cast<std::int64_t>(source.ne[0]) * dtype_size(source.dtype);
+        if (destination.dtype != source.dtype || destination.ne[0] != source.ne[0] ||
+            destination.ne[1] != columns || bytes % 4 != 0 || !source.is_contiguous() ||
+            !destination.is_contiguous() || indices.dtype != DType::I32) {
+            throw std::invalid_argument("gather_columns_group: invalid pair");
+        }
+        group.source[i]      = source.data;
+        group.destination[i] = destination.data;
+        group.words[i]       = bytes / 4;
+        group.pairs          = i + 1;
+    }
+    detail::gather_columns_group_launch(group, indices, columns, stream);
 }
 
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,

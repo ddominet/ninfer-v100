@@ -68,7 +68,32 @@ __global__ void gather_columns_kernel(const Word* __restrict__ source,
     for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = in[i]; }
 }
 
+// blockIdx.y selects the pair; 4-byte words (every BF16 column here has an even row count).
+__global__ void gather_columns_group_kernel(GatherColumnsGroup group,
+                                            const std::int32_t* __restrict__ indices) {
+    const int pair            = static_cast<int>(blockIdx.y);
+    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
+    const std::int64_t words  = group.words[pair];
+    const std::int32_t from   = indices[column];
+    auto* out = static_cast<std::uint32_t*>(group.destination[pair]) + column * words;
+    if (from < 0) {
+        for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = 0; }
+        return;
+    }
+    const auto* in = static_cast<const std::uint32_t*>(group.source[pair]) + from * words;
+    for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) { out[i] = in[i]; }
+}
+
 } // namespace
+
+void gather_columns_group_launch(const GatherColumnsGroup& group, const Tensor& indices,
+                                 std::int32_t columns, cudaStream_t stream) {
+    if (group.pairs <= 0 || columns <= 0) { return; }
+    const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(group.pairs));
+    gather_columns_group_kernel<<<grid, 256, 0, stream>>>(
+        group, static_cast<const std::int32_t*>(indices.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void gather_columns_launch(const Tensor& source, const Tensor& indices, Tensor& destination,
                            cudaStream_t stream) {

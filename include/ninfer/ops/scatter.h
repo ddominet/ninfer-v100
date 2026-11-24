@@ -101,4 +101,12 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
 void gather_columns(const Tensor& source, const Tensor& indices, Tensor& destination,
                     cudaStream_t stream);
 
+/**
+ * gather_columns over up to four (source, destination) pairs sharing one index list, in one
+ * launch. Each pair follows gather_columns' contract; pairs may differ in dtype and row count but
+ * every destination has indices.ne[0] columns. Unused trailing pairs are null.
+ */
+void gather_columns_group(const Tensor* const (&sources)[4], Tensor* const (&destinations)[4],
+                          const Tensor& indices, cudaStream_t stream);
+
 } // namespace ninfer::ops

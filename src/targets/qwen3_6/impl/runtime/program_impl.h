@@ -12322,6 +12322,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        // Append only as many columns as the widest request needs (eager rounds).
+        dflash_host_ingress->append_width = 0;
+        if (!use_cuda_graph) {
+            std::uint32_t widest = 1;
+            for (const std::uint32_t lane : lanes) {
+                const SequenceState& sequence = active_sequence(lane);
+                widest = std::max(widest, sequence.execution_frontier -
+                                              sequence.dflash_context_frontier);
+            }
+            widest = std::min(widest, width);
+            dflash_host_ingress->append_width = static_cast<std::int32_t>(widest);
+            envelopes.append = {0, widest};
+        }
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),

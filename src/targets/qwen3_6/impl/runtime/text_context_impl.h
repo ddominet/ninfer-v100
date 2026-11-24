@@ -784,14 +784,15 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             }
             Tensor hidden_c = work_.alloc(DType::BF16, {kCfg.hidden, live});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden_c, stream);
-            ops::gather_columns(hidden_c, padded_slots, flat_hidden, stream);
             Tensor logits_c = work_.alloc(DType::BF16, {kCfg.vocab, live});
             ops::linear(hidden_c, *lm_head_, logits_c, stream);
-            ops::gather_columns(logits_c, padded_slots, flat_logits, stream);
             Tensor tokens_c = work_.alloc(DType::I32, {live});
             ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
-            Tensor flat_tokens_row = flat_tokens.view({1, columns});
-            ops::gather_columns(tokens_c.view({1, live}), padded_slots, flat_tokens_row, stream);
+            Tensor flat_tokens_row     = flat_tokens.view({1, columns});
+            const Tensor tokens_c_row  = tokens_c.view({1, live});
+            ops::gather_columns_group({&hidden_c, &logits_c, &tokens_c_row, nullptr},
+                                      {&flat_hidden, &flat_logits, &flat_tokens_row, nullptr},
+                                      padded_slots, stream);
             active_tap_scratch_ = Tensor{};
         }
     }
@@ -937,9 +938,20 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         }
         // Kept columns only: the attention core reads the padded per-request blocks, so q, k and
         // v are expanded around it (dropped columns zero, masked by the valid counts).
-        const Tensor qp = compact ? expand_verify_columns(qn, kCfg.q_size) : qn;
-        const Tensor kp = compact ? expand_verify_columns(kn, kCfg.kv_size) : kn;
-        const Tensor vp = compact ? expand_verify_columns(v, kCfg.kv_size) : v;
+        Tensor qp = qn;
+        Tensor kp = kn;
+        Tensor vp = v;
+        if (compact) {
+            const std::int32_t padded = width * active_sequence_batch_;
+            qp = work_.alloc(DType::BF16, {kCfg.q_size, padded});
+            kp = work_.alloc(DType::BF16, {kCfg.kv_size, padded});
+            vp = work_.alloc(DType::BF16, {kCfg.kv_size, padded});
+            const Tensor qc = qn.view({kCfg.q_size, T});
+            const Tensor kc = kn.view({kCfg.kv_size, T});
+            const Tensor vc = v.view({kCfg.kv_size, T});
+            ops::gather_columns_group({&qc, &kc, &vc, nullptr}, {&qp, &kp, &vp, nullptr},
+                                      *active_compaction_->padded_slots, s);
+        }
         Tensor ap = compact ? work_.alloc(DType::BF16, {kCfg.q_size, width * active_sequence_batch_})
                             : a;
         Tensor q_batch        = qp.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
@@ -992,8 +1004,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             throw std::logic_error("GDN compaction does not match the kept columns");
         }
         if (!compact_projection) { h = expand_verify_columns(h, kCfg.hidden); }
-        g    = expand_verify_columns(g, kCfg.gdn_v_heads);
-        beta = expand_verify_columns(beta, kCfg.gdn_v_heads);
+        Tensor g_padded    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
+        Tensor beta_padded = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
+        const Tensor g_kept    = g.view({kCfg.gdn_v_heads, T});
+        const Tensor beta_kept = beta.view({kCfg.gdn_v_heads, T});
+        ops::gather_columns_group({&g_kept, &beta_kept, nullptr, nullptr},
+                                  {&g_padded, &beta_padded, nullptr, nullptr},
+                                  *active_compaction_->padded_slots, s);
+        g    = g_padded;
+        beta = beta_padded;
     }
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, P);
@@ -1035,9 +1054,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept, gate_kept, ph,
                                               work_, s);
                 Tensor record_flat = records.conv.view({kCfg.conv_dim, P});
-                ops::gather_columns(qkv_kept, *active_compaction_->padded_slots, record_flat, s);
-                Tensor gate_flat = gate_output.view({kCfg.value_dim, P});
-                ops::gather_columns(gate_kept, *active_compaction_->padded_slots, gate_flat, s);
+                Tensor gate_flat   = gate_output.view({kCfg.value_dim, P});
+                ops::gather_columns_group({&qkv_kept, &gate_kept, nullptr, nullptr},
+                                          {&record_flat, &gate_flat, nullptr, nullptr},
+                                          *active_compaction_->padded_slots, s);
                 ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
                                                *active_linear_state_source_slots_, query_output,
                                                key_output, value_output, s);
@@ -1105,8 +1125,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     }
 
     if (compact) {
-        o = compact_verify_columns(o, kCfg.value_dim).view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-        z = compact_verify_columns(z, kCfg.value_dim).view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        Tensor o_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+        Tensor z_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+        const Tensor o_padded = o.view({kCfg.value_dim, P});
+        const Tensor z_padded = z.view({kCfg.value_dim, P});
+        ops::gather_columns_group({&o_padded, &z_padded, nullptr, nullptr},
+                                  {&o_kept, &z_kept, nullptr, nullptr},
+                                  *active_compaction_->live_columns, s);
+        o = o_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        z = z_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     }
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});

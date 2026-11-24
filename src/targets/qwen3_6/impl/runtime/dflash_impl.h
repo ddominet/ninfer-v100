@@ -537,8 +537,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
         state.execution.work.reset();
+        const std::int32_t append_width =
+            state.host_ingress.append_width > 0 ? std::min(state.host_ingress.append_width, width)
+                                                : width;
+        append_positions = Tensor(append_positions.data, DType::I32, {append_width, batch_size});
         Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
+            DType::BF16, {Variant::DFlashConfig::feature_rows, append_width, batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);

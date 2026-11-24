@@ -99,6 +99,9 @@ struct DFlashDecodeIngress {
     // The same for the proposal head over the K draft positions (i + K*b): proposal_live > 0
     // scores only the listed positions; the rest get zero candidates the round never accepts.
     std::int32_t proposal_live = 0;
+    // Columns of the context-append block: the most target features any request appends this
+    // round (0 = the full verify width). Each request appends only its last round's commits.
+    std::int32_t append_width = 0;
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> proposal_live_columns{};
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> proposal_slots{};
 };
