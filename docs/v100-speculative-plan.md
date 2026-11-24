@@ -125,6 +125,42 @@ Constraints found:
   with eight concurrent requests it is refused at startup: 11.34 GB of runtime needed, 10.79 GB
   available (15.37 GB with CUDA Graphs). Phase 3, which would hold both drafts, does not fit that
   configuration either.
+- Resolved for graphs-off serving by keeping the 1.2 GiB token embedding in mapped host memory
+  (d5baa878): DFlash2 x7 now starts at 262,144 tokens with eight requests (654 MiB free) and MTP
+  K=3 gains 1.2 GiB of headroom with unchanged speed. CUDA Graphs with DFlash2 are still refused.
+
+### Production-configuration comparison (2026-11-24)
+
+Each engine at the production limits (262,144 tokens, eight requests, INT8/q8_0 KV), both on the
+same V100 and the same prompts. Decode tok/s for one request:
+
+| Prompt tokens | llama-superfast x7 | DFlash2 x7 | MTP K=3 | MTP K=6 | No speculation |
+|---:|---:|---:|---:|---:|---:|
+| 60 | 83.3 | 82.4 | 73.4 | 70.8 | 33.8 |
+| 1.1K | 87.2 | 89.1 | 74.3 | 77.4 | 33.6 |
+| 5.9K | 84.4 | 81.1 | 76.8 | 82.4 | 33.2 |
+| 24K | 78.1 | 72.6 | 72.1 | 74.9 | 32.2 |
+| 89K | 64.4 | 59.7 | 58.3 | 59.0 | 27.9 |
+| 172K | 51.8* | 52.4 | 52.6 | 55.7 | 24.2 |
+
+\* llama-superfast refused one of the 172K requests in every configuration ("new tokens do not
+fit the KV pool beside the other conversations"). Prefill is level (1164 vs 1122 tok/s at 5.9K,
+621 vs 621 at 172K). Aggregate tok/s at 1 / 2 / 4 / 8 streams: llama-superfast 76.8 / 120.4 /
+135.0 / 151.7, MTP K=3 67.1 / 115.7 / 150.7 / 204.1, DFlash2 x7 69.2 / 107.4 / 101.4 / 123.7, no
+speculation 33.1 / 61.3 / 109.3 / 179.7 (llama-superfast without speculation: 100.3 at eight).
+
+- MTP K=4-7 helps one request at long context and costs aggregate (K=4 181.6, K=7 142.7 at
+  eight streams); K=3 stays the serving choice.
+- DFlash2 x6 and x8 are slower than x7 from 5.9K up (x8: 40 tok/s at 89K and 172K).
+- llama-superfast at 5, 7 and 9 draft tokens is within noise; it does not draft more at 9.
+- Tokens accepted per output token are 0.62-0.69 in every engine and setting, so the differences
+  are round cost, not draft quality.
+- Temperature 1 (top-p 0.95, top-k 20) keeps the same ordering.
+- 1Cat-vLLM 1.5.3 does not load on one 32 GB V100 at any context from 262,144 to 32,768, with or
+  without speculation, eager or graphs: it runs out of memory with 30.9 GiB allocated.
+- This sweep found DFlash2 x8 failing every request at eight streams: 72 draft rows exceeded the
+  prepacked W8 kernel's 64-row launch. Fixed in 8aaf418f (chunked launches); after the fix x8
+  serves 61.1 / 82.3 / 89.6 / 106.8 tok/s at 1 / 2 / 4 / 8 streams with no errors.
 
 ## Phase 0: kernel profile of one DFlash2 round
 
