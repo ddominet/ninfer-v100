@@ -552,7 +552,61 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
                                      state_destinations, dflash_rows, envelopes.append);
 
-        propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+        const std::int32_t draft_width = state.host_ingress.draft_width;
+        if (draft_width > 1 && draft_width < width) {
+            // Narrow draft block: reinterpret the proposal tensors at k' = draft_width - 1, then
+            // re-lay drafts, candidates and their probabilities into the K-wide layout the
+            // verification reads (positions past k' zero; no request keeps them).
+            const std::int32_t narrow_k = draft_width - 1;
+            qwen3_6::DFlashDecodeState narrow = frame;
+            narrow.proposal_ids =
+                Tensor(frame.proposal_ids.data, DType::I32, {draft_width, batch_size});
+            narrow.proposal_positions =
+                Tensor(frame.proposal_positions.data, DType::I32, {draft_width, batch_size});
+            narrow.draft_tokens =
+                Tensor(frame.draft_tokens.data, DType::I32, {narrow_k, batch_size});
+            if (frame.candidate_ids.data != nullptr) {
+                narrow.candidate_ids =
+                    Tensor(frame.candidate_ids.data, DType::I32, {16, narrow_k, batch_size});
+                narrow.proposal_q =
+                    Tensor(frame.proposal_q.data, DType::FP32, {16, narrow_k, batch_size});
+            }
+            propose_batch_impl<Variant>(state, narrow, batch_size,
+                                        static_cast<std::uint32_t>(narrow_k), envelopes);
+            auto& work           = state.execution.work;
+            const auto stream    = state.execution.device.stream;
+            const std::int32_t m = narrow_k * batch_size;
+            const std::int32_t w = static_cast<std::int32_t>(k) * batch_size;
+            work.reset();
+            Tensor drafts_n = work.alloc(DType::I32, {1, m});
+            CUDA_CHECK(cudaMemcpyAsync(drafts_n.data, narrow.draft_tokens.data,
+                                       static_cast<std::size_t>(m) * 4, cudaMemcpyDeviceToDevice,
+                                       stream));
+            const Tensor expand(static_cast<unsigned char*>(frame.ingress.data) +
+                                    offsetof(qwen3_6::DFlashDecodeIngress, draft_expand),
+                                DType::I32, {w});
+            Tensor drafts_w = Tensor(frame.draft_tokens.data, DType::I32, {1, w});
+            if (frame.candidate_ids.data != nullptr) {
+                Tensor ids_n = work.alloc(DType::I32, {16, m});
+                Tensor q_n   = work.alloc(DType::FP32, {16, m});
+                CUDA_CHECK(cudaMemcpyAsync(ids_n.data, narrow.candidate_ids.data,
+                                           static_cast<std::size_t>(16 * m) * 4,
+                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(q_n.data, narrow.proposal_q.data,
+                                           static_cast<std::size_t>(16 * m) * 4,
+                                           cudaMemcpyDeviceToDevice, stream));
+                Tensor ids_w = Tensor(frame.candidate_ids.data, DType::I32, {16, w});
+                Tensor q_w   = Tensor(frame.proposal_q.data, DType::FP32, {16, w});
+                ops::gather_columns_group({&drafts_n, &ids_n, &q_n, nullptr},
+                                          {&drafts_w, &ids_w, &q_w, nullptr}, expand, stream);
+            } else {
+                ops::gather_columns_group({&drafts_n, nullptr, nullptr, nullptr},
+                                          {&drafts_w, nullptr, nullptr, nullptr}, expand, stream);
+            }
+            work.reset();
+        } else {
+            propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+        }
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
 

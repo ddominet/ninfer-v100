@@ -12331,6 +12331,16 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         dflash_round_context = mean_context;
     }
 
+    // Draft only as wide a block as any request keeps (plus its anchor); one request keeps its
+    // whole block, so this narrows only under load.
+    std::uint32_t draft_k = draft_window;
+    if (dflash_verify_budget) {
+        std::uint32_t widest_keep = 1;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            widest_keep = std::max(widest_keep, keep[row]);
+        }
+        draft_k = std::min(draft_window, widest_keep);
+    }
     const auto started = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -12379,8 +12389,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
-            dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
+            dflash_host_ingress->proposal_valid_columns[row] =
+                static_cast<std::int32_t>(draft_k + 1U);
+            dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
                 const std::uint32_t position = frontier + std::min(column, extent);
@@ -12422,10 +12433,21 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 live < static_cast<std::int32_t>(width * lanes.size())) {
                 dflash_host_ingress->verify_live = live;
             }
-            // Proposal head positions i + K*b for the kept drafts, padded with dropped positions
-            // to a count the fused head route takes (5..8 per chunk).
+            // Narrow draft block and its expansion back to the K-wide draft layout.
+            dflash_host_ingress->draft_width = 0;
+            if (draft_k < draft_window) {
+                dflash_host_ingress->draft_width = static_cast<std::int32_t>(draft_k + 1U);
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    for (std::uint32_t i = 0; i < draft_window; ++i) {
+                        dflash_host_ingress->draft_expand[i + draft_window * row] =
+                            i < draft_k ? static_cast<std::int32_t>(i + draft_k * row) : -1;
+                    }
+                }
+            }
+            // Proposal head positions i + k'*b (k' = this round's draft block) for the kept
+            // drafts, padded with dropped positions to a count the fused head route takes.
             dflash_host_ingress->proposal_live = 0;
-            const auto positions = static_cast<std::int32_t>(draft_window * lanes.size());
+            const auto positions = static_cast<std::int32_t>(draft_k * lanes.size());
             std::int32_t kept_positions = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 kept_positions += static_cast<std::int32_t>(keep[row]);
@@ -12439,7 +12461,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 std::array<bool, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> chosen{};
                 for (std::size_t row = 0; row < lanes.size(); ++row) {
                     for (std::uint32_t i = 0; i < keep[row]; ++i) {
-                        chosen[i + draft_window * row] = true;
+                        chosen[i + draft_k * row] = true;
                     }
                 }
                 for (std::int32_t p = 0, extra = target - kept_positions; p < positions && extra > 0;
