@@ -919,7 +919,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         dflash_force_keep    = force != nullptr ? std::atoi(force) : -1;
         // Prior: the profiled V100 costs (34 ms flat to 8 target columns, then about 1 ms a
         // column; 1.24 ms per head chunk), refined online from the rounds this engine runs.
-        dflash_cost.reset({38.6, 1.6, 1.0, 1.24, 0.3}, {25.0, 1.0, 0.25, 0.5, 0.5});
+        // Draft-block columns: about 0.45 ms per 8 (the W8 draft layers at several requests).
+        dflash_cost.reset({36.0, 1.2, 1.0, 1.24, 0.3, 0.45}, {25.0, 1.0, 0.25, 0.5, 0.5, 0.25});
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
@@ -12287,7 +12288,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             context_sum += static_cast<double>(active_sequence(lane).execution_frontier);
         }
         const double mean_context = context_sum / static_cast<double>(lanes.size());
-        double best_rate       = tokens / dflash_cost.predict(lanes.size(), 0, mean_context);
+        double best_rate = tokens / dflash_cost.predict(lanes.size(), 0, mean_context, 1);
+        std::size_t widest = 1;
         std::size_t best_count = 0;
         for (;;) {
             std::size_t pick = lanes.size();
@@ -12299,8 +12301,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             if (pick == lanes.size()) { break; }
             tokens += next[pick];
             order[candidates++] = static_cast<std::uint8_t>(pick);
-            const double rate   = tokens / dflash_cost.predict(lanes.size(), candidates,
-                                                           mean_context);
+            widest = std::max<std::size_t>(widest, taken[pick] + 1U);
+            const double rate =
+                tokens / dflash_cost.predict(lanes.size(), candidates, mean_context, widest);
             if (rate > best_rate) {
                 best_rate  = rate;
                 best_count = candidates;
@@ -12329,6 +12332,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
         dflash_round_kept    = best_count;
         dflash_round_context = mean_context;
+        dflash_round_widest  = 1;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            dflash_round_widest = std::max<std::size_t>(dflash_round_widest, keep[row]);
+        }
     }
 
     // Draft only as wide a block as any request keeps (plus its anchor); one request keeps its
@@ -12509,8 +12516,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         if (dflash_verify_budget) {
-            const double predicted =
-                dflash_cost.predict(lanes.size(), dflash_round_kept, dflash_round_context);
+            const double predicted = dflash_cost.predict(lanes.size(), dflash_round_kept,
+                                                         dflash_round_context, dflash_round_widest);
             if (dflash_trace) {
                 std::fprintf(stderr,
                              "dflash-round requests=%zu kept=%zu context=%.0f head=%d ms=%.3f "
@@ -12526,7 +12533,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             // Skip rounds stalled by something else (a host hiccup, a first-use allocation).
             if (seconds * 1000.0 < 3.0 * predicted) {
                 dflash_cost.update(lanes.size(), dflash_round_kept, dflash_round_context,
-                                   seconds * 1000.0);
+                                   dflash_round_widest, seconds * 1000.0);
             }
         }
         for (std::size_t row = 0; row < lanes.size(); ++row) {

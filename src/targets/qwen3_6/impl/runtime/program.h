@@ -495,9 +495,10 @@ struct RequestControl {
 
 // Round-time model for kept-column DFlash verification, fitted online by recursive least squares
 // to the rounds this engine actually runs. Features: 1, requests - 1, kept target columns past the
-// weight-bound eight, proposal-head chunks, and kept columns x mean context / 100K (attention).
+// weight-bound eight, proposal-head chunks, kept columns x mean context / 100K (attention), and
+// draft-block columns / 8 (the draft runs a block as wide as the widest kept extent + 1).
 struct DFlashCostModel {
-    static constexpr int kFeatures = 5;
+    static constexpr int kFeatures = 6;
     std::array<double, kFeatures> theta{};
     std::array<double, kFeatures * kFeatures> covariance{};
     std::uint64_t rounds = 0;
@@ -511,26 +512,28 @@ struct DFlashCostModel {
     }
 
     [[nodiscard]] static std::array<double, kFeatures>
-    features(std::size_t requests, std::size_t kept, double mean_context) noexcept {
+    features(std::size_t requests, std::size_t kept, double mean_context,
+             std::size_t widest) noexcept {
         const double columns = static_cast<double>(requests + kept);
         const double head =
             kept == 0 ? 0.0 : std::ceil(static_cast<double>(std::max<std::size_t>(kept, 5)) / 8.0);
         return {1.0, static_cast<double>(requests) - 1.0, std::max(0.0, columns - 8.0), head,
-                columns * mean_context / 1.0e5};
+                columns * mean_context / 1.0e5,
+                static_cast<double>((widest + 1) * requests) / 8.0};
     }
 
-    [[nodiscard]] double predict(std::size_t requests, std::size_t kept,
-                                 double mean_context) const noexcept {
-        const auto x = features(requests, kept, mean_context);
+    [[nodiscard]] double predict(std::size_t requests, std::size_t kept, double mean_context,
+                                 std::size_t widest) const noexcept {
+        const auto x = features(requests, kept, mean_context, widest);
         double ms    = std::max(1.0, theta[0]);
         for (int i = 1; i < kFeatures; ++i) { ms += std::max(0.0, theta[i]) * x[i]; }
         return ms;
     }
 
-    void update(std::size_t requests, std::size_t kept, double mean_context,
+    void update(std::size_t requests, std::size_t kept, double mean_context, std::size_t widest,
                 double observed_ms) noexcept {
         constexpr double kForget = 0.995;
-        const auto x = features(requests, kept, mean_context);
+        const auto x = features(requests, kept, mean_context, widest);
         std::array<double, kFeatures> px{};
         for (int i = 0; i < kFeatures; ++i) {
             for (int j = 0; j < kFeatures; ++j) { px[i] += covariance[i * kFeatures + j] * x[j]; }
@@ -700,6 +703,7 @@ public:
     bool dflash_verify_budget = false;
     DFlashCostModel dflash_cost;
     std::size_t dflash_round_kept     = 0;
+    std::size_t dflash_round_widest   = 0;
     bool dflash_trace                 = false; // NINFER_DFLASH_TRACE=1: one stderr line a round
     int dflash_force_keep             = -1;    // NINFER_DFLASH_FORCE_KEEP=n: experiments only
     double dflash_round_context       = 0.0;
