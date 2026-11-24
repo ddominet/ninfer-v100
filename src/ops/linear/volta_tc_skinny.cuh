@@ -105,9 +105,12 @@ __global__ __launch_bounds__(ROWS / 16 * 32) void volta_tc_skinny_kernel(
 #pragma unroll
     for (int j = 0; j < TT; ++j) { wmma::fill_fragment(acc[j], 0.0f); }
 
-    typename Decoder::Raw raw[A_VEC];
-    uint4 bx[B_VEC];
-    auto load = [&](int chunk) {
+    // Two register stages ahead of the shared-memory double buffer: a chunk's loads are issued
+    // two iterations before its decode, so their latency hides behind two rounds of MMA and
+    // decode instead of one.
+    typename Decoder::Raw raw0[A_VEC], raw1[A_VEC];
+    uint4 bx0[B_VEC], bx1[B_VEC];
+    auto load = [&](int chunk, auto& raw, auto& bx) {
 #pragma unroll
         for (int v = 0; v < A_VEC; ++v) {
             const int item = v * THREADS + static_cast<int>(threadIdx.x);
@@ -124,7 +127,7 @@ __global__ __launch_bounds__(ROWS / 16 * 32) void volta_tc_skinny_kernel(
                                   : make_uint4(0, 0, 0, 0);
         }
     };
-    auto store = [&](int buffer) {
+    auto store = [&](int buffer, const auto& raw, const auto& bx) {
         half* a_buffer = a_s + buffer * ROWS * LDS;
 #pragma unroll
         for (int v = 0; v < A_VEC; ++v) {
@@ -143,15 +146,7 @@ __global__ __launch_bounds__(ROWS / 16 * 32) void volta_tc_skinny_kernel(
             }
         }
     };
-
-    if (c0 < c1) {
-        load(c0);
-        store(0);
-    }
-    __syncthreads();
-    for (int c = c0; c < c1; ++c) {
-        const int buffer = (c - c0) & 1;
-        if (c + 1 < c1) { load(c + 1); }
+    auto compute = [&](int buffer) {
         const half* a_buffer = a_s + buffer * ROWS * LDS + warp * 16 * LDS;
         const half* b_buffer = b_s + buffer * TCOLS * LDS;
 #pragma unroll
@@ -165,7 +160,25 @@ __global__ __launch_bounds__(ROWS / 16 * 32) void volta_tc_skinny_kernel(
                 wmma::mma_sync(acc[j], a, b, acc[j]);
             }
         }
-        if (c + 1 < c1) { store(buffer ^ 1); }
+    };
+
+    // Invariant at the top of each pair: buffer 0 holds chunk c, raw0 holds c + 1, raw1 c + 2.
+    if (c0 < c1) {
+        load(c0, raw0, bx0);
+        store(0, raw0, bx0);
+    }
+    if (c0 + 1 < c1) { load(c0 + 1, raw0, bx0); }
+    if (c0 + 2 < c1) { load(c0 + 2, raw1, bx1); }
+    __syncthreads();
+    for (int c = c0; c < c1; c += 2) {
+        compute(0);
+        if (c + 1 < c1) { store(1, raw0, bx0); }
+        if (c + 3 < c1) { load(c + 3, raw0, bx0); }
+        __syncthreads();
+        if (c + 1 >= c1) { break; }
+        compute(1);
+        if (c + 2 < c1) { store(0, raw1, bx1); }
+        if (c + 4 < c1) { load(c + 4, raw1, bx1); }
         __syncthreads();
     }
 
