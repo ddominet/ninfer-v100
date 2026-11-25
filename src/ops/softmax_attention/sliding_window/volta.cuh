@@ -194,10 +194,11 @@ sliding_window_attention_volta_octet_partial_kernel(
 
     if (owns_query) {
         for (int key_token = 0; key_token < valid; ++key_token) {
-            if (tid < D) {
-                const auto index = context_query_query_kv_index(kv_head, tid, key_token);
-                key_s[tid]       = __bfloat162float(query_k[index]);
-                value_s[tid]     = __bfloat162float(query_v[index]);
+            // Fewer than D threads at one to three query tokens: stride over the row.
+            for (int d = tid; d < D; d += Tokens * 32) {
+                const auto index = context_query_query_kv_index(kv_head, d, key_token);
+                key_s[d]         = __bfloat162float(query_k[index]);
+                value_s[d]       = __bfloat162float(query_v[index]);
             }
             __syncthreads();
 
