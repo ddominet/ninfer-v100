@@ -14,7 +14,7 @@ template <int Tile, int Threads>
 __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
-    float* beta, int tokens, float eps) {
+    float* beta, const std::int32_t* scatter_cols, int tokens, float eps) {
     constexpr int D = 5120, H = 48, Warps = Threads / 32;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
               first = blockIdx.y * Tile;
@@ -68,7 +68,9 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
         const float inv = rsqrtf(s / D + eps);
         inverse[tid]    = inv;
         if (first + tid < tokens) {
-            const auto i = std::int64_t(first + tid) * H + head;
+            const int dst_col =
+                scatter_cols != nullptr ? scatter_cols[first + tid] : (first + tid);
+            const auto i = std::int64_t(dst_col) * H + head;
             g[i]         = -expf(alog[head]) * softplus(a * inv + bias[head]);
             beta[i]      = sigmoid(b * inv);
         }
@@ -89,32 +91,42 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
             }
     }
 }
+template <int T, int Threads>
+void launch_gdn_norm_gating_27(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
+                               const Weight& a_weight, const Weight& b_weight, const Tensor& alog,
+                               const Tensor& bias, Tensor& g, Tensor& beta,
+                               const std::int32_t* scatter_cols, cudaStream_t stream) {
+    gdn_norm_gating_27_simt<T, Threads>
+        <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(norm_weight.data),
+            static_cast<const __nv_bfloat16*>(a_weight.qdata),
+            static_cast<const __nv_bfloat16*>(b_weight.qdata),
+            static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
+            static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
+            static_cast<float*>(beta.data), scatter_cols, x.ne[1], eps);
+}
 } // namespace
 
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
-                                         Tensor& beta, cudaStream_t stream) {
-    const auto launch = [&]<int T, int Threads>() {
-        gdn_norm_gating_27_simt<T, Threads>
-            <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const __nv_bfloat16*>(norm_weight.data),
-                static_cast<const __nv_bfloat16*>(a_weight.qdata),
-                static_cast<const __nv_bfloat16*>(b_weight.qdata),
-                static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
-                static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
-                static_cast<float*>(beta.data), x.ne[1], eps);
-    };
+                                         Tensor& beta, cudaStream_t stream,
+                                         const std::int32_t* scatter_cols) {
     const int tokens = x.ne[1];
-    if (tokens <= 2)
-        launch.template operator()<1, 512>();
-    else if (tokens <= 14)
-        launch.template operator()<2, 512>();
-    else if (tokens <= 28)
-        launch.template operator()<2, 256>();
-    else
-        launch.template operator()<4, 256>();
+    if (tokens <= 2) {
+        launch_gdn_norm_gating_27<1, 512>(x, norm_weight, eps, h, a_weight, b_weight, alog, bias, g,
+                                          beta, scatter_cols, stream);
+    } else if (tokens <= 14) {
+        launch_gdn_norm_gating_27<2, 512>(x, norm_weight, eps, h, a_weight, b_weight, alog, bias, g,
+                                          beta, scatter_cols, stream);
+    } else if (tokens <= 28) {
+        launch_gdn_norm_gating_27<4, 256>(x, norm_weight, eps, h, a_weight, b_weight, alog, bias, g,
+                                          beta, scatter_cols, stream);
+    } else {
+        launch_gdn_norm_gating_27<8, 256>(x, norm_weight, eps, h, a_weight, b_weight, alog, bias, g,
+                                          beta, scatter_cols, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail

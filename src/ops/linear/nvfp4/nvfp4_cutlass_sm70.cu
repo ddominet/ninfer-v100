@@ -28,18 +28,26 @@ __device__ __forceinline__ half2 decode_e4m3_scale_shift(std::uint8_t value) {
     return __half2half2(__ushort_as_half(bits));
 }
 
-__device__ __forceinline__ void decode_e2m1_word_shift(std::uint32_t packed, half2 rebias,
-                                                       half2 (&out)[4]) {
+__device__ __forceinline__ void decode_e2m1_word_raw(std::uint32_t packed, half2 (&out)[4]) {
     constexpr std::uint32_t sign = 0x80008000u;
     constexpr std::uint32_t expm = 0x0e000e00u;
     std::uint32_t v0 = ((packed << 12) & sign) | ((packed << 9) & expm);
     std::uint32_t v1 = ((packed << 8) & sign) | ((packed << 5) & expm);
     std::uint32_t v2 = ((packed << 4) & sign) | ((packed << 1) & expm);
     std::uint32_t v3 = (packed & sign) | ((packed >> 3) & expm);
-    out[0] = __hmul2(*reinterpret_cast<half2*>(&v0), rebias);
-    out[1] = __hmul2(*reinterpret_cast<half2*>(&v1), rebias);
-    out[2] = __hmul2(*reinterpret_cast<half2*>(&v2), rebias);
-    out[3] = __hmul2(*reinterpret_cast<half2*>(&v3), rebias);
+    out[0] = *reinterpret_cast<half2*>(&v0);
+    out[1] = *reinterpret_cast<half2*>(&v1);
+    out[2] = *reinterpret_cast<half2*>(&v2);
+    out[3] = *reinterpret_cast<half2*>(&v3);
+}
+
+__device__ __forceinline__ void decode_e2m1_word_shift(std::uint32_t packed, half2 rebias,
+                                                       half2 (&out)[4]) {
+    decode_e2m1_word_raw(packed, out);
+    out[0] = __hmul2(out[0], rebias);
+    out[1] = __hmul2(out[1], rebias);
+    out[2] = __hmul2(out[2], rebias);
+    out[3] = __hmul2(out[3], rebias);
 }
 
 __device__ __forceinline__ void unshuffle_e2m1_word(const half2 (&in)[4], half2 (&out)[4]) {
@@ -96,36 +104,70 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
     *destination = *reinterpret_cast<const uint4*>(adjacent);
 }
 
+// Prepacked NVFP4 in storage order: [N/32 tile][K/16 group][32 lanes] x 8 code bytes + 1 scale byte.
+// 4-warp (128-thread) CTA owning 1 tile (32 rows) x 4 consecutive groups (64 K = 128B FP16/row):
+//   1. Coalesced warp reads: each warp reads one 256B uint2 code chunk + 32B scale chunk, decodes
+//      16 FP16 weights in registers (folding the 2^14 rebias when overflow-safe), and stages into
+//      a padded 4.5 KiB shared-memory tile (zero bank conflicts).
+//   2. Coalesced warp stores: 8 consecutive lanes write one 128-byte cache line per row (4 rows
+//      per warp per pass x 2 passes = all 32 rows), achieving 100% read AND 100% write coalescing.
+template <bool FoldRebias>
 __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes,
                                           const std::uint8_t* __restrict__ scales, int n, int k,
                                           float inverse_weight_divisor,
                                           cutlass::half_t* __restrict__ out) {
-    const int row      = static_cast<int>(blockIdx.y);
-    const int segment  = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int segments_per_row = k / 8;
-    if (row >= n || segment >= segments_per_row) { return; }
+    __shared__ uint4 smem[32][9]; // 32 rows x 8 uint4 (64 half = 128B) + 1 uint4 bank-conflict pad
 
-    const int group      = segment / 2;
-    const int group_half = segment & 1;
-    const int local_row  = row & 31;
-    const int qp         = local_row / 8;
-    const int r          = local_row & 7;
-    const int lane       = (qp << 2) | (r & 3) | ((r & 4) << 2);
-    const int groups     = k / 16;
-    const std::int64_t tuple =
-        (static_cast<std::int64_t>(row / 32) * groups + group) * 32 + lane;
-    const std::uint8_t* packed = codes + tuple * 8 + group_half * 4;
-    const std::uint32_t packed_word = *reinterpret_cast<const std::uint32_t*>(packed);
-    const half2 rebias = __float2half2_rn(16384.0f);
-    const half2 divisor = __float2half2_rn(inverse_weight_divisor * 256.0f);
-    const half2 coefficient = __hmul2(decode_e4m3_scale_shift(scales[tuple]), divisor);
-    half2 values[4];
-    decode_e2m1_word_shift(packed_word, rebias, values);
+    const int warp      = static_cast<int>(threadIdx.x) >> 5; // 0..3 (group offset within 4-group block)
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int groups    = k / 16;
+    const int g0        = static_cast<int>(blockIdx.x) * 4;
+    const int tile      = static_cast<int>(blockIdx.y);
+    const int group     = g0 + warp;
+    const int local_row = ((lane >> 2) & 3) * 8 + ((lane & 3) | ((lane & 16) ? 4 : 0));
+    const int row       = tile * 32 + local_row;
+
+    if (group < groups && row < n) {
+        const std::int64_t tuple =
+            (static_cast<std::int64_t>(tile) * groups + group) * 32 + lane;
+        const uint2 packed_words = __ldg(reinterpret_cast<const uint2*>(codes) + tuple);
+        const std::uint8_t sb    = __ldg(scales + tuple);
+        half2 values[8];
+        if constexpr (FoldRebias) {
+            const half2 divisor     = __float2half2_rn(inverse_weight_divisor * (256.0f * 16384.0f));
+            const half2 coefficient = __hmul2(decode_e4m3_scale_shift(sb), divisor);
+            decode_e2m1_word_raw(packed_words.x, *reinterpret_cast<half2(*)[4]>(&values[0]));
+            decode_e2m1_word_raw(packed_words.y, *reinterpret_cast<half2(*)[4]>(&values[4]));
 #pragma unroll
-    for (int pair = 0; pair < 4; ++pair) { values[pair] = __hmul2(values[pair], coefficient); }
-    auto* destination = reinterpret_cast<uint4*>(
-        out + static_cast<std::int64_t>(row) * k + segment * 8);
-    *destination = *reinterpret_cast<const uint4*>(values);
+            for (int pair = 0; pair < 8; ++pair) { values[pair] = __hmul2(values[pair], coefficient); }
+        } else {
+            const half2 rebias      = __float2half2_rn(16384.0f);
+            const half2 divisor     = __float2half2_rn(inverse_weight_divisor * 256.0f);
+            const half2 coefficient = __hmul2(decode_e4m3_scale_shift(sb), divisor);
+            decode_e2m1_word_shift(packed_words.x, rebias, *reinterpret_cast<half2(*)[4]>(&values[0]));
+            decode_e2m1_word_shift(packed_words.y, rebias, *reinterpret_cast<half2(*)[4]>(&values[4]));
+#pragma unroll
+            for (int pair = 0; pair < 8; ++pair) { values[pair] = __hmul2(values[pair], coefficient); }
+        }
+        const auto* v4 = reinterpret_cast<const uint4*>(values);
+        smem[local_row][warp * 2 + 0] = v4[0];
+        smem[local_row][warp * 2 + 1] = v4[1];
+    }
+    __syncthreads();
+
+    const int vec = lane & 7; // 0..7 -> 8 contiguous halfs (16B) within the 64-K span
+    const int k_off = g0 * 16 + vec * 8;
+    if (k_off < k) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int lr      = warp * 8 + p * 4 + (lane >> 3);
+            const int out_row = tile * 32 + lr;
+            if (out_row < n) {
+                *reinterpret_cast<uint4*>(out + static_cast<std::int64_t>(out_row) * k + k_off) =
+                    smem[lr][vec];
+            }
+        }
+    }
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
@@ -201,12 +243,20 @@ void stage_operands(const Tensor& x, const Weight& w, cutlass::half_t* w_fp16,
     const std::int32_t n    = w.n;
     constexpr int kThreads  = 256;
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        const dim3 grid(static_cast<unsigned>((k / 8 + kThreads - 1) / kThreads),
-                        static_cast<unsigned>(n), 1u);
-        dequant_nvfp4_qpn_to_fp16<<<grid, kThreads, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), n, k,
-            1.0F / w.weight_scale_divisor, w_fp16);
+        const float inv_div    = 1.0F / w.weight_scale_divisor;
+        const bool fold_rebias = (448.0F * 16384.0F * inv_div) <= 60000.0F;
+        const int groups       = k / 16;
+        const dim3 grid(static_cast<unsigned>((groups + 3) / 4),
+                        static_cast<unsigned>((n + 31) / 32));
+        if (fold_rebias) {
+            dequant_nvfp4_qpn_to_fp16<true><<<grid, 128, 0, stream>>>(
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), n, k, inv_div, w_fp16);
+        } else {
+            dequant_nvfp4_qpn_to_fp16<false><<<grid, 128, 0, stream>>>(
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), n, k, inv_div, w_fp16);
+        }
     } else {
         const std::int64_t segments = static_cast<std::int64_t>(n) * (k / 8);
         const int blocks = static_cast<int>((segments + kThreads - 1) / kThreads);
@@ -311,6 +361,26 @@ __global__ void swiglu_fp32_rows_kernel(const float* __restrict__ gate_up,
     *reinterpret_cast<uint2*>(out + token * half + row) = *reinterpret_cast<const uint2*>(packed);
 }
 
+// Separate gate and up FP32 slices [tokens][slice_rows] -> BF16 out [tokens][half] at row_offset.
+__global__ void swiglu_fp32_split_rows_kernel(const float* __restrict__ gate_plane,
+                                              const float* __restrict__ up_plane,
+                                              __nv_bfloat16* __restrict__ out, int slice_rows,
+                                              int row_offset, int half, std::int64_t quads) {
+    const std::int64_t quad = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (quad >= quads) { return; }
+    const int quads_per_token = slice_rows / 4;
+    const std::int64_t token  = quad / quads_per_token;
+    const int row             = static_cast<int>(quad - token * quads_per_token) * 4;
+    const std::int64_t off    = token * slice_rows + row;
+    const float4 gate         = *reinterpret_cast<const float4*>(gate_plane + off);
+    const float4 up           = *reinterpret_cast<const float4*>(up_plane + off);
+    __nv_bfloat162 packed[2];
+    packed[0] = __floats2bfloat162_rn(silu(gate.x) * up.x, silu(gate.y) * up.y);
+    packed[1] = __floats2bfloat162_rn(silu(gate.z) * up.z, silu(gate.w) * up.w);
+    *reinterpret_cast<uint2*>(out + token * half + row_offset + row) =
+        *reinterpret_cast<const uint2*>(packed);
+}
+
 } // namespace
 
 std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
@@ -359,15 +429,40 @@ void nvfp4_linear_swiglu_cutlass_sm70_launch(const Tensor& x, const Weight& w, T
     stage_operands(x, w, w_fp16, x_fp16, stream);
 
     const std::int32_t pass = swiglu_pass_columns(cols);
-    for (std::int32_t begin = 0; begin < cols; begin += pass) {
-        const std::int32_t active = std::min(pass, cols - begin);
-        run_gemm<GemmF32>(x_fp16 + static_cast<std::int64_t>(begin) * k, w_fp16, gate_up, n, k,
-                          active, scratch.operands.gemm_workspace.data, stream);
-        const std::int64_t quads = static_cast<std::int64_t>(active) * (half / 4);
-        swiglu_fp32_rows_kernel<<<static_cast<int>((quads + 255) / 256), 256, 0, stream>>>(
-            gate_up, static_cast<__nv_bfloat16*>(out.data) + static_cast<std::int64_t>(begin) * half,
-            half, quads);
-        CUDA_CHECK(cudaGetLastError());
+    if (cols > pass && half % 128 == 0 && (static_cast<std::int64_t>(half) * pass / cols) >= 128) {
+        // Row-tiled single-weight-read path: tile `half` instead of `cols` so each 128-row slice
+        // of the 356 MiB dequantized FP16 gate/up weight is streamed from HBM once instead of
+        // twice (saving ~20 GiB of HBM reads per 2048-token prefill chunk across 56 layers),
+        // while staying strictly inside the existing `n * pass * sizeof(float)` gate_up scratch.
+        const std::int32_t max_tile =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(half) * pass / cols) / 128 * 128);
+        const std::int32_t row_tile = std::min(half, std::max<std::int32_t>(128, max_tile));
+        for (std::int32_t r0 = 0; r0 < half; r0 += row_tile) {
+            const std::int32_t rlen = std::min(row_tile, half - r0);
+            float* gate_buf         = gate_up;
+            float* up_buf           = gate_up + static_cast<std::int64_t>(rlen) * cols;
+            run_gemm<GemmF32>(x_fp16, w_fp16 + static_cast<std::int64_t>(r0) * k, gate_buf, rlen,
+                              k, cols, scratch.operands.gemm_workspace.data, stream);
+            run_gemm<GemmF32>(x_fp16, w_fp16 + static_cast<std::int64_t>(half + r0) * k, up_buf,
+                              rlen, k, cols, scratch.operands.gemm_workspace.data, stream);
+            const std::int64_t quads = static_cast<std::int64_t>(cols) * (rlen / 4);
+            swiglu_fp32_split_rows_kernel<<<static_cast<int>((quads + 255) / 256), 256, 0,
+                                            stream>>>(
+                gate_buf, up_buf, static_cast<__nv_bfloat16*>(out.data), rlen, r0, half, quads);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    } else {
+        for (std::int32_t begin = 0; begin < cols; begin += pass) {
+            const std::int32_t active = std::min(pass, cols - begin);
+            run_gemm<GemmF32>(x_fp16 + static_cast<std::int64_t>(begin) * k, w_fp16, gate_up, n, k,
+                              active, scratch.operands.gemm_workspace.data, stream);
+            const std::int64_t quads = static_cast<std::int64_t>(active) * (half / 4);
+            swiglu_fp32_rows_kernel<<<static_cast<int>((quads + 255) / 256), 256, 0, stream>>>(
+                gate_up,
+                static_cast<__nv_bfloat16*>(out.data) + static_cast<std::int64_t>(begin) * half,
+                half, quads);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 }
 

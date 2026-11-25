@@ -76,13 +76,14 @@ __device__ __forceinline__ void fp8_decode_quad(std::uint32_t word, half2& lo, h
 // tensor-core route (volta_tc_skinny.cuh): one item is one lane's 16-byte slice of a 64-K chunk.
 // Values decode to 2^-8 times their magnitude, as in the quadpair kernel; the row scale and the
 // 256 are applied once per output.
+template <int MinTokens = kVoltaTcFp8MinTokens>
 struct Fp8VoltaTcDecoder {
     const uint4* codes;
     const __nv_bfloat16* scales;
     int blocks; // K / 128
 
     static constexpr int kItemsPerTileChunk = 128;
-    static constexpr int kMinTokens         = kVoltaTcFp8MinTokens;
+    static constexpr int kMinTokens         = MinTokens;
     static constexpr bool kMandatory        = false;
     struct Raw {
         uint4 q;
@@ -275,11 +276,20 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
     // Past one 8-row tile, a prepacked weight goes through the tensor-core route: one weight read
     // for all T columns instead of one per 8-row tile.
     if constexpr (std::is_same_v<Activation, half> || std::is_same_v<Activation, __nv_bfloat16>) {
-        if (prepacked && t > S::kRowsPerTile &&
-            launch_volta_tc_skinny(
-                Fp8VoltaTcDecoder{reinterpret_cast<const uint4*>(codes), scales, k / 128}, xd, n,
-                k, t, 0, output, stream)) {
-            return;
+        if (prepacked && t > S::kRowsPerTile) {
+            // Vocabulary head (N=248320) fills 24 waves with zero split-K, so TC skinny already
+            // beats 3-tile QPN starting at T=17 (cuts 2.47 ms -> ~1.65 ms on T=17..24).
+            const bool launched =
+                n >= 65536
+                    ? launch_volta_tc_skinny(
+                          Fp8VoltaTcDecoder<17>{reinterpret_cast<const uint4*>(codes), scales,
+                                                k / 128},
+                          xd, n, k, t, 0, output, stream)
+                    : launch_volta_tc_skinny(
+                          Fp8VoltaTcDecoder<>{reinterpret_cast<const uint4*>(codes), scales,
+                                              k / 128},
+                          xd, n, k, t, 0, output, stream);
+            if (launched) { return; }
         }
     }
     // Generation-2 winners from a private sweep (bench/ops/fp8_qpn8_splitk_sweep.cu, deleted):

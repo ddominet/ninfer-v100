@@ -93,4 +93,16 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
                           DeviceExecutionView execution);
 
+/**
+ * Volta-accelerated fused RMSNorm + GDN gating projection that writes `g` and `beta` directly to
+ * `scatter_columns[t]` in padded `[48, P]` outputs while keeping `h` compact `[5120, T]`.
+ * Returns false (launching nothing) when the route is unavailable for the shape/build.
+ */
+[[nodiscard]] bool gdn_norm_gating_proj_scatter(const Tensor& x, const Tensor& norm_weight,
+                                                float eps, const Weight& ab_weight,
+                                                const Tensor& A_log, const Tensor& dt_bias,
+                                                const Tensor& scatter_columns, Tensor& h,
+                                                Tensor& g_padded, Tensor& beta_padded,
+                                                cudaStream_t stream);
+
 } // namespace ninfer::ops

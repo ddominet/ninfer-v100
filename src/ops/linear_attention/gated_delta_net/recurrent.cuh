@@ -118,7 +118,11 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
 // dependent 5-step chains into one, with identical per-value xor-butterfly order (bit-identical
 // sums). The serial chain, not issue throughput, is what paces the prefill recurrence.
 #ifndef NINFER_GDN_BATCH_REDUCE
+#ifdef NINFER_VOLTA_BUILD
+#define NINFER_GDN_BATCH_REDUCE 1
+#else
 #define NINFER_GDN_BATCH_REDUCE 0
+#endif
 #endif
 
 __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
@@ -190,7 +194,12 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
             partial[r] += __shfl_xor_sync(kFullWarpMask, partial[r], offset, kWarpSize);
         }
     }
-    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(partial[lane] * scale); }
+    float attn_val = 0.0f;
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        if (lane == r) { attn_val = partial[r]; }
+    }
+    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 #else
     float attn_val = 0.0f;
 #pragma unroll
@@ -681,25 +690,42 @@ template <bool NormalizeInputs, class Effects, class Access>
 __device__ __forceinline__ void
 run_recurrent_sequence(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
                        const RecurrentCoordinates& coord, std::int32_t valid) {
-    RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    if (valid <= 0) { return; }
+    RawQkLane key      = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    RawGatePair gate   = access.load_gate(coord, 0);
+    RawValueLane value = load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
     Effects::observe_key(access, coord, 0, key);
+    Effects::observe_value_gate(access, coord, 0, value, gate);
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
     for (std::int32_t token = 0; token < valid; ++token) {
-        const RawGatePair gate = access.load_gate(coord, token);
-        const RawValueLane value =
-            load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
-        Effects::observe_value_gate(access, coord, token, value, gate);
-
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
-
+        Bf16x4Pack next_key_bits{};
+        RawGatePair next_gate{};
+        RawValueLane next_value{};
         if (token + 1 < valid) {
-            key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
-            Effects::observe_key(access, coord, token + 1, key);
-            normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
+            next_key_bits = load_vec<Bf16x4Pack>(access.key_ptr(coord, token + 1) + coord.dqk_base);
+            next_gate     = access.load_gate(coord, token + 1);
+            next_value    = load_value_lane(access.value_ptr(coord, token + 1), coord.lane,
+                                            coord.dv_base);
         }
 
+        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
         Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
+
+        if (token + 1 < valid) {
+            key.bits        = next_key_bits;
+            const float2 lo = bf16x2_to_float2(next_key_bits.pair[0]);
+            const float2 hi = bf16x2_to_float2(next_key_bits.pair[1]);
+            key.value[0]    = lo.x;
+            key.value[1]    = lo.y;
+            key.value[2]    = hi.x;
+            key.value[3]    = hi.y;
+            gate            = next_gate;
+            value           = next_value;
+            Effects::observe_key(access, coord, token + 1, key);
+            Effects::observe_value_gate(access, coord, token + 1, value, gate);
+            normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
+        }
     }
 }
 
@@ -809,9 +835,14 @@ __device__ __forceinline__ void consume_direct_token(float (&state)[kDvPerWarp][
             partial[r] += __shfl_xor_sync(kFullWarpMask, partial[r], offset, kWarpSize);
         }
     }
+    float attn_val = 0.0f;
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        if (coord.lane == r) { attn_val = partial[r]; }
+    }
     if (coord.lane < kDvPerWarp) {
         access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
-            __float2bfloat16(partial[coord.lane] * access.scale);
+            __float2bfloat16(attn_val * access.scale);
     }
 #else
     float attn_val = 0.0f;
@@ -1028,7 +1059,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 }
 
 template <bool Masked>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, NINFER_GDN_DIRECT_MIN_BLOCKS)
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
@@ -1039,7 +1070,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 }
 
 template <class Geometry>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, NINFER_GDN_DIRECT_MIN_BLOCKS)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

@@ -47,4 +47,21 @@ struct Nvfp4Fp32ContiguousOutput {
     }
 };
 
+// Fused SwiGLU epilogue for the up projection half: reads the FP32 gate plane written by the first
+// half, computes silu(gate) * up in FP32, and performs the single observable BF16 round straight
+// into the output tensor (eliminating up's FP32 DRAM traffic and the combine kernel launch).
+struct Nvfp4QpnSwiGluOutput {
+    const float* gate;
+    __nv_bfloat16* out;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float up_value) const {
+        const std::int64_t idx = static_cast<std::int64_t>(token) * rows + parent_row;
+        const float g          = gate[idx];
+        const float silu_g     = g / (1.0f + __expf(-g));
+        out[idx]               = __float2bfloat16_rn(silu_g * up_value);
+    }
+};
+
 } // namespace ninfer::ops::detail

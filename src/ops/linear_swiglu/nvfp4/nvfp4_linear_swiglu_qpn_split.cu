@@ -43,8 +43,10 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
     auto* x_fp16 = static_cast<half*>(activation_scratch);
     const std::int64_t activation_count = static_cast<std::int64_t>(k) * t;
-    bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
+    const auto convert_x_fp16 = [&] {
+        bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
+    };
 
     Weight gate_weight = weight;
     gate_weight.n      = kIntermediate;
@@ -65,6 +67,7 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
         return value != nullptr && value[0] == '1';
     }();
     if (t1_gemv && t == 1 && weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        convert_x_fp16();
         const std::size_t scratch_bytes = static_cast<std::size_t>(kIntermediate) * sizeof(float);
         cudaMemsetAsync(gate_scratch, 0, scratch_bytes, stream);
         cudaMemsetAsync(up_scratch, 0, scratch_bytes, stream);
@@ -77,31 +80,53 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
         };
         launch_half(gate_weight, gate_scratch);
         launch_half(up_weight, up_scratch);
+        const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
+        const int threads           = 256;
+        const int blocks =
+            static_cast<int>(std::min<std::int64_t>((elements + threads - 1) / threads, 4096));
+        nvfp4_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
+            gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (weight.layout == QuantLayout::VoltaQpnPrepacked &&
+               volta_tc_applies(kIntermediate, k, t, kVoltaTcNvfp4MinTokens)) {
+        const half* staged = volta_stage_fp16_activation(x, stream);
+        const Nvfp4QpnSwiGluOutput swiglu_out{gate_scratch, static_cast<__nv_bfloat16*>(out.data),
+                                              kIntermediate};
+        if (staged != nullptr) {
+            launch_nvfp4_volta_qpn_with_fp16_activation(
+                x, gate_weight, staged, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
+                kIntermediate, inverse_weight_divisor, stream);
+            launch_nvfp4_volta_qpn_with_fp16_activation(
+                x, up_weight, staged, swiglu_out, kIntermediate, inverse_weight_divisor, stream);
+        } else {
+            convert_x_fp16();
+            launch_nvfp4_volta_qpn_with_fp16_activation(
+                x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
+                kIntermediate, inverse_weight_divisor, stream);
+            launch_nvfp4_volta_qpn_with_fp16_activation(
+                x, up_weight, x_fp16, swiglu_out, kIntermediate, inverse_weight_divisor, stream);
+        }
     } else if (const VoltaGroupMajorHalf* staged =
                    weight.layout == QuantLayout::VoltaQpnPrepacked
                        ? volta_stage_fp16_group_major(x, stream)
                        : nullptr) {
+        const Nvfp4QpnSwiGluOutput swiglu_out{gate_scratch, static_cast<__nv_bfloat16*>(out.data),
+                                              kIntermediate};
         launch_nvfp4_volta_qpn_with_group_major_activation(
             x, gate_weight, staged, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
             kIntermediate, inverse_weight_divisor, stream);
         launch_nvfp4_volta_qpn_with_group_major_activation(
-            x, up_weight, staged, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
-            kIntermediate, inverse_weight_divisor, stream);
+            x, up_weight, staged, swiglu_out, kIntermediate, inverse_weight_divisor, stream);
     } else {
+        convert_x_fp16();
+        const Nvfp4QpnSwiGluOutput swiglu_out{gate_scratch, static_cast<__nv_bfloat16*>(out.data),
+                                              kIntermediate};
         launch_nvfp4_volta_qpn_with_fp16_activation(
             x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
             kIntermediate, inverse_weight_divisor, stream);
         launch_nvfp4_volta_qpn_with_fp16_activation(
-            x, up_weight, x_fp16, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
-            kIntermediate, inverse_weight_divisor, stream);
+            x, up_weight, x_fp16, swiglu_out, kIntermediate, inverse_weight_divisor, stream);
     }
-
-    const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
-    const int threads           = 256;
-    const int blocks = static_cast<int>(std::min<std::int64_t>((elements + threads - 1) / threads, 4096));
-    nvfp4_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
-        gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 #endif // NINFER_VOLTA_BUILD

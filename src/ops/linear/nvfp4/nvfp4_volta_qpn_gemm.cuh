@@ -83,18 +83,26 @@ struct Nvfp4VoltaQpnSchedule {
 // global divisor composed with an e4m3 byte up to 448), and gscale * 2^14 overflows fp16 long
 // before the *actual* weight value -- shift_decoded(<=6 * 2^-14) * 2^14 -- ever could. Splitting
 // the multiply costs one extra hmul2 per value; both factors stay within fp16 range throughout.
-__device__ __forceinline__ void nvfp4_decode_e2m1_quad(std::uint32_t q, half2 rebias16384,
-                                                        half2 (&out)[4]) {
+__device__ __forceinline__ void nvfp4_decode_e2m1_quad_raw(std::uint32_t q, half2 (&out)[4]) {
     constexpr std::uint32_t kSign = 0x80008000u;
     constexpr std::uint32_t kExpM = 0x0E000E00u;
     std::uint32_t v0 = ((q << 12) & kSign) | ((q << 9) & kExpM);
     std::uint32_t v1 = ((q << 8) & kSign) | ((q << 5) & kExpM);
     std::uint32_t v2 = ((q << 4) & kSign) | ((q << 1) & kExpM);
     std::uint32_t v3 = (q & kSign) | ((q >> 3) & kExpM);
-    out[0]           = __hmul2(*reinterpret_cast<half2*>(&v0), rebias16384);
-    out[1]           = __hmul2(*reinterpret_cast<half2*>(&v1), rebias16384);
-    out[2]           = __hmul2(*reinterpret_cast<half2*>(&v2), rebias16384);
-    out[3]           = __hmul2(*reinterpret_cast<half2*>(&v3), rebias16384);
+    out[0]           = *reinterpret_cast<half2*>(&v0);
+    out[1]           = *reinterpret_cast<half2*>(&v1);
+    out[2]           = *reinterpret_cast<half2*>(&v2);
+    out[3]           = *reinterpret_cast<half2*>(&v3);
+}
+
+__device__ __forceinline__ void nvfp4_decode_e2m1_quad(std::uint32_t q, half2 rebias16384,
+                                                        half2 (&out)[4]) {
+    nvfp4_decode_e2m1_quad_raw(q, out);
+    out[0] = __hmul2(out[0], rebias16384);
+    out[1] = __hmul2(out[1], rebias16384);
+    out[2] = __hmul2(out[2], rebias16384);
+    out[3] = __hmul2(out[3], rebias16384);
 }
 
 // e4m3 group-scale decode (mirrors fp8_volta_qpn_gemm.cuh's fp8_decode_quad exactly): sign to fp16
@@ -112,6 +120,7 @@ __device__ __forceinline__ half2 nvfp4_decode_e4m3_scale(std::uint8_t b) {
 // order that decodes to adjacent-k pairs, scales [tile][group][lane] x 1 E4M3 byte) for the
 // tensor-core route (volta_tc_skinny.cuh). One item is two adjacent lanes of one group: 16 code
 // bytes and 2 scale bytes. Decoding matches nvfp4_volta_qpn_prepacked_kernel value for value.
+template <bool FoldRebias>
 struct Nvfp4VoltaTcDecoder {
     const std::uint8_t* codes;
     const std::uint8_t* scales;
@@ -134,8 +143,10 @@ struct Nvfp4VoltaTcDecoder {
                 __ldg(reinterpret_cast<const std::uint16_t*>(scales + index))};
     }
     __device__ __forceinline__ void store(const Raw& raw, int item, half* tile, int lds) const {
-        const half2 rebias   = __float2half2_rn(16384.0f);
-        const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+        const half2 divisor2 = __float2half2_rn(
+            FoldRebias ? inverse_weight_divisor * (256.0f * 16384.0f)
+                       : inverse_weight_divisor * 256.0f);
+        const half2 rebias = __float2half2_rn(16384.0f);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int lane = (item & 15) * 2 + h;
@@ -143,10 +154,17 @@ struct Nvfp4VoltaTcDecoder {
                 nvfp4_decode_e4m3_scale(static_cast<std::uint8_t>(h != 0 ? raw.s >> 8 : raw.s & 0xffu)),
                 divisor2);
             half2 b[8];
-            nvfp4_decode_e2m1_quad(h != 0 ? raw.q.z : raw.q.x, rebias,
-                                   *reinterpret_cast<half2(*)[4]>(&b[0]));
-            nvfp4_decode_e2m1_quad(h != 0 ? raw.q.w : raw.q.y, rebias,
-                                   *reinterpret_cast<half2(*)[4]>(&b[4]));
+            if constexpr (FoldRebias) {
+                nvfp4_decode_e2m1_quad_raw(h != 0 ? raw.q.z : raw.q.x,
+                                           *reinterpret_cast<half2(*)[4]>(&b[0]));
+                nvfp4_decode_e2m1_quad_raw(h != 0 ? raw.q.w : raw.q.y,
+                                           *reinterpret_cast<half2(*)[4]>(&b[4]));
+            } else {
+                nvfp4_decode_e2m1_quad(h != 0 ? raw.q.z : raw.q.x, rebias,
+                                       *reinterpret_cast<half2(*)[4]>(&b[0]));
+                nvfp4_decode_e2m1_quad(h != 0 ? raw.q.w : raw.q.y, rebias,
+                                       *reinterpret_cast<half2(*)[4]>(&b[4]));
+            }
 #pragma unroll
             for (int j = 0; j < 8; ++j) { b[j] = __hmul2(b[j], sc2); }
             auto* destination =
@@ -344,7 +362,7 @@ __global__ __launch_bounds__(SPLITK * 32, volta_qpn_min_blocks(kTiles, SPLITK)) 
 // Load-time-prepacked companion. Codes are [N/32 tile][K/16 group][lane32][8B], with
 // the nibble order chosen so the shift decoder's structural (i,i+4) pairs become adjacent K.
 // This is v100-skinny's QPN2 main loop: no activation PRMTs and one scale byte per group.
-template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation>
+template <int kTiles, int SPLITK, int NACC, bool FoldRebias, class OutputPolicy, class Activation>
 __global__ __launch_bounds__(SPLITK * 32, volta_qpn_min_blocks(kTiles, SPLITK))
 void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
                                       const std::uint8_t* __restrict__ scales,
@@ -364,7 +382,9 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     const std::int64_t tile_base =
         static_cast<std::int64_t>(blockIdx.x) * groups * 32 + lane;
     const half2 rebias   = __float2half2_rn(16384.0f);
-    const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const half2 divisor2 = __float2half2_rn(
+        FoldRebias ? inverse_weight_divisor * (256.0f * 16384.0f)
+                   : inverse_weight_divisor * 256.0f);
 
     float c[kTiles][NACC][8];
 #pragma unroll
@@ -379,8 +399,13 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     auto consume = [&](int group, uint2 q2, std::uint8_t scale_byte) {
         half2 b[8];
         const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scale_byte), divisor2);
-        nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
-        nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
+        if constexpr (FoldRebias) {
+            nvfp4_decode_e2m1_quad_raw(q2.x, *reinterpret_cast<half2(*)[4]>(&b[0]));
+            nvfp4_decode_e2m1_quad_raw(q2.y, *reinterpret_cast<half2(*)[4]>(&b[4]));
+        } else {
+            nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
+            nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
+        }
 #pragma unroll
         for (int j = 0; j < 8; ++j) { b[j] = __hmul2(b[j], sc2); }
         const unsigned* B = reinterpret_cast<const unsigned*>(b);
@@ -511,15 +536,25 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
 // (if small) edge. Geometries this dispatch doesn't name (attn/gdn input, the 6144-residual)
 // aren't reached by the mixed artifact's routing and fall to the SPLITK=8 default, which was never
 // worse than production's SPLITK=4 baseline on any measured shape.
+inline bool nvfp4_can_fold_rebias(float inverse_weight_divisor) noexcept {
+    return (448.0f * 16384.0f * inverse_weight_divisor) <= 60000.0f;
+}
+
 template <int kTiles, int SPLITK, int NACC, class Activation, class OutputPolicy>
 void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* codes,
                                const std::uint8_t* scales, const Activation* x, int n, int k,
                                int t, float inverse_weight_divisor, OutputPolicy output,
                                cudaStream_t stream) {
     if (prepacked) {
-        nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC>
-            <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
-                                               inverse_weight_divisor, output);
+        if (nvfp4_can_fold_rebias(inverse_weight_divisor)) {
+            nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC, true>
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
+                                                   inverse_weight_divisor, output);
+        } else {
+            nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC, false>
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
+                                                   inverse_weight_divisor, output);
+        }
     } else if constexpr (std::is_same_v<Activation, VoltaGroupMajorHalf>) {
         throw std::invalid_argument("nvfp4 qpn: group-major activation requires prepacked weights");
     } else {
@@ -546,12 +581,19 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool split_half = (n == 17408 && k == 5120);
     // Past one 8-row tile, a prepacked weight goes through the tensor-core route: one weight read
     // for all T columns instead of one per 8-row tile.
-    if (prepacked && t > S::kRowsPerTile &&
-        launch_volta_tc_skinny(
-            Nvfp4VoltaTcDecoder{codes, scales, k / S::kGroupK, inverse_weight_divisor}, xd, n, k,
-            t, std::is_same_v<Activation, VoltaGroupMajorHalf> ? volta_group_major_tiles(t) : 0,
-            output, stream)) {
-        return;
+    if (prepacked && t > S::kRowsPerTile) {
+        const int x_tiles =
+            std::is_same_v<Activation, VoltaGroupMajorHalf> ? volta_group_major_tiles(t) : 0;
+        const bool launched = nvfp4_can_fold_rebias(inverse_weight_divisor)
+                                  ? launch_volta_tc_skinny(
+                                        Nvfp4VoltaTcDecoder<true>{codes, scales, k / S::kGroupK,
+                                                                  inverse_weight_divisor},
+                                        xd, n, k, t, x_tiles, output, stream)
+                                  : launch_volta_tc_skinny(
+                                        Nvfp4VoltaTcDecoder<false>{codes, scales, k / S::kGroupK,
+                                                                   inverse_weight_divisor},
+                                        xd, n, k, t, x_tiles, output, stream);
+        if (launched) { return; }
     }
     if (t <= S::kRowsPerTile) {
         if (t == 1 && split_half) {
@@ -606,7 +648,8 @@ template <class OutputPolicy>
 void launch_nvfp4_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPolicy output,
                                         std::int32_t n, float inverse_weight_divisor,
                                         cudaStream_t stream) {
-    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+    if (w.layout == QuantLayout::VoltaQpnPrepacked &&
+        !volta_tc_applies(n, x.ne[0], x.ne[1], kVoltaTcNvfp4MinTokens)) {
         if (const VoltaGroupMajorHalf* staged = volta_stage_fp16_group_major(x, stream)) {
             launch_nvfp4_volta_qpn_with_activation(x, w, staged, output, n, inverse_weight_divisor,
                                                    stream);

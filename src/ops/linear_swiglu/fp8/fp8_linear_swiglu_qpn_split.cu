@@ -33,19 +33,15 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
                        static_cast<std::int64_t>(kIntermediate) * weight.k;
     up_weight.scales = static_cast<const __nv_bfloat16*>(weight.scales) + kIntermediate;
 
+    (void)up_scratch;
     launch_fp8_volta_qpn_with_fp16_activation(
         x, gate_weight, x_fp16, Fp8Fp32ContiguousOutput{gate_scratch, kIntermediate},
         kIntermediate, stream);
     launch_fp8_volta_qpn_with_fp16_activation(
-        x, up_weight, x_fp16, Fp8Fp32ContiguousOutput{up_scratch, kIntermediate},
+        x, up_weight, x_fp16,
+        Fp8QpnSwiGluOutput{gate_scratch, static_cast<__nv_bfloat16*>(out.data), kIntermediate},
         kIntermediate, stream);
-
-    const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
-    const int threads           = 256;
-    const int blocks = static_cast<int>(std::min<std::int64_t>((elements + threads - 1) / threads, 4096));
-    fp8_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
-        gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
-    CUDA_CHECK(cudaGetLastError());
+    (void)t;
 }
 
 #endif // NINFER_VOLTA_BUILD

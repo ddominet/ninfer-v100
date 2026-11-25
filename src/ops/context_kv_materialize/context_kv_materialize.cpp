@@ -5,6 +5,9 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ops/common/dflash2_rmsnorm_rope_volta.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/w8/w8_cutlass_sm70.h"
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -162,8 +165,15 @@ void context_kv_materialize(
         Tensor value = workspace.alloc(DType::BF16, {kKVSize, width_columns});
 
         if (layer.key_weight.layout == QuantLayout::VoltaQpnPrepacked) {
-            // Prepacked DFlash2 key/value views: one tensor-core launch for both.
-            linear_pair(context_flat, layer.key_weight, layer.value_weight, key, value, stream);
+#ifdef NINFER_VOLTA_BUILD
+            if (!detail::w8_cutlass_sm70_try_launch_pair(context_flat, layer.key_weight,
+                                                         layer.value_weight, key, value, workspace,
+                                                         stream))
+#endif
+            {
+                // Prepacked DFlash2 key/value views: one tensor-core launch for both.
+                linear_pair(context_flat, layer.key_weight, layer.value_weight, key, value, stream);
+            }
         } else {
             linear(context_flat, layer.key_weight, key, stream);
             linear(context_flat, layer.value_weight, value, stream);

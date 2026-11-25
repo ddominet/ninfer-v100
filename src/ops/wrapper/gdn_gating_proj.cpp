@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cmath>
@@ -181,6 +182,38 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                           dt_bias, ws, g, beta, execution);
+}
+
+bool gdn_norm_gating_proj_scatter(const Tensor& x, const Tensor& norm_weight, float eps,
+                                  const Weight& ab_weight, const Tensor& A_log,
+                                  const Tensor& dt_bias, const Tensor& scatter_columns, Tensor& h,
+                                  Tensor& g_padded, Tensor& beta_padded, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 0 || tokens > 128 || ab_weight.n != 96 || ab_weight.k != 5120 ||
+        scatter_columns.dtype != DType::I32 || scatter_columns.ne[0] != tokens) {
+        return false;
+    }
+    const Weight a_weight = bf16_row_view(ab_weight, 0, 48);
+    const Weight b_weight = bf16_row_view(ab_weight, 48, 48);
+    detail::bf16_gdn_norm_gating_proj_27_launch(
+        x, norm_weight, eps, h, a_weight, b_weight, A_log, dt_bias, g_padded, beta_padded, stream,
+        static_cast<const std::int32_t*>(scatter_columns.data));
+    return true;
+#else
+    (void)x;
+    (void)norm_weight;
+    (void)eps;
+    (void)ab_weight;
+    (void)A_log;
+    (void)dt_bias;
+    (void)scatter_columns;
+    (void)h;
+    (void)g_padded;
+    (void)beta_padded;
+    (void)stream;
+    return false;
+#endif
 }
 
 } // namespace ninfer::ops

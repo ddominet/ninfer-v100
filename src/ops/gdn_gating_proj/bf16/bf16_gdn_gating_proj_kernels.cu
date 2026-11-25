@@ -4,6 +4,10 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/common/volta_mma.cuh"
+#include <cuda_fp16.h>
+#endif
 
 #include "core/device.h" // CUDA_CHECK
 
@@ -414,6 +418,124 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// Double-buffered shared-memory Volta HMMA (mma.sync.m8n8k4) GDN gating projection for wide T
+// (prefill T >= 256): 6 row blocks x 16 rows covers all 96 rows (48 a_weight + 48 b_weight),
+// 32 tokens per CTA, 2 warps (64 threads) per CTA, 7.5 KiB smem -> 12 CTAs/SM max occupancy,
+// 100% coalesced global loads of both x and weights, zero shared-memory reduction, zero global
+// workspace (192 CTAs at T=1000, 384 CTAs at T=2048).
+__global__ __launch_bounds__(64, 8) void bf16_gdn_gating_proj_volta_hmma_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+    const __nv_bfloat16* __restrict__ b_weight, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, float* __restrict__ g, float* __restrict__ beta,
+    std::int32_t t) {
+    constexpr int kWarps      = 2;
+    constexpr int kRowsPerCta = kWarps * 8; // 16 rows/CTA -> 6 CTAs cover 96 rows
+    constexpr int kTTile      = 32;
+    constexpr int kKStep      = 32;
+    constexpr int kPad        = 8;
+    constexpr int kSmemStride = kKStep + kPad; // 40 halfs = 20 half2s
+
+    __shared__ __align__(16) __half x_sh[2][kTTile][kSmemStride];
+    __shared__ __align__(16) __half w_sh[2][kRowsPerCta][kSmemStride];
+
+    const int tid  = static_cast<int>(threadIdx.x); // 0..63
+    const int warp = tid >> 5;                      // 0..1
+    const int n0   = static_cast<int>(blockIdx.x) * kRowsPerCta;
+    const int wn0  = n0 + warp * 8;
+    const int t0   = static_cast<int>(blockIdx.y) * kTTile;
+    const int tcnt = min(kTTile, t - t0);
+
+    // 64 threads load 16x32 weights (1 uint4/thread) and 32x32 activations (2 uint4/thread).
+    const int xr0   = tid >> 2; // 0..15
+    const int xr1   = xr0 + 16; // 16..31
+    const int kv    = (tid & 3) * 8;
+    const int w_col = n0 + xr0;
+    const bool w_is_b = w_col >= kN;
+    const int w_row   = w_is_b ? w_col - kN : w_col;
+    const __nv_bfloat16* w_base =
+        (w_is_b ? b_weight : a_weight) + static_cast<std::int64_t>(w_row) * kK;
+
+    struct Carry {
+        uint4 x0;
+        uint4 x1;
+        uint4 w;
+    };
+    Carry carry;
+
+    auto prefetch = [&](int kbase, Carry& c) {
+        c.w = __ldg(reinterpret_cast<const uint4*>(w_base + kbase + kv));
+        if (xr0 < tcnt) {
+            c.x0 = __ldg(reinterpret_cast<const uint4*>(
+                x + static_cast<std::int64_t>(t0 + xr0) * kK + kbase + kv));
+        } else {
+            c.x0 = make_uint4(0, 0, 0, 0);
+        }
+        if (xr1 < tcnt) {
+            c.x1 = __ldg(reinterpret_cast<const uint4*>(
+                x + static_cast<std::int64_t>(t0 + xr1) * kK + kbase + kv));
+        } else {
+            c.x1 = make_uint4(0, 0, 0, 0);
+        }
+    };
+
+    auto cvt_store = [](const uint4& raw, __half* dst) {
+        const auto* src = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        uint4 out_u4;
+        auto* h2 = reinterpret_cast<__half2*>(&out_u4);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { h2[j] = __float22half2_rn(__bfloat1622float2(src[j])); }
+        *reinterpret_cast<uint4*>(dst) = out_u4;
+    };
+
+    auto commit = [&](const Carry& c, int buf) {
+        cvt_store(c.w, &w_sh[buf][xr0][kv]);
+        cvt_store(c.x0, &x_sh[buf][xr0][kv]);
+        cvt_store(c.x1, &x_sh[buf][xr1][kv]);
+    };
+
+    float d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    prefetch(0, carry);
+    commit(carry, 0);
+    int buf = 0;
+
+    for (int kbase = 0; kbase < kK; kbase += kKStep) {
+        __syncthreads();
+        const int nxt       = kbase + kKStep;
+        const bool has_next = nxt < kK;
+        if (has_next) { prefetch(nxt, carry); }
+
+#pragma unroll
+        for (int kk = 0; kk < kKStep; kk += 8) {
+            half2 a[4], b[4];
+            volta_load_qp(a, reinterpret_cast<const half2*>(&x_sh[buf][0][kk]), kSmemStride / 2);
+            volta_load_k(b, reinterpret_cast<const half2*>(&w_sh[buf][warp * 8][kk]),
+                         kSmemStride / 2);
+            volta_mma_qk(d, a, b);
+        }
+
+        if (has_next) { commit(carry, buf ^ 1); }
+        buf ^= 1;
+    }
+
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int row_t = volta_d_get_i(l);
+        const int lrow  = wn0 + volta_d_get_j(l);
+        if (row_t < tcnt && lrow < kLogicalRows) {
+            const bool out_b           = lrow >= kN;
+            const int head             = out_b ? lrow - kN : lrow;
+            const std::int64_t out_idx = static_cast<std::int64_t>(t0 + row_t) * kN + head;
+            if (out_b) {
+                beta[out_idx] = sigmoid(d[l]);
+            } else {
+                g[out_idx] = -expf(A_log[head]) * softplus(d[l] + dt_bias[head]);
+            }
+        }
+    }
+}
+#endif
+
 void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& a_weight,
                                                  const Weight& b_weight, const Tensor& A_log,
                                                  const Tensor& dt_bias, void* workspace,
@@ -422,6 +544,19 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
     const std::int32_t t       = x.ne[1];
+#ifdef NINFER_VOLTA_BUILD
+    if (t >= 256) {
+        const dim3 grid(6u, static_cast<unsigned>(div_up(t, 32)));
+        bf16_gdn_gating_proj_volta_hmma_kernel<<<grid, 64, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(a_weight.qdata),
+            static_cast<const __nv_bfloat16*>(b_weight.qdata),
+            static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+            static_cast<float*>(g.data), static_cast<float*>(beta.data), t);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     const std::size_t required = static_cast<std::size_t>(kSmallTSplits) *
                                  static_cast<std::size_t>(t) *
                                  static_cast<std::size_t>(kLogicalRows) * sizeof(float);

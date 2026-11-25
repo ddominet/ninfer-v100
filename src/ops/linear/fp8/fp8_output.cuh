@@ -53,4 +53,18 @@ struct Fp8Fp32ContiguousOutput {
     }
 };
 
+struct Fp8QpnSwiGluOutput {
+    const float* gate;
+    __nv_bfloat16* out;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float up_value) const {
+        const std::int64_t idx = static_cast<std::int64_t>(token) * rows + parent_row;
+        const float g          = gate[idx];
+        const float silu_g     = g / (1.0f + __expf(-g));
+        out[idx]               = __float2bfloat16_rn(silu_g * up_value);
+    }
+};
+
 } // namespace ninfer::ops::detail

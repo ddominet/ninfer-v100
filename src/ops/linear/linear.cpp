@@ -89,7 +89,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::W8G32_F16S:
-        detail::w8_dispatch(x, w, out, policy, stream);
+        detail::w8_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::BF16_CTRL:
         detail::bf16_dispatch(x, w, out, policy, stream);

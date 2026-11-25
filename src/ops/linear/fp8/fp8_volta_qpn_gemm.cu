@@ -22,14 +22,30 @@ static_assert(kFp8VoltaQpnRowsPerTile == S::kRowsPerTile,
 __global__ void fp8_stage_bf16_activation_kernel(const __nv_bfloat16* __restrict__ input,
                                                  half* __restrict__ output,
                                                  std::int64_t count) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { output[i] = __float2half(__bfloat162float(input[i])); }
+    const std::int64_t i =
+        (static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+    if (i + 8 <= count) {
+        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(input + i));
+        const auto* src = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        uint4 packed;
+        auto* dst = reinterpret_cast<half2*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            dst[j] = __float22half2_rn(__bfloat1622float2(src[j]));
+        }
+        *reinterpret_cast<uint4*>(output + i) = packed;
+    } else {
+        for (std::int64_t j = i; j < count; ++j) {
+            output[j] = __float2half(__bfloat162float(input[j]));
+        }
+    }
 }
 } // namespace
 
 void fp8_stage_bf16_activation_sm70(const Tensor& x, void* fp16_out, cudaStream_t stream) {
     const std::int64_t count = x.numel();
-    fp8_stage_bf16_activation_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
+    const std::int64_t vecs  = (count + 7) / 8;
+    fp8_stage_bf16_activation_kernel<<<static_cast<int>((vecs + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<half*>(fp16_out), count);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -74,18 +90,30 @@ bool volta_stage_enabled(const char* name) {
 
 __global__ void volta_stage_group_major_kernel(const __nv_bfloat16* __restrict__ input,
                                                half* __restrict__ output, int k, int t, int tiles,
-                                               std::int64_t count) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count) { return; }
-    const int j     = static_cast<int>(i & 7);
-    const int r     = static_cast<int>((i >> 3) & 7);
-    const int h     = static_cast<int>((i >> 6) & 1);
-    const int tile  = static_cast<int>((i >> 7) % tiles);
-    const int group = static_cast<int>((i >> 7) / tiles);
+                                               std::int64_t vec_count) {
+    // Each vector is 8 contiguous elements (j = 0..7) at [group][tile][h][r][0..7].
+    const std::int64_t vec = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (vec >= vec_count) { return; }
+    const int r     = static_cast<int>(vec & 7);
+    const int h     = static_cast<int>((vec >> 3) & 1);
+    const std::int64_t gt = vec >> 4;
+    const int tile  = static_cast<int>(gt % tiles);
+    const int group = static_cast<int>(gt / tiles);
     const int row   = tile * 8 + r;
-    output[i] = row < t ? __float2half(__bfloat162float(
-                              input[static_cast<std::int64_t>(row) * k + group * 16 + h * 8 + j]))
-                        : __ushort_as_half(0);
+    uint4 packed;
+    if (row < t) {
+        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(
+            input + static_cast<std::int64_t>(row) * k + group * 16 + h * 8));
+        const auto* src = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        auto* dst       = reinterpret_cast<half2*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            dst[j] = __float22half2_rn(__bfloat1622float2(src[j]));
+        }
+    } else {
+        packed = make_uint4(0u, 0u, 0u, 0u);
+    }
+    reinterpret_cast<uint4*>(output)[vec] = packed;
 }
 } // namespace
 
@@ -165,10 +193,11 @@ const VoltaGroupMajorHalf* volta_stage_fp16_group_major(const Tensor& x, cudaStr
     if (!enabled || k % 16 != 0 || t > kVoltaQpnMaxTokens) { return nullptr; }
     const int tiles          = volta_group_major_tiles(t);
     const std::int64_t count = static_cast<std::int64_t>(k / 16) * tiles * 128;
+    const std::int64_t vecs  = count / 8;
     void* data = volta_stage_scratch(stream, static_cast<std::size_t>(count) * sizeof(half));
     if (data == nullptr) { return nullptr; }
-    volta_stage_group_major_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<half*>(data), k, t, tiles, count);
+    volta_stage_group_major_kernel<<<static_cast<int>((vecs + 255) / 256), 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<half*>(data), k, t, tiles, vecs);
     CUDA_CHECK(cudaGetLastError());
     return static_cast<const VoltaGroupMajorHalf*>(data);
 }

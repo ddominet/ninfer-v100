@@ -38,36 +38,52 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
     out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
 }
 
-// Prepacked code plane in storage order: [N/32 tile][K/128 block][8 slices][32 lanes][16 codes],
-// where a lane's 16 codes are 16 consecutive columns of one row (fp8_qpn_prepacked_offset). One
-// thread moves one 16-code chunk: a warp reads 512 contiguous bytes and each thread writes 32
-// contiguous bytes of its row. Same per-value decode as the row-order kernel, which gathers two
-// bytes per thread (~505 GB/s on the p45k prefill trace).
+// Prepacked FP8 in storage order: [N/32 tile][K/128 block][8 slices][32 lanes][16 codes].
+// 4-warp (128-thread) CTA owning 1 tile (32 rows) x 4 slices (64 K = 128B FP16/row) stages
+// through a padded 4.5 KiB shared-memory tile so BOTH reads (512B/warp) and writes (4x 128B
+// cache lines/warp) are 100% coalesced.
 __global__ void dequant_fp8_prepacked_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
                                               cutlass::half_t* __restrict__ out) {
-    const std::int64_t chunk =
-        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int blocks = k / 128;
-    const int lane   = static_cast<int>(chunk & 31);
-    const int slice  = static_cast<int>((chunk >> 5) & 7);
-    const std::int64_t tile_block = chunk >> 8;
-    const int block  = static_cast<int>(tile_block % blocks);
-    const int tile   = static_cast<int>(tile_block / blocks);
-    const int row    = tile * 32 + ((lane >> 2) & 3) * 8 + ((lane & 3) | ((lane & 16) ? 4 : 0));
-    if (row >= n) { return; }
-    const uint4 raw      = *reinterpret_cast<const uint4*>(codes + chunk * 16);
-    const auto* pairs    = reinterpret_cast<const std::uint16_t*>(&raw);
-    uint4 packed[2];
-    auto* dst = reinterpret_cast<__half2*>(packed);
+    __shared__ uint4 smem[32][9];
+
+    const int warp       = static_cast<int>(threadIdx.x) >> 5; // 0..3
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int blocks     = k / 128;
+    const int half_block = static_cast<int>(blockIdx.x) & 1;
+    const int block      = static_cast<int>(blockIdx.x) >> 1;
+    const int tile       = static_cast<int>(blockIdx.y);
+    const int slice      = half_block * 4 + warp;
+    const int local_row  = ((lane >> 2) & 3) * 8 + ((lane & 3) | ((lane & 16) ? 4 : 0));
+    const int row        = tile * 32 + local_row;
+
+    if (row < n) {
+        const std::int64_t chunk =
+            ((static_cast<std::int64_t>(tile) * blocks + block) * 8 + slice) * 32 + lane;
+        const uint4 raw   = __ldg(reinterpret_cast<const uint4*>(codes) + chunk);
+        const auto* pairs = reinterpret_cast<const std::uint16_t*>(&raw);
+        uint4 packed[2];
+        auto* dst = reinterpret_cast<__half2*>(packed);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const float2 weight = decode_fp8_e4m3x2(pairs[j]);
-        dst[j]              = __floats2half2_rn(weight.x, weight.y);
+        for (int j = 0; j < 8; ++j) {
+            const float2 weight = decode_fp8_e4m3x2(pairs[j]);
+            dst[j]              = __floats2half2_rn(weight.x, weight.y);
+        }
+        smem[local_row][warp * 2 + 0] = packed[0];
+        smem[local_row][warp * 2 + 1] = packed[1];
     }
-    auto* destination = reinterpret_cast<uint4*>(out + static_cast<std::int64_t>(row) * k +
-                                                 block * 128 + slice * 16);
-    destination[0] = packed[0];
-    destination[1] = packed[1];
+    __syncthreads();
+
+    const int vec   = lane & 7;
+    const int k_off = block * 128 + half_block * 64 + vec * 8;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int lr      = warp * 8 + p * 4 + (lane >> 3);
+        const int out_row = tile * 32 + lr;
+        if (out_row < n) {
+            *reinterpret_cast<uint4*>(out + static_cast<std::int64_t>(out_row) * k + k_off) =
+                smem[lr][vec];
+        }
+    }
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
@@ -174,10 +190,9 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     auto* input  = static_cast<cutlass::half_t*>(scratch.input.data);
 
     if (w.layout == QuantLayout::VoltaQpnPrepacked && n % 32 == 0 && k % 128 == 0) {
-        const std::int64_t chunks = static_cast<std::int64_t>(n) * k / 16;
-        dequant_fp8_prepacked_to_fp16<<<static_cast<unsigned>((chunks + 255) / 256), 256, 0,
-                                        stream>>>(static_cast<const std::uint8_t*>(w.qdata), n, k,
-                                                  weight);
+        const dim3 grid(static_cast<unsigned>((k / 128) * 2), static_cast<unsigned>(n / 32));
+        dequant_fp8_prepacked_to_fp16<<<grid, 128, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), n, k, weight);
     } else {
         const dim3 block(256);
         const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);

@@ -336,6 +336,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/q5/q5_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_qpn_gemm.cu
+    ops/linear/w8/w8_cutlass_sm70.cu
     ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu
@@ -362,7 +363,6 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   set_source_files_properties(ops/attn_input_proj/fp8/fp8_attn_input_a16_small_t.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
   set_source_files_properties(ops/attn_input_proj/fp8/fp8_attn_input_a16_gemm.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
   set_source_files_properties(ops/attn_input_proj/w8/w8_dflash2_attn_input.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
-  set_source_files_properties(ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
   set_source_files_properties(ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
   set_source_files_properties(ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
   set_source_files_properties(ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)

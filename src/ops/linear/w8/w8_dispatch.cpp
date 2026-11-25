@@ -1,5 +1,8 @@
 #include "ops/linear/w8/w8_dispatch.h"
 #include "ops/linear/w8/w8_feature.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/w8/w8_cutlass_sm70.h"
+#endif
 
 #include <stdexcept>
 
@@ -274,14 +277,22 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
+                 WorkspaceArena* workspace, cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
+    // Wide-T W8 prefill (e.g. DFlash2 feature_projection 5120x25600 at T=256..2048): when the
+    // caller provides a workspace arena with room for FP16 staging, CUTLASS SM70 Tensor Cores
+    // avoid 64x weight re-reads in the 32x32 MMA kernel.
+    if (workspace != nullptr && w8_cutlass_sm70_try_launch(x, w, out, *workspace, stream)) {
+        return;
+    }
     // A load-time prepacked weight is readable only by the QPN kernel; every table route below
     // reads row-major.
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
         launch_w8_volta_qpn(x, w, out, stream);
         return;
     }
+#else
+    (void)workspace;
 #endif
     const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);

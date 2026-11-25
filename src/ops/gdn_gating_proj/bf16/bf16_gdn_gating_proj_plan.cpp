@@ -404,6 +404,10 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     // Composed alternative is the same computation as rmsnorm + the routed gating
     // projection, which does go through the table.
 #ifdef NINFER_VOLTA_BUILD
+    // On Volta, 27B T <= 128 executes the single-launch fused SIMT kernel with zero workspace.
+    if (is_27(problem) && problem.cols <= 128) {
+        return {schedule, control, 0};
+    }
     constexpr bool fused_norm_gating_available = false;
 #else
     constexpr bool fused_norm_gating_available = true;
@@ -423,6 +427,15 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_cols,
                                                           std::int32_t max_cols) {
+#ifdef NINFER_VOLTA_BUILD
+    if (heads == 48 && input_rows == 5120) {
+        if (min_cols <= 0 || max_cols < min_cols) {
+            throw std::invalid_argument("BF16 GDN gating: invalid column interval");
+        }
+        if (max_cols <= 128) { return 0; }
+        min_cols = std::max<std::int32_t>(min_cols, 129);
+    }
+#endif
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
     if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
@@ -470,6 +483,16 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                                    Tensor& g, Tensor& beta, DeviceExecutionView execution) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
+#ifdef NINFER_VOLTA_BUILD
+    // Single-launch fused RMSNorm + GDN gating projection for 27B decode and short-prompt widths
+    // (T <= 128): replaces 3 launches/layer (rmsnorm + partial + reduce = -96 launches/rnd) and
+    // keeps the normalized input in FP32 for the gating dot products.
+    if (is_27(problem) && problem.cols <= 128) {
+        bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                            dt_bias, g, beta, execution.stream);
+        return;
+    }
+#endif
     const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
     if (plan.schedule == Bf16GdnNormGatingScheduleId::Composed) {
         rmsnorm(x, norm_weight, eps, true, h, execution.stream);
