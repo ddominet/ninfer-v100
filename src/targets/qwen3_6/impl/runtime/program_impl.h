@@ -924,7 +924,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // column; 1.24 ms per head chunk), refined online from the rounds this engine runs.
         // Draft-block columns: about 0.45 ms per 8 (the W8 draft layers at several requests).
         // Context: one request's round grows about 18 ms per 100K tokens (59 vs 82 tok/s at 90K).
-        dflash_cost.reset({36.0, 1.2, 1.0, 1.24, 18.0, 0.45}, {25.0, 1.0, 0.25, 0.5, 25.0, 0.25});
+        dflash_cost.reset({36.0, 1.2, 6.0, 1.24, 18.0, 0.45}, {25.0, 1.0, 9.0, 0.5, 25.0, 0.25});
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
