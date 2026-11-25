@@ -99,10 +99,22 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
     if (q.ne[2] >= 1 && q.ne[2] <= 8 && context.capacity == 2048 &&
         plan.route == SlidingWindowAttentionRoute::SplitKv) {
         auto run = [&]<int Tokens>() {
-            const dim3 partial_grid(kContextQueryQHeads, plan.split_capacity,
+            // One CTA per K/V head serving its four query heads (see the GQA kernel).
+            constexpr int kRows = kContextQueryGroup * Tokens;
+            constexpr int kSmem = (2 * 32 * (kContextQueryHeadDim + 1) +
+                                   kRows * kContextQueryHeadDim + kRows * 32) *
+                                  static_cast<int>(sizeof(float));
+            static const bool configured = [] {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    sliding_window_attention_volta_gqa_partial_kernel<Tokens>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+                return true;
+            }();
+            (void)configured;
+            const dim3 partial_grid(kContextQueryKVHeads, plan.split_capacity,
                                     static_cast<unsigned>(q.ne[3]));
-            sliding_window_attention_volta_octet_partial_kernel<Tokens>
-                <<<partial_grid, Tokens * 32, 0, stream>>>(
+            sliding_window_attention_volta_gqa_partial_kernel<Tokens>
+                <<<partial_grid, kRows * 32, kSmem, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
                     static_cast<const __nv_bfloat16*>(query_v.data),
