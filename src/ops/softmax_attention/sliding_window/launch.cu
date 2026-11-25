@@ -102,7 +102,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
             const dim3 partial_grid(kContextQueryQHeads, plan.split_capacity,
                                     static_cast<unsigned>(q.ne[3]));
             sliding_window_attention_volta_octet_partial_kernel<Tokens>
-                <<<partial_grid, kSlidingWindowVoltaOctetThreads, 0, stream>>>(
+                <<<partial_grid, Tokens * 32, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
                     static_cast<const __nv_bfloat16*>(query_v.data),
