@@ -706,6 +706,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         auto& dflash2             = runtime.dflash.emplace();
         dflash2.feature_projection =
             materialized_weight(backing, source.feature_projection, 5120, 25600);
+#ifdef NINFER_VOLTA_BUILD
+        // Read only by ops::linear (the context append and its prefill form): prepacked it takes
+        // the coalesced quadpair kernel to 16 columns and the tensor-core route above (row-major
+        // it ran ~545 us a call at verify widths, ~240 GB/s). Prefill reads it in 64-token
+        // launches.
+        ::ninfer::ops::detail::w8_prepack_qpn_sm70(dflash2.feature_projection);
+#endif
         dflash2.context_norm = artifact::materialized_tensor(backing, source.context_norm,
                                                              NumericFormat::BF16, {5120});
         for (std::size_t layer = 0; layer < dflash2.layers.size(); ++layer) {
