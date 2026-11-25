@@ -30,7 +30,10 @@ sliding_window_attention_volta_octet_partial_kernel(
     int padded_context, int max_context, int split_capacity, float scale,
     float* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l) {
-    static_assert(Tokens == 8, "the Volta octet path is the DFlash2 K=7 tile");
+    // One warp a query token: eight for the full K=7 block, fewer for the narrowed blocks the
+    // kept-draft choice drafts under load (a narrow block took the per-token fallback, which
+    // streams the 2K window once per token: 146 us a call).
+    static_assert(Tokens >= 1 && Tokens <= 8, "one warp per query token, at most eight");
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     constexpr int D                 = kContextQueryHeadDim;
     constexpr int Window            = 2048;
@@ -118,7 +121,7 @@ sliding_window_attention_volta_octet_partial_kernel(
         // 32 keys x 128 dims of K and V: one 16-byte load (8 elements) per thread and plane per
         // step, keys in cyclic-slot order so a block may wrap the 2048-slot ring.
         constexpr int ChunksPerKey = D / 8;
-        for (int c = tid; c < KeyBlock * ChunksPerKey; c += kSlidingWindowVoltaOctetThreads) {
+        for (int c = tid; c < KeyBlock * ChunksPerKey; c += Tokens * 32) {
             const int j     = c / ChunksPerKey;
             const int piece = c % ChunksPerKey;
             float* krow = key_s + j * RowStride + piece * 8;

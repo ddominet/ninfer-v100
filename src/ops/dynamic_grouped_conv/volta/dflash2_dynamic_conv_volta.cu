@@ -118,48 +118,54 @@ __global__ void dflash2_bf16_matvec_kernel(const __nv_bfloat16* __restrict__ w,
     }
 }
 
-// K=7 DFlash2 always projects eight normalized positions through the same control matrix. The
-// scalar fallback launches one CTA per (row, position), rereading every weight row eight times.
-// This route keeps all eight dot products in one CTA: each weight is loaded once, activations are
-// shared by cache, and the reduction tree matches the fallback's four-warp block reduction.
-// `cols` <= kCols columns are live; the rest are neither read nor written, so a remainder block
-// shares the kernel (and its per-column reduction order) with the full ones.
+// Four weight rows a CTA: each activation value is loaded once and used by four rows. One row a
+// CTA reread all `cols` activation columns per weight row, ~200 MB of cache traffic for a
+// 13 MB weight at 16 columns (104 us a call against ~30 here).
 template <int kCols>
-__global__ __launch_bounds__(128, 4) void dflash2_bf16_control_wide_kernel(
+__global__ __launch_bounds__(128) void dflash2_bf16_control_rows4_kernel(
     const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ out, int cols) {
-    constexpr int kRows = 1280;
-    constexpr int k     = 5120;
+    constexpr int kRows  = 1280;
+    constexpr int k      = 5120;
+    constexpr int kTile  = 4;
     constexpr int kWarps = 4;
-    const int row = static_cast<int>(blockIdx.x);
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const __nv_bfloat16* wrow = w + static_cast<std::int64_t>(row) * k;
-    float acc[kCols] = {};
+    const int row0       = static_cast<int>(blockIdx.x) * kTile;
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+    float acc[kTile][kCols] = {};
 
     for (int i = static_cast<int>(threadIdx.x); i < k; i += 128) {
-        const float weight = __bfloat162float(wrow[i]);
+        float xv[kCols];
 #pragma unroll
         for (int col = 0; col < kCols; ++col) {
-            if (col < cols) {
-                acc[col] = fmaf(weight,
-                                __bfloat162float(x[static_cast<std::int64_t>(col) * k + i]),
-                                acc[col]);
-            }
+            xv[col] = col < cols ? __bfloat162float(x[static_cast<std::int64_t>(col) * k + i]) : 0.0f;
+        }
+#pragma unroll
+        for (int r = 0; r < kTile; ++r) {
+            const float weight = __bfloat162float(w[static_cast<std::int64_t>(row0 + r) * k + i]);
+#pragma unroll
+            for (int col = 0; col < kCols; ++col) { acc[r][col] = fmaf(weight, xv[col], acc[r][col]); }
         }
     }
 
-    __shared__ float sums[kWarps][kCols];
+    __shared__ float sums[kWarps][kTile][kCols];
 #pragma unroll
-    for (int col = 0; col < kCols; ++col) {
-        acc[col] = warp_reduce_sum(acc[col]);
-        if (lane == 0) { sums[warp][col] = acc[col]; }
+    for (int r = 0; r < kTile; ++r) {
+#pragma unroll
+        for (int col = 0; col < kCols; ++col) {
+            const float total = warp_reduce_sum(acc[r][col]);
+            if (lane == 0) { sums[warp][r][col] = total; }
+        }
     }
     __syncthreads();
-    if (warp == 0 && lane < cols) {
-        // Preserve block_reduce_sum<128>'s pairwise order: (warp0 + warp2) + (warp1 + warp3).
-        const float total = (sums[0][lane] + sums[2][lane]) + (sums[1][lane] + sums[3][lane]);
-        out[row + static_cast<std::int64_t>(lane) * kRows] = __float2bfloat16_rn(total);
+    for (int e = static_cast<int>(threadIdx.x); e < kTile * kCols; e += 128) {
+        const int r   = e / kCols;
+        const int col = e % kCols;
+        if (col < cols) {
+            const float total =
+                (sums[0][r][col] + sums[2][r][col]) + (sums[1][r][col] + sums[3][r][col]);
+            out[row0 + r + static_cast<std::int64_t>(col) * kRows] = __float2bfloat16_rn(total);
+        }
     }
 }
 
@@ -193,11 +199,11 @@ void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_b
         while (first < cols) {
             const int block = std::min(16, cols - first);
             if (block > 8) {
-                dflash2_bf16_control_wide_kernel<16><<<n_rows, 128, 0, stream>>>(
+                dflash2_bf16_control_rows4_kernel<16><<<n_rows / 4, 128, 0, stream>>>(
                     w, x + static_cast<std::int64_t>(first) * k,
                     out + static_cast<std::int64_t>(first) * n_rows, block);
             } else {
-                dflash2_bf16_control_wide_kernel<8><<<n_rows, 128, 0, stream>>>(
+                dflash2_bf16_control_rows4_kernel<8><<<n_rows / 4, 128, 0, stream>>>(
                     w, x + static_cast<std::int64_t>(first) * k,
                     out + static_cast<std::int64_t>(first) * n_rows, block);
             }
