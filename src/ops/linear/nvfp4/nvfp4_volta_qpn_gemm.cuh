@@ -120,6 +120,7 @@ struct Nvfp4VoltaTcDecoder {
 
     static constexpr int kItemsPerTileChunk = 64; // 4 groups x 16 lane pairs
     static constexpr int kMinTokens         = kVoltaTcNvfp4MinTokens;
+    static constexpr bool kMandatory        = false;
     struct Raw {
         uint4 q;
         std::uint16_t s;

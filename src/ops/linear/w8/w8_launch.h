@@ -39,6 +39,15 @@ void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& weight,
 // v [1024, T]; T <= 64.
 void launch_w8_volta_qpn_split3(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                 Tensor& v, cudaStream_t stream);
+// Prepacked W8 through the tensor-core skinny route at any token count (launches of at most 64
+// tokens). Return false, launching nothing, when the weight is not prepacked W8.
+// split3: rows [0, q) -> q, [q, q + k) -> k, the rest -> v.
+[[nodiscard]] bool launch_w8_volta_tc_split3(const Tensor& x, const Weight& weight, Tensor& q,
+                                             Tensor& k, Tensor& v, cudaStream_t stream);
+// pair: two weights (one launch when they are adjacent row views of one parent).
+[[nodiscard]] bool launch_w8_volta_tc_pair(const Tensor& x, const Weight& first,
+                                           const Weight& second, Tensor& first_out,
+                                           Tensor& second_out, cudaStream_t stream);
 #endif
 
 void launch_w8_decode_r4(const Tensor&, const Weight&, Tensor&, cudaStream_t);

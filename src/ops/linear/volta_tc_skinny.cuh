@@ -301,7 +301,9 @@ void launch_volta_tc_skinny_rows(const Decoder& decoder, const Activation* x, in
 template <class Decoder, class Activation, class OutputPolicy>
 bool launch_volta_tc_skinny(const Decoder& decoder, const Activation* x, int n, int k, int t,
                             int x_tiles, OutputPolicy output, cudaStream_t stream) {
-    if (!volta_tc_applies(n, k, t, Decoder::kMinTokens)) { return false; }
+    if (n <= 0 || n % 64 != 0 || k <= 0 || k % 128 != 0 || t < 1 || t > 64) { return false; }
+    // A mandatory decoder is the only reader of its weight layout: it runs whatever the controls.
+    if (!Decoder::kMandatory && !volta_tc_applies(n, k, t, Decoder::kMinTokens)) { return false; }
     if (reinterpret_cast<std::uintptr_t>(x) % 16 != 0) { return false; }
     const VoltaTcSchedule schedule = volta_tc_schedule(n, k, t);
     if (schedule.rows != 64 && schedule.rows != 128) { return false; }

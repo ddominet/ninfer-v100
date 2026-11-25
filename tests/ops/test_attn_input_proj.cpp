@@ -514,6 +514,15 @@ int run_w8_dflash2() {
                                       72, 96, 128, 129}) {
         failures += run_w8_companion_case(parent, tokens, kHidden, "dflash2");
     }
+#ifdef NINFER_VOLTA_BUILD
+    // The runtime prepacks this weight in DFlash2 mode: the tensor-core route at every width.
+    DevicePackedWeight prepacked(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 6144, kHidden, 409U));
+    prepacked.prepack_w8();
+    for (const std::int32_t tokens : {1, 3, 8, 9, 16, 24, 32, 40, 64, 65, 129}) {
+        failures += run_w8_companion_case(prepacked, tokens, kHidden, "dflash2 prepacked");
+    }
+#endif
     return failures;
 }
 

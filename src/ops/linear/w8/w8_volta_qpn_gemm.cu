@@ -3,6 +3,7 @@
 #include "ops/linear/w8/w8_volta_qpn_gemm.cuh"
 #include "ops/linear/volta_fp16_stage.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include <cuda_bf16.h>
@@ -380,6 +381,108 @@ void w8_linear_swiglu_volta_qpn_split_launch(const Tensor& x, const Weight& w, T
     w8_qpn_launch<W8QpnEpilogue::SwiGluUp>(a, launch.splitk, up_codes, up_scales, output,
                                            kIntermediate, k, t, padded_groups, kIntermediate,
                                            stream);
+}
+
+namespace {
+
+// Row ranges of one prepacked parent weight scattered into separate [rows, T] outputs.
+struct W8TcRowSplitOutput {
+    __nv_bfloat16* first;
+    __nv_bfloat16* second;
+    __nv_bfloat16* third;
+    int first_rows;
+    int second_rows;
+    std::int64_t first_ld;
+    std::int64_t second_ld;
+    std::int64_t third_ld;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        if (row < first_rows) {
+            first[token * first_ld + row] = __float2bfloat16(value);
+        } else if (row < first_rows + second_rows) {
+            second[token * second_ld + row - first_rows] = __float2bfloat16(value);
+        } else {
+            third[token * third_ld + row - first_rows - second_rows] = __float2bfloat16(value);
+        }
+    }
+};
+
+bool w8_tc_prepacked(const Weight& w, std::int32_t k) {
+    return w.qtype == QType::W8G32_F16S && w.layout == QuantLayout::VoltaQpnPrepacked &&
+           w.k == k && w.padded_shape[1] == k && k % 128 == 0 && w.n % 64 == 0;
+}
+
+// Every token count, in launches of at most 64 tokens, BF16 activations staged by the kernel.
+void w8_tc_launch_chunks(const Tensor& x, const Weight& w, W8TcRowSplitOutput output,
+                         cudaStream_t stream) {
+    const std::int32_t k = x.ne[0];
+    const std::int32_t t = x.ne[1];
+    const W8VoltaTcDecoder decoder{static_cast<const uint4*>(w.qdata),
+                                   static_cast<const __half*>(w.scales), k / 128};
+    for (std::int32_t first = 0; first < t; first += 64) {
+        const std::int32_t count = std::min<std::int32_t>(64, t - first);
+        W8TcRowSplitOutput chunk = output;
+        chunk.first += first * output.first_ld;
+        if (chunk.second != nullptr) { chunk.second += first * output.second_ld; }
+        if (chunk.third != nullptr) { chunk.third += first * output.third_ld; }
+        const auto* activation =
+            static_cast<const __nv_bfloat16*>(x.data) + static_cast<std::int64_t>(first) * k;
+        if (!launch_volta_tc_skinny(decoder, activation, w.n, k, count, 0, chunk, stream)) {
+            throw std::invalid_argument("W8 tensor-core route: unsupported prepacked shape");
+        }
+    }
+}
+
+std::int64_t leading(const Tensor& t) {
+    return static_cast<std::int64_t>(t.nb[1] / sizeof(__nv_bfloat16));
+}
+
+} // namespace
+
+bool launch_w8_volta_tc_split3(const Tensor& x, const Weight& w, Tensor& q, Tensor& k, Tensor& v,
+                               cudaStream_t stream) {
+    if (!w8_tc_prepacked(w, x.ne[0]) || w.n != q.ne[0] + k.ne[0] + v.ne[0]) { return false; }
+    w8_tc_launch_chunks(x, w,
+                        {static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                         static_cast<__nv_bfloat16*>(v.data), q.ne[0], k.ne[0], leading(q),
+                         leading(k), leading(v)},
+                        stream);
+    return true;
+}
+
+bool launch_w8_volta_tc_pair(const Tensor& x, const Weight& first, const Weight& second,
+                             Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    const std::int32_t k = x.ne[0];
+    if (!w8_tc_prepacked(first, k) || !w8_tc_prepacked(second, k)) { return false; }
+    const auto* first_codes  = static_cast<const std::uint8_t*>(first.qdata);
+    const auto* first_scales = static_cast<const std::uint8_t*>(first.scales);
+    const bool adjacent =
+        static_cast<const std::uint8_t*>(second.qdata) ==
+            first_codes + static_cast<std::int64_t>(first.n) * k &&
+        static_cast<const std::uint8_t*>(second.scales) ==
+            first_scales + static_cast<std::int64_t>(first.n) * (k / 32) * 2;
+    if (adjacent) {
+        // Row views of one parent (the DFlash2 context key and value): one launch over both.
+        Weight both          = first;
+        both.n               = first.n + second.n;
+        both.shape[0]        = both.n;
+        both.padded_shape[0] = both.n;
+        w8_tc_launch_chunks(x, both,
+                            {static_cast<__nv_bfloat16*>(first_out.data),
+                             static_cast<__nv_bfloat16*>(second_out.data), nullptr, first.n,
+                             second.n, leading(first_out), leading(second_out), 0},
+                            stream);
+        return true;
+    }
+    w8_tc_launch_chunks(x, first,
+                        {static_cast<__nv_bfloat16*>(first_out.data), nullptr, nullptr, first.n,
+                         0, leading(first_out), 0, 0},
+                        stream);
+    w8_tc_launch_chunks(x, second,
+                        {static_cast<__nv_bfloat16*>(second_out.data), nullptr, nullptr,
+                         second.n, 0, leading(second_out), 0, 0},
+                        stream);
+    return true;
 }
 
 #endif // NINFER_VOLTA_BUILD

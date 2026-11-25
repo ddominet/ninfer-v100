@@ -1,3 +1,4 @@
+#include "ops/linear/w8/w8_launch.h"
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
@@ -271,6 +272,16 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_matrix(q, kQRows, cols, "q");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
+#ifdef NINFER_VOLTA_BUILD
+    // The DFlash2 draft's prepacked q|k|v is read only by the tensor-core route.
+    if (query_key_value_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        if (query_key_value_weight.n != kRows || query_key_value_weight.k != hidden ||
+            !detail::launch_w8_volta_tc_split3(x, query_key_value_weight, q, k, v, stream)) {
+            throw std::invalid_argument("attn_input_proj: invalid prepacked query/key/value weight");
+        }
+        return;
+    }
+#endif
     require_w8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
 
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);

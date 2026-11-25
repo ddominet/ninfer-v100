@@ -155,8 +155,13 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
+    // A prepacked W8 weight is stored in 32-row tiles whose codes and scales start at the same
+    // byte offsets as the row-major rows, so 32-aligned row views stay valid.
+    const bool prepacked_w8 = block.layout == QuantLayout::VoltaQpnPrepacked &&
+                              block.qtype == QType::W8G32_F16S && row_begin % 32 == 0 &&
+                              row_count % 32 == 0;
     if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
-        block.layout != QuantLayout::RowSplit) {
+        (block.layout != QuantLayout::RowSplit && !prepacked_w8)) {
         throw std::logic_error("invalid target row view");
     }
     const std::uint64_t groups    = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
@@ -715,6 +720,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, layer_source.attention_conv.kernel_projection, 1280, 5120);
             target.query_key_value =
                 materialized_weight(backing, layer_source.query_key_value, 6144, 5120);
+#ifdef NINFER_VOLTA_BUILD
+            // q|k|v and its context key/value views take the tensor-core route at every width
+            // (draft block, per-round context append, prefill append in 64-token launches):
+            // the row-major routes ran 236 us for the 32-column block and 89 us for the pair at
+            // 9..16 columns (a SIMT fallback).
+            ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.query_key_value);
+#endif
             target.context_key   = row_view(target.query_key_value, 4096, 1024);
             target.context_value = row_view(target.query_key_value, 5120, 1024);
             target.query_norm    = artifact::materialized_tensor(backing, layer_source.query_norm,
@@ -733,8 +745,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.down    = materialized_weight(backing, layer_source.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
             // The draft block's output, gate|up and down projections only ever run on the masked
-            // block (at most 64 columns), so they take the coalesced QPN layout. q|k|v stays
-            // row-major: its key and value rows are also the context K/V views read at prefill.
+            // block (at most 64 columns), so they take the coalesced QPN layout.
             ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.attention_output);
             ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.gate_up);
             ::ninfer::ops::detail::w8_prepack_qpn_sm70(target.down);

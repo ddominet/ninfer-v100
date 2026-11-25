@@ -1,3 +1,4 @@
+#include "ops/linear/w8/w8_launch.h"
 #include "ninfer/ops/linear_pair.h"
 
 #include "ops/linear_pair/w8/w8_pair_plan.h"
@@ -40,7 +41,11 @@ std::uint64_t required_payload_bytes(std::int32_t rows, std::int32_t k) {
 
 void require_weight(const Weight& weight, std::int32_t k, const char* label) {
     const std::uint64_t payload_bytes = required_payload_bytes(1024, k);
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+    bool layout_ok = weight.layout == QuantLayout::RowSplit;
+#ifdef NINFER_VOLTA_BUILD
+    layout_ok = layout_ok || weight.layout == QuantLayout::VoltaQpnPrepacked;
+#endif
+    if (weight.qtype != QType::W8G32_F16S || !layout_ok ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
         weight.ndim != 2 || weight.n != 1024 || weight.k != k || weight.shape[0] != 1024 ||
         weight.shape[1] != k || weight.padded_shape[0] != 1024 || weight.padded_shape[1] != k ||
@@ -101,6 +106,18 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_weight(second_weight, x.ne[0], "second weight");
     require_nonoverlap(x, first_weight, second_weight, first_out, second_out);
 
+#ifdef NINFER_VOLTA_BUILD
+    // Prepacked weights (the DFlash2 context key/value views) are read only by the tensor-core
+    // route, at any token count.
+    if (first_weight.layout == QuantLayout::VoltaQpnPrepacked ||
+        second_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        if (!detail::launch_w8_volta_tc_pair(x, first_weight, second_weight, first_out,
+                                             second_out, stream)) {
+            throw std::invalid_argument("linear_pair: prepacked weights need matching layouts");
+        }
+        return;
+    }
+#endif
     detail::w8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
 }
 

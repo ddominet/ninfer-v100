@@ -32,6 +32,7 @@
 //     repacking, exactly as in Q4.
 
 #include "ops/common/volta_mma.cuh"
+#include "ops/linear/volta_tc_skinny.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
 
@@ -55,6 +56,53 @@ struct W8VoltaQpnSchedule {
 // SwiGluUp are the DFlash2 draft's fused MLP epilogues; Split3 scatters a [6144] q|k|v parent into
 // q [4096], k [1024] and v [1024] planes (out, out1, out2), each token-major. 4096 and 5120 are
 // multiples of the 32-row CTA tile, so a CTA never straddles two planes.
+// Prepacked W8 (w8_prepack_sm70.cu: codes [N/32 tile][K/128 block][8 slices][lane] x 16 bytes,
+// scales [tile][block][lane] x 4 FP16) for the tensor-core route (volta_tc_skinny.cuh): one item
+// is one lane's 16-byte slice of a 64-K chunk, decoded as code * group scale like the quadpair
+// kernel. Mandatory: the DFlash2 draft's q|k|v weight is prepacked and read by nothing else.
+struct W8VoltaTcDecoder {
+    const uint4* codes;
+    const __half* scales;
+    int blocks; // K / 128
+
+    static constexpr int kItemsPerTileChunk = 128;
+    static constexpr int kMinTokens         = 1;
+    static constexpr bool kMandatory        = true;
+    struct Raw {
+        uint4 q;
+        __half s;
+    };
+
+    __device__ __forceinline__ Raw load(int tile, int chunk, int item) const {
+        const std::int64_t block = static_cast<std::int64_t>(tile) * blocks + (chunk >> 1);
+        const int slice          = item >> 5;
+        const int lane           = item & 31;
+        return {__ldg(codes + (block * 8 + (chunk & 1) * 4 + slice) * 32 + lane),
+                scales[(block * 32 + lane) * 4 + (chunk & 1) * 2 + (slice >> 1)]};
+    }
+    __device__ __forceinline__ void store(const Raw& raw, int item, half* tile, int lds) const {
+        // code + 1152 is exact in FP16 (1024 + 128 bias from the byte permute), so the subtract
+        // is exact and the only rounding is the scale multiply.
+        const half2 bias  = __half2half2(__ushort_as_half(0x6480));
+        const half2 scale = __half2half2(raw.s);
+        const unsigned words[4] = {raw.q.x ^ 0x80808080u, raw.q.y ^ 0x80808080u,
+                                   raw.q.z ^ 0x80808080u, raw.q.w ^ 0x80808080u};
+        half2 values[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned lo = __byte_perm(words[i], 0x64646464u, 0x4140);
+            const unsigned hi = __byte_perm(words[i], 0x64646464u, 0x4342);
+            values[2 * i]     = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&lo), bias), scale);
+            values[2 * i + 1] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&hi), bias), scale);
+        }
+        auto* destination =
+            reinterpret_cast<uint4*>(tile + volta_tc_lane_row(item & 31) * lds + (item >> 5) * 16);
+        destination[0] = reinterpret_cast<const uint4*>(values)[0];
+        destination[1] = reinterpret_cast<const uint4*>(values)[1];
+    }
+    __device__ __forceinline__ float finish(int, float value) const { return value; }
+};
+
 enum class W8QpnEpilogue { Store, DynamicConvAdd, SwiGluUp, Split3 };
 
 // `kTiles` is the number of 8-row A tiles (T <= 8 * kTiles); `kBlk` is how many W8 groups a lane
