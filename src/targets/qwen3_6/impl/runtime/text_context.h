@@ -138,6 +138,7 @@ struct VerifyCompaction {
     const Tensor* attention_slots  = nullptr;
     const Tensor* attention_live   = nullptr;
     const Tensor* attention_source = nullptr;
+    bool skip_logits_expand        = false;
 };
 
 struct PrefillChunkResult {

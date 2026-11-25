@@ -800,7 +800,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
-      context_source_ready_(device_in), context_completion_(device_in),
+      context_source_ready_(device_in), context_completion_(device_in), gdn_fold_done_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
@@ -894,6 +894,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
+        const char* async_fold_env = std::getenv("NINFER_ASYNC_GDN_FOLD");
+        if (speculative_backend == SpeculativeBackend::DFlash2 && !use_cuda_graph &&
+            !(async_fold_env != nullptr && async_fold_env[0] == '0')) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&gdn_fold_stream_, cudaStreamNonBlocking));
+            async_gdn_fold_ = true;
+        }
     }
     if (plan.persistent.mtp_lookup_replay_records) {
         mtp_lookup_replay_records.emplace(backing, *plan.persistent.mtp_lookup_replay_records);
@@ -913,6 +919,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const char* keep_all = std::getenv("NINFER_DFLASH_KEEP_ALL");
         dflash_verify_budget = is_masked_draft_backend(speculative_backend) && !use_cuda_graph &&
                                !(keep_all != nullptr && keep_all[0] == '1');
+        const char* post_conf = std::getenv("NINFER_DFLASH_POST_CONF");
+        dflash_post_conf      = dflash_verify_budget &&
+                           speculative_backend == SpeculativeBackend::DFlash2 &&
+                           (post_conf != nullptr && post_conf[0] == '1');
+        dflash_conf_hits_.fill(0.0F);
+        dflash_conf_tries_.fill(0.0F);
         for (std::uint32_t j = 0; j < dflash_global_accept.size(); ++j) {
             dflash_global_accept[j] = dflash_conditional_prior(j);
         }
@@ -920,11 +932,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         dflash_trace         = trace != nullptr && trace[0] == '1';
         const char* force    = std::getenv("NINFER_DFLASH_FORCE_KEEP");
         dflash_force_keep    = force != nullptr ? std::atoi(force) : -1;
-        // Prior: the profiled V100 costs (34 ms flat to 8 target columns, then about 1 ms a
-        // column; 1.24 ms per head chunk), refined online from the rounds this engine runs.
-        // Draft-block columns: about 0.45 ms per 8 (the W8 draft layers at several requests).
-        // Context: one request's round grows about 18 ms per 100K tokens (59 vs 82 tok/s at 90K).
-        dflash_cost.reset({36.0, 1.2, 6.0, 1.24, 18.0, 0.45}, {25.0, 1.0, 9.0, 0.5, 25.0, 0.25});
+        // Prior: profiled V100 costs (36 ms flat to 8 target columns, ~5.5 ms/tile, ~1.24 ms per
+        // head chunk, 12 ms/100K fixed context, 0.45 ms/8 draft-block cols, 8 ms/100K width-scaled
+        // context attention), refined online from the rounds this engine runs.
+        dflash_cost.reset({36.0, 1.2, 5.5, 1.24, 12.0, 0.45, 8.0},
+                          {25.0, 1.0, 9.0, 0.5, 25.0, 0.25, 16.0});
     }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
@@ -1073,12 +1085,26 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    if (gdn_fold_stream_ != nullptr) {
+        (void)cudaStreamSynchronize(gdn_fold_stream_);
+        (void)cudaStreamDestroy(gdn_fold_stream_);
+        gdn_fold_stream_ = nullptr;
+    }
+    gdn_fold_pending_ = false;
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
+void ProgramImplCore::sync_gdn_fold_host() noexcept {
+    if (gdn_fold_pending_ && gdn_fold_stream_ != nullptr) {
+        (void)cudaStreamSynchronize(gdn_fold_stream_);
+    }
+    gdn_fold_pending_ = false;
+}
+
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                                                  std::uint32_t first_target) {
+    sync_gdn_fold_host();
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -5195,6 +5221,7 @@ void ProgramImplCore::prepare_prefix_forks(MaterializationTransaction& transacti
 }
 
 void ProgramImplCore::enqueue_materialization_transfers(MaterializationTransaction& transaction) {
+    sync_gdn_fold_host();
     if (!transaction.prepared || transaction.transfer_submitted) {
         throw std::logic_error("materialization transfer batch is not enqueueable");
     }
@@ -5926,6 +5953,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
 
 MaterializationResult
 ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagView cancellation) {
+    sync_gdn_fold_host();
     MaterializationResult out;
     MaterializationTransaction* transaction_ptr =
         std::get_if<MaterializationTransaction>(&context_transaction_);
@@ -7589,11 +7617,20 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     if (replaced_shared.device.state_slots > state_store->device_occupied()) {
         throw std::logic_error("shared capture replacement exceeds Device State occupancy");
     }
+    // When a host state pool is configured, reserve one device state slot per idle concurrency
+    // lane so active-request checkpoint captures (e.g. turn-closure rewrite checkpoints with
+    // --device-state-slots 0) spill to HostSnapshot instead of starving concurrent admissions.
+    std::uint32_t idle_active_lanes = 0;
+    if (host_state_images != nullptr) {
+        for (std::uint32_t active_lane = 0; active_lane < max_concurrency; ++active_lane) {
+            if (requests[active_lane].lifecycle == Lifecycle::Empty) { ++idle_active_lanes; }
+        }
+    }
     const std::uint32_t device_state_after_preparation =
         state_store->device_occupied() - replaced_shared.device.state_slots;
     const bool device_destination_available =
         assessment.recycles_private_state ||
-        device_state_after_preparation < state_store->device_capacity();
+        device_state_after_preparation + idle_active_lanes < state_store->device_capacity();
     if (device_destination_available || host_state_images == nullptr) {
         assessment.state_placement = qwen3_6::CaptureStatePlacement::DeviceFork;
         added.device.state_slots   = 1;
@@ -8192,6 +8229,7 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
 }
 
 void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction) {
+    sync_gdn_fold_host();
     if (!transaction.prepared || !transaction.transfer_enqueue_pending ||
         transaction.transfer_submitted) {
         throw std::logic_error("active capture transfer batch is not enqueueable");
@@ -8474,6 +8512,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
 
 ActiveCaptureResult
 ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagView cancellation) {
+    sync_gdn_fold_host();
     ActiveCaptureTransaction* transaction_ptr =
         std::get_if<ActiveCaptureTransaction>(&context_transaction_);
     if (transaction_ptr == nullptr) {
@@ -8898,6 +8937,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
     std::span<const SequenceHandle> members, std::span<const TokenId> row_major_tokens,
     std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
     runtime::ExecutionTiming* failed_timing) {
+    sync_gdn_fold_host();
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         row_stride == 0 || prefix_execution_splits.size() != members.size() ||
@@ -9231,6 +9271,7 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
 }
 
 DiscardResult ProgramImplCore::abort_pending(PendingBatch&& pending) noexcept {
+    sync_gdn_fold_host();
     DiscardResult out;
     const auto rows  = ContractAccess::rows(pending);
     const bool valid = valid_pending(pending);
@@ -9254,6 +9295,7 @@ DiscardResult ProgramImplCore::abort_pending(PendingBatch&& pending) noexcept {
 }
 
 FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
+    sync_gdn_fold_host();
     FinishResult out;
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
         return out;
@@ -9337,6 +9379,7 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
 }
 
 AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
+    sync_gdn_fold_host();
     AbortResult out;
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
         return out;
@@ -9357,6 +9400,7 @@ AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
 }
 
 ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continuation) noexcept {
+    sync_gdn_fold_host();
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(continuation);
     const std::uint64_t generation = ContractAccess::epoch(continuation);
@@ -9417,6 +9461,7 @@ ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
 }
 
 ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle) noexcept {
+    sync_gdn_fold_host();
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(handle);
     const std::uint64_t generation = ContractAccess::epoch(handle);
@@ -9439,6 +9484,7 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
 }
 
 void ProgramImplCore::fail_all_cleanup() noexcept {
+    sync_gdn_fold_host();
     pending_transaction_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
@@ -9560,6 +9606,7 @@ qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept 
 
 void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                      MaterializationTransaction& transaction) {
+    sync_gdn_fold_host();
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     RequestControl& request = requests[lane];
     if (!transaction.plan || transaction.plan->impl_ == nullptr || !transaction.prepared ||
@@ -10185,10 +10232,28 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     }
 
     const auto tail_started = Clock::now();
+    bool any_terminal       = false;
+    bool any_cancelled      = false;
+    bool any_fork_pending   = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        any_terminal     = any_terminal || (terminal[row] != 0);
+        any_cancelled    = any_cancelled || (cancelled[row] != 0);
+        any_fork_pending = any_fork_pending || active_sequence(lanes[row]).state.fork_pending;
+    }
+    const bool run_async_fold = async_gdn_fold_ &&
+                                speculative_backend == SpeculativeBackend::DFlash2 &&
+                                !use_cuda_graph && !needs_hidden_correction && !any_terminal &&
+                                !any_cancelled && !any_fork_pending && gdn_fold_stream_ != nullptr;
     try {
+        sync_gdn_fold_host();
         timing.resume_submit();
         active_replay_fold.execute(
-            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()), device.stream);
+            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+            run_async_fold ? gdn_fold_stream_ : device.stream);
+        if (run_async_fold) {
+            gdn_fold_done_.record(gdn_fold_stream_);
+            gdn_fold_pending_ = true;
+        }
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -10261,11 +10326,14 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             }
         }
 
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
-        work.reset();
+        if (!run_async_fold) {
+            timing.begin_wait();
+            device.synchronize();
+            timing.end_wait();
+            work.reset();
+        }
     } catch (...) {
+        sync_gdn_fold_host();
         try {
             device.synchronize();
         } catch (...) {}
@@ -10994,6 +11062,7 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
+    sync_gdn_fold_host();
     if (!state_store->valid(sequence.state.write)) {
         throw std::logic_error("pre-reset StateImage reservation is missing");
     } else {
@@ -11548,6 +11617,7 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 runtime::PrefillStepResult
 ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
                                  runtime::ExecutionTiming* failed_timing) {
+    sync_gdn_fold_host();
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
@@ -11670,6 +11740,32 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     split_frontier = *rewrite_split;
                 }
                 schedule::PrefillChunkResult result;
+                // DFlash2 has only a cyclic local_capacity sliding window (no full-attention draft
+                // layers). Any prefill tokens strictly earlier than local_capacity before the next
+                // capture frontier or prompt end will be 100% overwritten before being read, so
+                // skip feature capture and dflash_append_context on those chunks (and slice only
+                // the surviving tail on the straddling chunk).
+                schedule_state.capture_dflash_context = true;
+                schedule_state.dflash_keep_from       = 0;
+                if (is_masked_draft_backend(speculative_backend)) {
+                    if constexpr (Variant::supports_dflash &&
+                                  Variant::DFlashConfig::coherent_selector &&
+                                  Variant::DFlashConfig::local_layers ==
+                                      Variant::DFlashConfig::layers &&
+                                  Variant::DFlashConfig::local_capacity > 0) {
+                        const std::uint32_t next_needed =
+                            capture_frontier ? std::min(*capture_frontier, staged.prompt_tokens)
+                                             : staged.prompt_tokens;
+                        const auto local_cap =
+                            static_cast<std::uint32_t>(Variant::DFlashConfig::local_capacity);
+                        const std::uint32_t keep_from =
+                            next_needed > local_cap ? next_needed - local_cap : 0U;
+                        schedule_state.dflash_keep_from = keep_from;
+                        if (staged.cursor + remaining <= keep_from) {
+                            schedule_state.capture_dflash_context = false;
+                        }
+                    }
+                }
                 timing.pause();
                 if (staged.vision) {
                     if (!workspace_plan.vision) {
@@ -11844,6 +11940,7 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets,
                                        runtime::ExecutionTiming* failed_timing) {
+    sync_gdn_fold_host();
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -11977,6 +12074,7 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets,
                                   runtime::ExecutionTiming* failed_timing) {
+    sync_gdn_fold_host();
     nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -12272,6 +12370,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // draft by its acceptance estimate (each request's drafts stay a prefix), then pick the count
     // with the best expected tokens / modelled round time. One request fits one target tile, so
     // it keeps its whole block; a full batch drops the drafts least likely to be accepted.
+    std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency> cond_accept{};
+    double mean_context     = 0.0;
+    std::uint32_t limit_max = 0;
     if (dflash_verify_budget) {
         std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency>
             joint_accept{};
@@ -12287,6 +12388,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             for (std::uint32_t j = 0; j < joint_accept[row].size(); ++j) {
                 const float rate = (request.dflash_hits[j] + kDFlashAcceptPrior * dflash_global_accept[j]) /
                                    (request.dflash_tries[j] + kDFlashAcceptPrior);
+                cond_accept[row][j]  = rate;
                 joint *= rate;
                 joint_accept[row][j] = joint;
             }
@@ -12296,8 +12398,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         for (const std::uint32_t lane : lanes) {
             context_sum += static_cast<double>(active_sequence(lane).execution_frontier);
         }
-        const double mean_context = context_sum / static_cast<double>(lanes.size());
-        std::uint32_t limit_max   = 0;
+        mean_context = context_sum / static_cast<double>(lanes.size());
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             limit_max = std::max(limit_max, draft_limit[row]);
         }
@@ -12347,51 +12448,73 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
             return std::pair<double, std::size_t>{best, apply ? count : chosen};
         };
-        double best_rate       = -1.0;
-        std::uint32_t best_cap = 0;
-        std::size_t best_count = 0;
-        for (std::uint32_t cap = 1; cap <= limit_max; ++cap) {
-            const auto [rate, count] = greedy(cap, 0, false);
-            if (rate > best_rate) {
-                best_rate  = rate;
-                best_cap   = cap;
-                best_count = count;
+        if (lanes.size() == 1 && dflash_force_keep < 0) {
+            // Single request (1..8 target columns) always fits inside one 8-column target tile;
+            // keep its entire draft block so multi-stream cost fits never truncate B=1 runs.
+            keep[0]              = draft_limit[0];
+            dflash_round_kept    = keep[0];
+            dflash_round_context = mean_context;
+            dflash_round_widest  = keep[0];
+        } else {
+            double best_rate       = -1.0;
+            std::uint32_t best_cap = 0;
+            std::size_t best_count = 0;
+            for (std::uint32_t cap = 1; cap <= limit_max; ++cap) {
+                const auto [rate, count] = greedy(cap, 0, false);
+                if (rate > best_rate) {
+                    best_rate  = rate;
+                    best_cap   = cap;
+                    best_count = count;
+                }
             }
-        }
-        // Every sixteenth round verifies one draft deeper than the model wants (up to a draft more
-        // per request), so the column and width slopes keep being observed when the model prefers
-        // short rounds.
-        if (dflash_cost.rounds % 16 == 15 && best_cap < limit_max) {
-            best_cap += 1;
-            best_count += lanes.size();
-        }
-        if (dflash_force_keep >= 0) {
-            // Experiment: every request keeps the same number of drafts (cost-curve sweeps).
-            best_count = 0;
+            // Explore deeper keeps frequently during warmup, then taper to <0.8% of rounds so
+            // converged steady-state traffic does not pay a permanent 6.25% exploration tax.
+            const bool explore =
+                (dflash_cost.rounds < 128 && (dflash_cost.rounds % 16) == 15) ||
+                (dflash_cost.rounds >= 128 && (dflash_cost.rounds % 128) == 127);
+            if (explore && best_cap < limit_max) {
+                best_cap += 1;
+                best_count += lanes.size();
+            }
+            if (dflash_force_keep >= 0) {
+                // Experiment: every request keeps the same number of drafts (cost-curve sweeps).
+                best_count = 0;
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    keep[row] = std::min<std::uint32_t>(
+                        draft_limit[row], static_cast<std::uint32_t>(dflash_force_keep));
+                    best_count += keep[row];
+                }
+            }
+            if (dflash_force_keep < 0) { best_count = greedy(best_cap, best_count, true).second; }
+            dflash_round_kept    = best_count;
+            dflash_round_context = mean_context;
+            dflash_round_widest  = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                keep[row] = std::min<std::uint32_t>(draft_limit[row],
-                                                    static_cast<std::uint32_t>(dflash_force_keep));
-                best_count += keep[row];
+                dflash_round_widest = std::max<std::size_t>(dflash_round_widest, keep[row]);
             }
-        }
-        if (dflash_force_keep < 0) { best_count = greedy(best_cap, best_count, true).second; }
-        dflash_round_kept    = best_count;
-        dflash_round_context = mean_context;
-        dflash_round_widest  = 1;
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            dflash_round_widest = std::max<std::size_t>(dflash_round_widest, keep[row]);
         }
     }
 
-    // Draft only as wide a block as any request keeps (plus its anchor); one request keeps its
-    // whole block, so this narrows only under load.
+    // Draft only as wide a block as any request keeps (plus its anchor); when every request
+    // keeps 0 drafts, draft_k = 0 bypasses the 5-layer draft, proposal head, and selector.
     std::uint32_t draft_k = draft_window;
     if (dflash_verify_budget) {
-        std::uint32_t widest_keep = 1;
+        std::uint32_t widest_keep = 0;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             widest_keep = std::max(widest_keep, keep[row]);
         }
         draft_k = std::min(draft_window, widest_keep);
+    }
+    const bool use_post_conf = dflash_post_conf && lanes.size() >= 2 && dflash_force_keep < 0 &&
+                               !use_cuda_graph && draft_k > 0 && limit_max > 0;
+    if (use_post_conf) {
+        // Widen draft_k by up to +1 within a single 32-column Volta Q4 proposal-head pass so
+        // high-confidence requests can claim extra drafts while low-confidence requests yield
+        // their columns before target verification.
+        const std::uint32_t single_pass_cap =
+            std::max<std::uint32_t>(1U, 32U / static_cast<std::uint32_t>(lanes.size()));
+        const std::uint32_t boosted = std::max(draft_k, std::min(draft_k + 1U, single_pass_cap));
+        draft_k                     = std::min({draft_window, limit_max, boosted});
     }
     const auto started = Clock::now();
     try {
@@ -12428,14 +12551,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            SequenceState& sequence           = active_sequence(lanes[row]);
-            const RequestControl& request     = requests[lanes[row]];
-            const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1U
-                                                    : 0U;
-            const std::uint32_t extent = keep[row];
-            (void)max_by_budget;
+            SequenceState& sequence       = active_sequence(lanes[row]);
+            const RequestControl& request = requests[lanes[row]];
+            const std::uint32_t frontier  = sequence.execution_frontier;
+            const std::uint32_t max_extent =
+                use_post_conf ? std::min(draft_k, draft_limit[row]) : keep[row];
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -12443,13 +12563,6 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
             dflash_host_ingress->proposal_valid_columns[row] =
                 static_cast<std::int32_t>(draft_k + 1U);
-            dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
-            dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
-            for (std::uint32_t column = 0; column < width; ++column) {
-                const std::uint32_t position = frontier + std::min(column, extent);
-                dflash_host_ingress->target_rope_positions[row * width + column] =
-                    checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
-            }
             dflash_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
             dflash_host_ingress->dflash_kv_table_rows[row] =
@@ -12459,14 +12572,26 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
+            ensure_sequence_kv_mapped(sequence, frontier + max_extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
-        // Kept columns: request row's columns 0..extent, in padded order j + width * row.
-        dflash_host_ingress->verify_live = 0;
-        {
-            std::int32_t live = 0;
+        const auto pack_verify_ingress = [&]() {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& sequence = active_sequence(lanes[row]);
+                const std::uint32_t frontier  = sequence.execution_frontier;
+                const std::uint32_t extent    = keep[row];
+                dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
+                dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+                for (std::uint32_t column = 0; column < width; ++column) {
+                    const std::uint32_t position = frontier + std::min(column, extent);
+                    dflash_host_ingress->target_rope_positions[row * width + column] =
+                        checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
+                }
+            }
+            // Kept columns: request row's columns 0..extent, in padded order j + width * row.
+            dflash_host_ingress->verify_live = 0;
+            std::int32_t live                = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 for (std::uint32_t column = 0; column < width; ++column) {
                     const auto padded = static_cast<std::int32_t>(column + width * row);
@@ -12482,8 +12607,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 }
             }
             dflash_host_ingress->attention_width = 0;
-            if (dflash_verify_budget &&
-                live < static_cast<std::int32_t>(width * lanes.size())) {
+            if (dflash_verify_budget && live < static_cast<std::int32_t>(width * lanes.size())) {
                 dflash_host_ingress->verify_live = live;
                 // Attention core at the widest kept extent + 1 instead of the verify width.
                 std::uint32_t narrow = 1;
@@ -12509,6 +12633,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     dflash_host_ingress->attention_width = static_cast<std::int32_t>(narrow);
                 }
             }
+        };
+
+        pack_verify_ingress();
+        {
             // Narrow draft block and its expansion back to the K-wide draft layout.
             dflash_host_ingress->draft_width = 0;
             if (draft_k < draft_window) {
@@ -12523,43 +12651,64 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             // Proposal head positions i + k'*b (k' = this round's draft block) for the kept
             // drafts, padded with dropped positions to a count the fused head route takes.
             dflash_host_ingress->proposal_live = 0;
-            const auto positions = static_cast<std::int32_t>(draft_k * lanes.size());
-            std::int32_t kept_positions = 0;
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                kept_positions += static_cast<std::int32_t>(keep[row]);
-            }
-            const auto head_ok = [](std::int32_t n) {
-                return n >= 5 && n / ((n + 7) / 8) >= 5;
-            };
-            std::int32_t target = kept_positions;
-            while (target < positions && !head_ok(target)) { ++target; }
-            if (dflash_verify_budget && target < positions && head_ok(target)) {
-                std::array<bool, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> chosen{};
+            if (!use_post_conf) {
+                const auto positions        = static_cast<std::int32_t>(draft_k * lanes.size());
+                std::int32_t kept_positions = 0;
                 for (std::size_t row = 0; row < lanes.size(); ++row) {
-                    for (std::uint32_t i = 0; i < keep[row]; ++i) {
-                        chosen[i + draft_k * row] = true;
-                    }
+                    kept_positions += static_cast<std::int32_t>(keep[row]);
                 }
-                for (std::int32_t p = 0, extra = target - kept_positions; p < positions && extra > 0;
-                     ++p) {
-                    if (!chosen[static_cast<std::size_t>(p)]) {
-                        chosen[static_cast<std::size_t>(p)] = true;
-                        --extra;
+#ifdef NINFER_VOLTA_BUILD
+                const auto head_ok = [&](std::int32_t n) {
+                    if (proposal_head == ProposalHead::Optimized) { return n >= 1; }
+                    return n >= 5 && n / ((n + 7) / 8) >= 5;
+                };
+#else
+                const auto head_ok = [](std::int32_t n) {
+                    return n >= 5 && n / ((n + 7) / 8) >= 5;
+                };
+#endif
+                std::int32_t target = kept_positions;
+                while (target < positions && !head_ok(target)) { ++target; }
+                if (dflash_verify_budget && target < positions && head_ok(target)) {
+                    std::array<bool, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> chosen{};
+                    for (std::size_t row = 0; row < lanes.size(); ++row) {
+                        for (std::uint32_t i = 0; i < keep[row]; ++i) {
+                            chosen[i + draft_k * row] = true;
+                        }
                     }
-                }
-                std::int32_t n = 0;
-                for (std::int32_t p = 0; p < positions; ++p) {
-                    if (chosen[static_cast<std::size_t>(p)]) {
-                        dflash_host_ingress->proposal_live_columns[static_cast<std::size_t>(n)] = p;
-                        dflash_host_ingress->proposal_slots[static_cast<std::size_t>(p)] = n++;
-                    } else {
-                        dflash_host_ingress->proposal_slots[static_cast<std::size_t>(p)] = -1;
+                    for (std::int32_t p = 0, extra = target - kept_positions;
+                         p < positions && extra > 0; ++p) {
+                        if (!chosen[static_cast<std::size_t>(p)]) {
+                            chosen[static_cast<std::size_t>(p)] = true;
+                            --extra;
+                        }
                     }
+                    std::int32_t n = 0;
+                    for (std::int32_t p = 0; p < positions; ++p) {
+                        if (chosen[static_cast<std::size_t>(p)]) {
+                            dflash_host_ingress->proposal_live_columns[static_cast<std::size_t>(n)] =
+                                p;
+                            dflash_host_ingress->proposal_slots[static_cast<std::size_t>(p)] = n++;
+                        } else {
+                            dflash_host_ingress->proposal_slots[static_cast<std::size_t>(p)] = -1;
+                        }
+                    }
+                    dflash_host_ingress->proposal_live = n;
                 }
-                dflash_host_ingress->proposal_live = n;
             }
         }
 
+        bool all_raw_greedy = !use_cuda_graph && speculative_backend == SpeculativeBackend::DFlash2;
+        if (all_raw_greedy) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const ops::SamplingConfig& cfg = dflash_host_ingress->sampling[row];
+                if (cfg.temperature > 0.0f || cfg.presence_penalty != 0.0f ||
+                    cfg.frequency_penalty != 0.0f) {
+                    all_raw_greedy = false;
+                    break;
+                }
+            }
+        }
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
@@ -12569,11 +12718,137 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *io.dflash_decode,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
-                                                    state_images->continuation_hidden_store()};
+                                                    state_images->continuation_hidden_store(),
+                                                    gdn_fold_pending_ ? &gdn_fold_done_ : nullptr,
+                                                    all_raw_greedy};
 
         mark_workspace_usage(workspace_plan.dflash_round);
-        schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, envelopes, target_envelope, executable);
+        if (use_post_conf) {
+            schedule::dflash_propose_stage(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                           draft_window, envelopes, true);
+            // Synchronize only the compute stream so async GDN replay fold keeps running.
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+
+            // Empirical-Bayes log-odds post-draft acceptance probability using selector confidence.
+            constexpr float kConfPriorStrength = 8.0F;
+            constexpr float kConfWeight        = 0.85F;
+            const auto logit                   = [](float p) {
+                const float c = std::clamp(p, 0.02F, 0.98F);
+                return std::log(c / (1.0F - c));
+            };
+            const auto sigmoid = [](float x) { return 1.0F / (1.0F + std::exp(-x)); };
+            float total_hits   = 0.0F;
+            float total_tries  = 0.0F;
+            std::array<float, 8> bin_rate{};
+            for (int b = 0; b < 8; ++b) {
+                const float prior_b = 0.20F + 0.75F * ((static_cast<float>(b) + 0.5F) / 8.0F);
+                bin_rate[static_cast<std::size_t>(b)] =
+                    (dflash_conf_hits_[static_cast<std::size_t>(b)] +
+                     kConfPriorStrength * prior_b) /
+                    (dflash_conf_tries_[static_cast<std::size_t>(b)] + kConfPriorStrength);
+                total_hits += dflash_conf_hits_[static_cast<std::size_t>(b)];
+                total_tries += dflash_conf_tries_[static_cast<std::size_t>(b)];
+            }
+            const float g_rate =
+                (total_hits + kConfPriorStrength * 0.575F) / (total_tries + kConfPriorStrength);
+            const float g_logit = logit(g_rate);
+
+            std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency>
+                post_joint{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::uint32_t row_cap = std::min(draft_k, draft_limit[row]);
+                float joint                 = 1.0F;
+                for (std::uint32_t j = 0; j < row_cap; ++j) {
+                    const float raw_conf =
+                        dflash_host_egress->draft_confidence[j + draft_k * row];
+                    const float c = std::isfinite(raw_conf) ? std::clamp(raw_conf, 0.0F, 0.9999F)
+                                                            : 0.5F;
+                    const int bin = std::clamp(static_cast<int>(c * 8.0F), 0, 7);
+                    const float p_cond =
+                        sigmoid(logit(cond_accept[row][j]) +
+                                kConfWeight *
+                                    (logit(bin_rate[static_cast<std::size_t>(bin)]) - g_logit));
+                    joint *= p_cond;
+                    post_joint[row][j] = joint;
+                }
+            }
+
+            // Greedy prefix allocation over post_joint with Stage 1 (draft_k, head) already sunk.
+            const std::size_t B   = lanes.size();
+            const double ctx_req  = static_cast<double>(B) * mean_context / 1.0e5;
+#ifdef NINFER_VOLTA_BUILD
+            const double sunk_head =
+                std::ceil(static_cast<double>(static_cast<std::size_t>(draft_k) * B) / 32.0);
+#else
+            const double sunk_head =
+                std::ceil(static_cast<double>(
+                              std::max<std::size_t>(static_cast<std::size_t>(draft_k) * B, 5U)) /
+                          8.0);
+#endif
+            const double sunk_draft_w = static_cast<double>((draft_k + 1U) * B) / 8.0;
+            const auto& th            = dflash_cost.theta;
+            const double fixed_ms     = th[0] + th[1] * static_cast<double>(B - 1U) +
+                                    th[3] * sunk_head + th[4] * ctx_req + th[5] * sunk_draft_w;
+            const auto post_predict = [&](std::size_t count, std::size_t target_widest) {
+                const std::size_t cols = B + count;
+                const double tiles     = cols <= 8    ? 0.0
+                                         : cols <= 16 ? 1.0
+                                         : cols <= 24 ? 2.0
+                                         : cols <= 32 ? 3.0
+                                         : cols <= 48 ? 5.0
+                                                      : 7.0;
+                const double ctx_w =
+                    target_widest == 0
+                        ? 0.0
+                        : ctx_req * (static_cast<double>(target_widest) / 7.0);
+                return fixed_ms + th[2] * tiles + th[6] * ctx_w;
+            };
+
+            std::array<float, kMaximumConcurrency> next_draft{};
+            std::array<std::uint32_t, kMaximumConcurrency> taken{};
+            std::array<std::uint32_t, kMaximumConcurrency> best_keep{};
+            for (std::size_t row = 0; row < B; ++row) {
+                next_draft[row] =
+                    std::min(draft_k, draft_limit[row]) > 0 ? post_joint[row][0] : -1.0F;
+            }
+            double tokens          = static_cast<double>(B);
+            double best_rate       = tokens / post_predict(0, 0);
+            std::size_t count      = 0;
+            std::size_t best_count = 0;
+            std::size_t t_widest   = 0;
+            for (;;) {
+                std::size_t pick = B;
+                for (std::size_t row = 0; row < B; ++row) {
+                    if (next_draft[row] >= 0.0F &&
+                        (pick == B || next_draft[row] > next_draft[pick])) {
+                        pick = row;
+                    }
+                }
+                if (pick == B) { break; }
+                tokens += next_draft[pick];
+                ++count;
+                const std::uint32_t kept = ++taken[pick];
+                t_widest                 = std::max<std::size_t>(t_widest, kept);
+                const double rate        = tokens / post_predict(count, t_widest);
+                if (rate > best_rate) {
+                    best_rate  = rate;
+                    best_count = count;
+                    best_keep  = taken;
+                }
+                next_draft[pick] = kept < std::min(draft_k, draft_limit[pick])
+                                       ? post_joint[pick][kept]
+                                       : -1.0F;
+            }
+            for (std::size_t row = 0; row < B; ++row) { keep[row] = best_keep[row]; }
+            dflash_round_kept   = best_count;
+            dflash_round_widest = draft_k;
+            pack_verify_ingress();
+            schedule::dflash_verify_stage(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                          draft_window, target_envelope, true);
+        } else {
+            schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                          draft_window, envelopes, target_envelope, executable);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -12581,6 +12856,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        gdn_fold_pending_ = false;
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -12589,10 +12865,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                          dflash_round_context, dflash_round_widest);
             if (dflash_trace) {
                 std::fprintf(stderr,
-                             "dflash-round requests=%zu kept=%zu context=%.0f head=%d ms=%.3f "
-                             "predicted=%.3f accepted=",
-                             lanes.size(), dflash_round_kept, dflash_round_context,
-                             dflash_host_ingress->proposal_live, seconds * 1000.0, predicted);
+                             "dflash-round requests=%zu kept=%zu draft_k=%u context=%.0f head=%d "
+                             "post=%d ms=%.3f predicted=%.3f accepted=",
+                             lanes.size(), dflash_round_kept, draft_k, dflash_round_context,
+                             dflash_host_ingress->proposal_live, use_post_conf ? 1 : 0,
+                             seconds * 1000.0, predicted);
                 for (std::size_t row = 0; row < lanes.size(); ++row) {
                     std::fprintf(stderr, "%d/%d%s", dflash_host_egress->accepted_drafts[row],
                                  dflash_host_ingress->proposal_extents[row],
@@ -12600,12 +12877,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 }
                 if (dflash_cost.rounds % 64 == 0) {
                     const auto& t = dflash_cost.theta;
-                    std::fprintf(stderr, "dflash-theta %.3f %.3f %.3f %.3f %.3f %.3f\n", t[0],
-                                 t[1], t[2], t[3], t[4], t[5]);
+                    std::fprintf(stderr, "dflash-theta %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n", t[0],
+                                 t[1], t[2], t[3], t[4], t[5], t[6]);
                 }
             }
-            // Skip rounds stalled by something else (a host hiccup, a first-use allocation).
-            if (seconds * 1000.0 < 3.0 * predicted) {
+            // Skip rounds stalled by something else (a host hiccup, a first-use allocation) or
+            // post-conf rounds that dropped every draft after running Stage 1.
+            if (!(use_post_conf && dflash_round_kept == 0) && seconds * 1000.0 < 3.0 * predicted) {
                 dflash_cost.update(lanes.size(), dflash_round_kept, dflash_round_context,
                                    dflash_round_widest, seconds * 1000.0);
             }
@@ -12640,6 +12918,17 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     request.dflash_hits[j]  = kDFlashAcceptDecay * request.dflash_hits[j] + hit;
                     request.dflash_tries[j] = kDFlashAcceptDecay * request.dflash_tries[j] + 1.0F;
                     dflash_global_accept[j] += kDFlashGlobalLearning * (hit - dflash_global_accept[j]);
+                    if (use_post_conf && j < draft_k) {
+                        const float raw_conf =
+                            dflash_host_egress->draft_confidence[j + draft_k * row];
+                        if (std::isfinite(raw_conf)) {
+                            const float c = std::clamp(raw_conf, 0.0F, 0.9999F);
+                            const auto bin =
+                                static_cast<std::size_t>(std::clamp(static_cast<int>(c * 8.0F), 0, 7));
+                            dflash_conf_hits_[bin]  = 0.995F * dflash_conf_hits_[bin] + hit;
+                            dflash_conf_tries_[bin] = 0.995F * dflash_conf_tries_[bin] + 1.0F;
+                        }
+                    }
                 }
             }
             if (extent == 0) {
@@ -12675,6 +12964,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         };
     } catch (...) {
         timing.begin_wait();
+        sync_gdn_fold_host();
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));

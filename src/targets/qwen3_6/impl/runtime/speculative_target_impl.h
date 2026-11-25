@@ -29,7 +29,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            TextConfig::token_domain, frame.sampling, {false}, execution.work,
+            TextConfig::token_domain, frame.sampling, {frame.all_raw_greedy}, execution.work,
             execution.device.stream);
     } else {
         ops::speculative_accept_greedy_drafts(

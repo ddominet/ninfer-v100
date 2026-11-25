@@ -101,6 +101,11 @@ struct Variant {
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace,
                                             DeviceExecutionView execution);
+    static bool gdn_norm_control_projection_scatter(const Tensor&, const Tensor&, float,
+                                                    const GdnProjectionWeights&, const Tensor&,
+                                                    Tensor&, Tensor&, Tensor&, cudaStream_t) {
+        return false;
+    }
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, const ::ninfer::ops::SparseMoeHints& hints,
                            WorkspaceArena& workspace, cudaStream_t stream);

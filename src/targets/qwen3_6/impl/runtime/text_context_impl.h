@@ -30,6 +30,9 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/common/dflash2_rmsnorm_rope_volta.h"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -811,9 +814,15 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             // dropped columns of the padded hidden and logits are never read, so they are not
             // zeroed. The 4-byte token row goes separately: in the group it held the
             // vocabulary-wide logits to 4-byte copies (192 us a round, the costliest gather).
-            ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
-                                      {&flat_hidden, &flat_logits, nullptr, nullptr},
-                                      padded_slots, stream, false);
+            if (compaction->skip_logits_expand) {
+                ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
+                                          {&flat_hidden, nullptr, nullptr, nullptr}, padded_slots,
+                                          stream, false);
+            } else {
+                ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
+                                          {&flat_hidden, &flat_logits, nullptr, nullptr},
+                                          padded_slots, stream, false);
+            }
             ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
             active_tap_scratch_ = Tensor{};
         }
@@ -939,14 +948,23 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+#ifdef NINFER_VOLTA_BUILD
+    if (kCfg.head_dim == 256 && kCfg.rotary_dim == 64 && kCfg.rope_theta == 1.0e7F &&
+        rope_for_op.ne[1] == 1) {
+        ops::detail::target_rmsnorm_qk_rope_launch(q, k, *w.q_norm, *w.k_norm, rope_for_op,
+                                                   kCfg.rms_eps, qn, kn, s);
+    } else
+#endif
+    {
+        ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
+        ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -1019,10 +1037,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
-                                         work_, ctx_.execution_view());
 
-    // Kept-column verification: the control projection above ran on the C kept columns; the
+    // Kept-column verification: the control projection runs on the C kept columns; the
     // input projection, convolution and recurrence below read padded per-request blocks, so their
     // inputs are expanded to P = W*B columns and the recurrent output is compacted back.
     const bool compact = active_compaction_ != nullptr && ph == Phase::Verify;
@@ -1030,26 +1046,37 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     // On the record path the input projection also runs on the kept columns (projected_record
     // below); only the in-place snapshot path needs the padded hidden.
     const bool compact_projection = compact && gdn_state_action_ == GdnStateAction::RecordForReplay;
-    const Tensor kept_hidden      = h;
+    bool control_scattered        = false;
     if (compact) {
         if (active_compaction_->live != T) {
             throw std::logic_error("GDN compaction does not match the kept columns");
         }
-        if (!compact_projection) { h = expand_verify_columns(h, kCfg.hidden); }
-        // g and beta are expanded with the projected record below (one launch) on the record
-        // path, here otherwise.
         Tensor g_padded    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
         Tensor beta_padded = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
-        g_kept_    = g.view({kCfg.gdn_v_heads, T});
-        beta_kept_ = beta.view({kCfg.gdn_v_heads, T});
-        if (!compact_projection) {
-            ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
-                                      {&g_padded, &beta_padded, nullptr, nullptr},
-                                      *active_compaction_->padded_slots, s);
+        if (compact_projection && Variant::gdn_norm_control_projection_scatter(
+                                      x, *w.input_norm, kCfg.rms_eps, *w.projection,
+                                      *active_compaction_->live_columns, h, g_padded, beta_padded,
+                                      s)) {
+            control_scattered = true;
+        } else {
+            Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h,
+                                                 g, beta, work_, ctx_.execution_view());
+            g_kept_    = g.view({kCfg.gdn_v_heads, T});
+            beta_kept_ = beta.view({kCfg.gdn_v_heads, T});
+            if (!compact_projection) {
+                ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
+                                          {&g_padded, &beta_padded, nullptr, nullptr},
+                                          *active_compaction_->padded_slots, s);
+            }
         }
+        if (!compact_projection) { h = expand_verify_columns(h, kCfg.hidden); }
         g    = g_padded;
         beta = beta_padded;
+    } else {
+        Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
+                                             beta, work_, ctx_.execution_view());
     }
+    const Tensor kept_hidden = h;
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, P);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, P});
@@ -1098,16 +1125,23 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                     kept_hidden, *w.projection, record_flat, gate_kept_,
                     *active_compaction_->live_columns, s);
                 if (scattered) {
-                    ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
-                                              {&g, &beta, nullptr, nullptr},
-                                              *active_compaction_->padded_slots, s, false);
+                    if (!control_scattered) {
+                        ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
+                                                  {&g, &beta, nullptr, nullptr},
+                                                  *active_compaction_->padded_slots, s, false);
+                    }
                 } else {
                     Tensor qkv_kept = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
                     Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept,
                                                   gate_kept_, ph, work_, s);
-                    ops::gather_columns_group({&qkv_kept, &g_kept_, &beta_kept_, nullptr},
-                                              {&record_flat, &g, &beta, nullptr},
-                                              *active_compaction_->padded_slots, s, false);
+                    if (control_scattered) {
+                        ops::gather_columns(qkv_kept, *active_compaction_->padded_slots,
+                                            record_flat, s);
+                    } else {
+                        ops::gather_columns_group({&qkv_kept, &g_kept_, &beta_kept_, nullptr},
+                                                  {&record_flat, &g, &beta, nullptr},
+                                                  *active_compaction_->padded_slots, s, false);
+                    }
                 }
                 ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
                                                *active_linear_state_source_slots_, query_output,

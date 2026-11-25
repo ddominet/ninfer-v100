@@ -19,13 +19,28 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     }
     return dflash_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
+            const auto chunk_len   = static_cast<std::uint32_t>(features.ne[1]);
+            std::uint32_t offset   = 0;
+            if (state.dflash_keep_from > state.text_kv_base) {
+                offset = state.dflash_keep_from - state.text_kv_base;
+                if (offset >= chunk_len) { return; }
+            }
+            const Tensor kept_features =
+                offset > 0 ? features.slice(1, static_cast<std::int32_t>(offset),
+                                            static_cast<std::int32_t>(chunk_len - offset))
+                           : features;
+            const Tensor kept_positions =
+                offset > 0 ? positions.slice(0, static_cast<std::int32_t>(offset),
+                                             static_cast<std::int32_t>(chunk_len - offset))
+                           : positions;
             auto& frame  = *state.execution.io.dflash_decode;
             Tensor count = frame.append_counts.slice(0, 0, 1);
             Tensor lane  = frame.state_destination_slots.slice(0, 0, 1);
             Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
-            ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
-            const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-            dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
+            ops::set_i32_scalar(count, kept_features.ne[1], state.execution.device.stream);
+            const auto exact = static_cast<std::uint32_t>(kept_features.ne[1]);
+            dflash_append_context(state, kept_features, kept_positions, count, lane, row,
+                                  {exact, exact});
             (void)rewrite_checkpoint;
         });
 }
@@ -63,7 +78,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr && state.capture_dflash_context) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
@@ -85,7 +100,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr && state.capture_dflash_context) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
                                   finalize_at_end, sink);

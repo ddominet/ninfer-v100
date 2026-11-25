@@ -509,7 +509,7 @@ struct RequestControl {
 // read once a round whatever its query count, so context does not make columns dearer), and
 // draft-block columns / 8 (the draft runs a block as wide as the widest kept extent + 1).
 struct DFlashCostModel {
-    static constexpr int kFeatures = 6;
+    static constexpr int kFeatures = 7;
     std::array<double, kFeatures> theta{};
     std::array<double, kFeatures> prior{};
     std::array<double, kFeatures> ridge{};
@@ -530,13 +530,29 @@ struct DFlashCostModel {
     [[nodiscard]] static std::array<double, kFeatures>
     features(std::size_t requests, std::size_t kept, double mean_context,
              std::size_t widest) noexcept {
-        const double columns = static_cast<double>(requests + kept);
+        const std::size_t cols = requests + kept;
+#ifdef NINFER_VOLTA_BUILD
+        // Multi-tile prepacked Q4 proposal head reads up to 32 proposal positions per head pass.
+        const double head =
+            kept == 0 ? 0.0 : std::ceil(static_cast<double>(kept) / 32.0);
+#else
         const double head =
             kept == 0 ? 0.0 : std::ceil(static_cast<double>(std::max<std::size_t>(kept, 5)) / 8.0);
-        const double tiles = std::max(0.0, std::ceil(columns / 8.0) - 1.0);
-        return {1.0, static_cast<double>(requests) - 1.0, tiles, head,
-                static_cast<double>(requests) * mean_context / 1.0e5,
-                static_cast<double>((widest + 1) * requests) / 8.0};
+#endif
+        // Match Volta NVFP4/FP8 kTiles buckets {1, 2, 3, 4, 6, 8} so T=33 (kTiles=6) and
+        // T=49 (kTiles=8) accurately charge their occupancy/tile jump.
+        const double tiles = cols <= 8    ? 0.0
+                             : cols <= 16 ? 1.0
+                             : cols <= 24 ? 2.0
+                             : cols <= 32 ? 3.0
+                             : cols <= 48 ? 5.0
+                                          : 7.0;
+        const double ctx_req = static_cast<double>(requests) * mean_context / 1.0e5;
+        const double draft_w =
+            kept == 0 ? 0.0 : static_cast<double>((widest + 1) * requests) / 8.0;
+        const double ctx_width =
+            kept == 0 ? 0.0 : ctx_req * (static_cast<double>(widest) / 7.0);
+        return {1.0, static_cast<double>(requests) - 1.0, tiles, head, ctx_req, draft_w, ctx_width};
     }
 
     [[nodiscard]] double predict(std::size_t requests, std::size_t kept, double mean_context,
@@ -722,9 +738,13 @@ public:
     // Verify only the DFlash drafts whose expected acceptance pays for their target rows (eager
     // rounds only; NINFER_DFLASH_KEEP_ALL=1 verifies every draft as before).
     bool dflash_verify_budget = false;
+    bool dflash_post_conf     = false; // NINFER_DFLASH_POST_CONF=0 disables post-draft confidence
     // Engine-wide conditional acceptance per draft position, updated by every request's verified
     // positions; the prior for positions a request has not verified recently.
     std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_global_accept{};
+    // Online 8-bin Empirical-Bayes acceptance calibrator over selector confidence softmax(edge)[j].
+    std::array<float, 8> dflash_conf_hits_{};
+    std::array<float, 8> dflash_conf_tries_{};
     DFlashCostModel dflash_cost;
     std::size_t dflash_round_kept     = 0;
     std::size_t dflash_round_widest   = 0;
@@ -993,6 +1013,11 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    cudaStream_t gdn_fold_stream_ = nullptr;
+    CudaCompletionEvent gdn_fold_done_;
+    bool gdn_fold_pending_ = false;
+    bool async_gdn_fold_   = false;
+    void sync_gdn_fold_host() noexcept;
     std::vector<TokenId> materialization_ledger_;
     qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_6::detail::PrefixShortlistDigests materialization_prefix_digests_;

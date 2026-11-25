@@ -317,6 +317,19 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, execution);
 }
 
+bool Variant::gdn_norm_control_projection_scatter(const Tensor& residual, const Tensor& norm_weight,
+                                                  float eps, const GdnProjectionWeights& weights,
+                                                  const Tensor& scatter_columns, Tensor& hidden,
+                                                  Tensor& g_padded, Tensor& beta_padded,
+                                                  cudaStream_t stream) {
+    const auto* fused =
+        std::get_if<FusedGdnControlProjectionPayload>(&weights.control_projection);
+    if (fused == nullptr) { return false; }
+    return ops::gdn_norm_gating_proj_scatter(residual, norm_weight, eps, fused->a_b_projection,
+                                             weights.a_log, weights.dt_bias, scatter_columns,
+                                             hidden, g_padded, beta_padded, stream);
+}
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints&,
                          WorkspaceArena& workspace, cudaStream_t stream) {
