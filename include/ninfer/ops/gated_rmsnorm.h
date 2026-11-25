@@ -23,4 +23,12 @@ namespace ninfer::ops {
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    cudaStream_t stream);
 
+/**
+ * gated_rmsnorm reading x through a column map: `x` is [D, H, P], `z` and `out` are [D, H, T],
+ * and output column t reads x column `x_columns[t]` (I32 [T], each in [0, P)). Equivalent to
+ * gathering those columns of x first. D must be 64, 128, 192 or 256 with even alignment.
+ */
+void gated_rmsnorm_columns(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                           const Tensor& x_columns, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

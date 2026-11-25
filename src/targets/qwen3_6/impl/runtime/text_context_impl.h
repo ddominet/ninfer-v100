@@ -1161,22 +1161,28 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                              o, s);
     }
 
-    if (compact) {
-        Tensor o_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-        const Tensor o_padded = o.view({kCfg.value_dim, P});
-        const bool gate_kept  = gate_kept_.data != nullptr;
-        Tensor z_kept = gate_kept ? gate_kept_ : work_.alloc(DType::BF16, {kCfg.value_dim, T});
-        const Tensor z_padded = z.view({kCfg.value_dim, P});
-        ops::gather_columns_group({&o_padded, gate_kept ? nullptr : &z_padded, nullptr, nullptr},
-                                  {&o_kept, gate_kept ? nullptr : &z_kept, nullptr, nullptr},
-                                  *active_compaction_->live_columns, s);
-        o = o_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-        z = z_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-        gate_kept_ = Tensor{};
-    }
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    if (compact && gate_kept_.data != nullptr) {
+        // Gate already kept: the norm reads the recurrence output's kept columns in place.
+        const Tensor z_kept = gate_kept_.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        gate_kept_          = Tensor{};
+        ops::gated_rmsnorm_columns(o, *w.gdn_norm, z_kept, kCfg.rms_eps,
+                                   *active_compaction_->live_columns, on, s);
+    } else {
+        if (compact) {
+            Tensor o_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+            Tensor z_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
+            const Tensor o_padded = o.view({kCfg.value_dim, P});
+            const Tensor z_padded = z.view({kCfg.value_dim, P});
+            ops::gather_columns_group({&o_padded, &z_padded, nullptr, nullptr},
+                                      {&o_kept, &z_kept, nullptr, nullptr},
+                                      *active_compaction_->live_columns, s);
+            o = o_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+            z = z_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        }
+        ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    }
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }

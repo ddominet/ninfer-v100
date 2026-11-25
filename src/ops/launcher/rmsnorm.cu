@@ -158,4 +158,20 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
+void gated_rmsnorm_columns_launch(const Tensor& x, const Tensor& weight, const Tensor& z,
+                                  float eps, const Tensor& x_columns, Tensor& out,
+                                  cudaStream_t stream) {
+    const std::int32_t d              = out.ne[0];
+    const std::int32_t rows_per_column = out.ne[1];
+    const std::int64_t rows           = static_cast<std::int64_t>(rows_per_column) * out.ne[2];
+    constexpr int kBlock              = 512;
+    constexpr int kWarpsPerBlock      = kBlock / kWarpSize;
+    const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    rmsnorm_warp_bf16x2_kernel<RmsEpilogue::Gated, kBlock, true><<<blocks, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat162*>(x.data), static_cast<const __nv_bfloat162*>(weight.data),
+        static_cast<const __nv_bfloat162*>(z.data), static_cast<__nv_bfloat162*>(out.data), d,
+        rows, eps, static_cast<const std::int32_t*>(x_columns.data), rows_per_column);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

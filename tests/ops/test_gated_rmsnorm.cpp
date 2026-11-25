@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -107,6 +108,49 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
 
 } // namespace
 
+// gated_rmsnorm_columns against gathering x's columns first and running gated_rmsnorm: the same
+// warp kernel either way, so the outputs must match bit for bit.
+int columns_case(int padded, const std::vector<std::int32_t>& map) {
+    const int d = 128, heads = 48, t = static_cast<int>(map.size());
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(d) * heads * padded);
+    std::vector<std::uint16_t> z(static_cast<std::size_t>(d) * heads * t);
+    std::vector<std::uint16_t> w(d);
+    auto bf = [](float v) { std::uint32_t b; std::memcpy(&b, &v, 4); return static_cast<std::uint16_t>(b >> 16); };
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = bf(std::sin(0.37f * static_cast<float>(i % 997)) * 2.0f);
+    for (std::size_t i = 0; i < z.size(); ++i) z[i] = bf(std::cos(0.11f * static_cast<float>(i % 613)) * 3.0f);
+    for (int i = 0; i < d; ++i) w[i] = bf(0.5f + 0.01f * i);
+    std::vector<std::uint16_t> gathered(z.size());
+    const std::size_t column = static_cast<std::size_t>(d) * heads;
+    for (int c = 0; c < t; ++c) {
+        std::memcpy(gathered.data() + column * c, x.data() + column * map[c], column * 2);
+    }
+    DeviceBuffer dx(x.size() * 2), dz(z.size() * 2), dw(w.size() * 2), dg(gathered.size() * 2),
+        dmap(map.size() * 4), out_a(z.size() * 2), out_b(z.size() * 2);
+    dx.copy_from_host(x.data(), dx.bytes);
+    dz.copy_from_host(z.data(), dz.bytes);
+    dw.copy_from_host(w.data(), dw.bytes);
+    dg.copy_from_host(gathered.data(), dg.bytes);
+    dmap.copy_from_host(map.data(), dmap.bytes);
+    Tensor tx(dx.p, DType::BF16, {d, heads, padded});
+    Tensor tg(dg.p, DType::BF16, {d, heads, t});
+    Tensor tz(dz.p, DType::BF16, {d, heads, t});
+    Tensor tw(dw.p, DType::BF16, {d});
+    Tensor tm(dmap.p, DType::I32, {t});
+    Tensor ta(out_a.p, DType::BF16, {d, heads, t});
+    Tensor tb(out_b.p, DType::BF16, {d, heads, t});
+    ops::gated_rmsnorm(tg, tw, tz, 1.0e-6F, ta, nullptr);
+    ops::gated_rmsnorm_columns(tx, tw, tz, 1.0e-6F, tm, tb, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "gated_rmsnorm_columns");
+    std::vector<std::uint16_t> a(z.size()), b(z.size());
+    out_a.copy_to_host(a.data(), out_a.bytes);
+    out_b.copy_to_host(b.data(), out_b.bytes);
+    if (a != b) {
+        std::cerr << "gated_rmsnorm_columns P=" << padded << " T=" << t << " mismatch\n";
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -124,6 +168,9 @@ int main() {
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
     failures += run_case("gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
+    failures += columns_case(64, {0, 1, 2, 8, 9, 16, 24, 25, 26, 63});
+    failures += columns_case(8, {3});
+    failures += columns_case(16, {15, 0, 7, 8});
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

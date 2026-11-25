@@ -32,7 +32,9 @@ template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out,
-                                    std::int32_t input_d, std::int64_t rows, float eps) {
+                                    std::int32_t input_d, std::int64_t rows, float eps,
+                                    const std::int32_t* x_columns   = nullptr,
+                                    std::int32_t rows_per_column = 1) {
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / kWarpSize;
@@ -44,6 +46,13 @@ __launch_bounds__(Block) __global__
 
     const int pairs             = d / 2;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+    // With a column map, x row (column c, sub-row s) comes from x column x_columns[c].
+    const std::int64_t x_row =
+        x_columns == nullptr
+            ? row
+            : static_cast<std::int64_t>(x_columns[row / rows_per_column]) * rows_per_column +
+                  row % rows_per_column;
+    const std::int64_t x_base = x_row * static_cast<std::int64_t>(pairs);
     __nv_bfloat162 values[kMaxPairsPerLane];
     __nv_bfloat162 weights[kMaxPairsPerLane];
     __nv_bfloat162 gates[kMaxPairsPerLane];
@@ -53,7 +62,7 @@ __launch_bounds__(Block) __global__
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
-            values[k] = x[row_base + pair];
+            values[k] = x[x_base + pair];
             if constexpr (Prefetch) {
                 weights[k] = weight[pair];
                 if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }

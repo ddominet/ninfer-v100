@@ -98,4 +98,23 @@ void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float
     rmsnorm_impl(x, weight, eps, false, &z, out, stream);
 }
 
+void gated_rmsnorm_columns(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                           const Tensor& x_columns, Tensor& out, cudaStream_t stream) {
+    const auto bf16 = [](const Tensor& t) { return t.dtype == DType::BF16 && t.is_contiguous(); };
+    const std::int32_t d = out.ne[0];
+    if (!bf16(x) || !bf16(weight) || !bf16(z) || !bf16(out) || x_columns.dtype != DType::I32 ||
+        !x_columns.is_contiguous() || !(eps > 0.0f) || !std::isfinite(eps) ||
+        (d != 64 && d != 128 && d != 192 && d != 256) || x.ne[0] != d || x.ne[1] != out.ne[1] ||
+        z.ne[0] != d || z.ne[1] != out.ne[1] || z.ne[2] != out.ne[2] || weight.ne[0] != d ||
+        x_columns.ne[0] != out.ne[2] || x.ne[3] != 1 || out.ne[3] != 1 || z.ne[3] != 1 ||
+        x.data == nullptr || z.data == nullptr || out.data == nullptr ||
+        ((reinterpret_cast<std::uintptr_t>(x.data) | reinterpret_cast<std::uintptr_t>(z.data) |
+          reinterpret_cast<std::uintptr_t>(out.data) |
+          reinterpret_cast<std::uintptr_t>(weight.data)) & 3u) != 0) {
+        throw std::invalid_argument("gated_rmsnorm_columns: invalid operands");
+    }
+    if (out.ne[2] == 0) { return; }
+    detail::gated_rmsnorm_columns_launch(x, weight, z, eps, x_columns, out, stream);
+}
+
 } // namespace ninfer::ops
