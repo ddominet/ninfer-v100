@@ -1092,9 +1092,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept, gate_kept_, ph,
                                               work_, s);
                 Tensor record_flat = records.conv.view({kCfg.conv_dim, P});
+                // Dropped columns are left unwritten: the projected conv, the recurrence and the
+                // replay fold all stop at each request's valid count (the conv writes zero q/k/v
+                // past it itself), so no reader reaches them.
                 ops::gather_columns_group({&qkv_kept, &g_kept_, &beta_kept_, nullptr},
                                           {&record_flat, &g, &beta, nullptr},
-                                          *active_compaction_->padded_slots, s);
+                                          *active_compaction_->padded_slots, s, false);
                 ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
                                                *active_linear_state_source_slots_, query_output,
                                                key_output, value_output, s);
