@@ -348,6 +348,7 @@ private:
     const VerifyCompaction* active_compaction_                                     = nullptr;
     Tensor g_kept_;    // kept-column gdn_mix g / beta awaiting their grouped expansion
     Tensor beta_kept_;
+    Tensor gate_kept_; // kept-layout GDN output gate, set when the projection ran on kept columns
     Tensor active_tap_scratch_;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;

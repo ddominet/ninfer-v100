@@ -1079,15 +1079,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             if (compact_projection) {
                 // Project the kept columns, expand them into the padded record (dropped columns
                 // zero, never consumed past the valid counts) and run the convolution from it.
+                // The output gate stays in the kept layout: only the gated norm after the
+                // recurrence reads it, and it reads kept columns.
+                gate_kept_ = work_.alloc(DType::BF16, {kCfg.value_dim, T});
                 auto projection_scope = work_.scope();
                 Tensor qkv_kept  = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
-                Tensor gate_kept = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-                Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept, gate_kept, ph,
+                Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept, gate_kept_, ph,
                                               work_, s);
                 Tensor record_flat = records.conv.view({kCfg.conv_dim, P});
-                Tensor gate_flat   = gate_output.view({kCfg.value_dim, P});
-                ops::gather_columns_group({&qkv_kept, &gate_kept, &g_kept_, &beta_kept_},
-                                          {&record_flat, &gate_flat, &g, &beta},
+                ops::gather_columns_group({&qkv_kept, &g_kept_, &beta_kept_, nullptr},
+                                          {&record_flat, &g, &beta, nullptr},
                                           *active_compaction_->padded_slots, s);
                 ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
                                                *active_linear_state_source_slots_, query_output,
@@ -1157,14 +1158,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     if (compact) {
         Tensor o_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-        Tensor z_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
         const Tensor o_padded = o.view({kCfg.value_dim, P});
+        const bool gate_kept  = gate_kept_.data != nullptr;
+        Tensor z_kept = gate_kept ? gate_kept_ : work_.alloc(DType::BF16, {kCfg.value_dim, T});
         const Tensor z_padded = z.view({kCfg.value_dim, P});
-        ops::gather_columns_group({&o_padded, &z_padded, nullptr, nullptr},
-                                  {&o_kept, &z_kept, nullptr, nullptr},
+        ops::gather_columns_group({&o_padded, gate_kept ? nullptr : &z_padded, nullptr, nullptr},
+                                  {&o_kept, gate_kept ? nullptr : &z_kept, nullptr, nullptr},
                                   *active_compaction_->live_columns, s);
         o = o_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
         z = z_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+        gate_kept_ = Tensor{};
     }
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
