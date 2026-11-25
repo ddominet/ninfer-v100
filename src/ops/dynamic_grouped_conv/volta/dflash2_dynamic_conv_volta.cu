@@ -12,6 +12,7 @@
 
 #include "core/device.h"
 #include "ops/common/warp.cuh"
+#include "ops/linear/volta_tc_skinny.cuh"
 
 #include <cuda_bf16.h>
 #include <algorithm>
@@ -190,6 +191,44 @@ __global__ __launch_bounds__(128) void dflash2_bf16_control_rows4_kernel(
     }
 }
 
+// Row-major BF16 weights for the tensor-core skinny route (volta_tc_skinny.cuh): one item is 8
+// adjacent K of one row of a 32-row tile in a 64-K chunk, converted to FP16 in shared memory.
+// The control weights are small coefficients well inside FP16's range.
+struct Bf16VoltaTcDecoder {
+    const __nv_bfloat16* weight;
+    int k;
+
+    static constexpr int kItemsPerTileChunk = 256; // 32 rows x 8 vectors of 8
+    static constexpr int kMinTokens         = 1;
+    static constexpr bool kMandatory        = false;
+    struct Raw {
+        uint4 q;
+    };
+
+    __device__ __forceinline__ Raw load(int tile, int chunk, int item) const {
+        const std::int64_t row = static_cast<std::int64_t>(tile) * 32 + (item >> 3);
+        return {__ldg(reinterpret_cast<const uint4*>(weight + row * k + chunk * 64 +
+                                                     (item & 7) * 8))};
+    }
+    __device__ __forceinline__ void store(const Raw& raw, int item, half* tile, int lds) const {
+        const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw.q);
+        half2 values[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { values[i] = __float22half2_rn(__bfloat1622float2(pairs[i])); }
+        *reinterpret_cast<uint4*>(tile + (item >> 3) * lds + (item & 7) * 8) =
+            *reinterpret_cast<const uint4*>(values);
+    }
+    __device__ __forceinline__ float finish(int, float value) const { return value; }
+};
+
+struct Bf16ControlOutput {
+    __nv_bfloat16* out;
+    int rows;
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        out[static_cast<std::int64_t>(token) * rows + row] = __float2bfloat16_rn(value);
+    }
+};
+
 } // namespace
 
 void dflash2_dynamic_conv_prepare_launch(const __nv_bfloat16* n, const __nv_bfloat16* delta,
@@ -214,6 +253,23 @@ void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_b
     int first = 0;
     const bool aligned16 =
         ((reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(x)) & 15u) == 0;
+    // The tensor-core skinny route reads the 13 MB weight once for up to 64 columns (one launch a
+    // call instead of 16-column chunks at ~49 us each).
+    if (n_rows % 64 == 0 && k % 128 == 0 && aligned16) {
+        const Bf16VoltaTcDecoder decoder{w, k};
+        for (; first < cols; first += 64) {
+            const int count = std::min(64, cols - first);
+            if (!launch_volta_tc_skinny(decoder, x + static_cast<std::int64_t>(first) * k, n_rows,
+                                        k, count, 0,
+                                        Bf16ControlOutput{out + static_cast<std::int64_t>(first) *
+                                                                    n_rows,
+                                                          n_rows},
+                                        stream)) {
+                break;
+            }
+        }
+        if (first >= cols) { return; }
+    }
     if (n_rows == 1280 && k == 5120 && aligned16) {
         // Any remainder takes the narrowest wide form that holds it: a 15-column block (three
         // drafts for five requests) was 8 + 7 scalar columns, the scalar part 124 us a call.
