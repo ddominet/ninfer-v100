@@ -73,6 +73,11 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
+    // No scattered GDN projection route for this target's weights: callers gather.
+    static bool gdn_input_projection_scatter(const Tensor&, const GdnProjectionWeights&, Tensor&,
+                                             Tensor&, const Tensor&, cudaStream_t) {
+        return false;
+    }
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);

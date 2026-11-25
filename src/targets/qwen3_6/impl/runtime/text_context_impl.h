@@ -1092,18 +1092,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 // Dropped columns are left unwritten: the projected conv, the recurrence and the
                 // replay fold all stop at each request's valid count (the conv writes zero q/k/v
                 // past it itself), so no reader reaches them.
-                bool scattered = false;
-                if constexpr (requires {
-                                  Variant::gdn_input_projection_scatter(
-                                      kept_hidden, *w.projection, record_flat, gate_kept_,
-                                      *active_compaction_->live_columns, s);
-                              }) {
-                    // The projection writes each kept column straight into its padded record
-                    // column: no expansion of the 10240-row q/k/v.
-                    scattered = Variant::gdn_input_projection_scatter(
-                        kept_hidden, *w.projection, record_flat, gate_kept_,
-                        *active_compaction_->live_columns, s);
-                }
+                // Where the variant has the route, the projection writes each kept column
+                // straight into its padded record column: no expansion of the 10240-row q/k/v.
+                const bool scattered = Variant::gdn_input_projection_scatter(
+                    kept_hidden, *w.projection, record_flat, gate_kept_,
+                    *active_compaction_->live_columns, s);
                 if (scattered) {
                     ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
                                               {&g, &beta, nullptr, nullptr},
