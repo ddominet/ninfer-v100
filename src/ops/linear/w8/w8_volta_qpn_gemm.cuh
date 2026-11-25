@@ -103,6 +103,12 @@ struct W8VoltaTcDecoder {
     __device__ __forceinline__ float finish(int, float value) const { return value; }
 };
 
+// The same decoder where the quadpair kernel also reads the weight: optional, from its floor.
+struct W8VoltaTcOptionalDecoder : W8VoltaTcDecoder {
+    static constexpr int kMinTokens  = kVoltaTcW8MinTokens;
+    static constexpr bool kMandatory = false;
+};
+
 enum class W8QpnEpilogue { Store, DynamicConvAdd, SwiGluUp, Split3 };
 
 // `kTiles` is the number of 8-row A tiles (T <= 8 * kTiles); `kBlk` is how many W8 groups a lane

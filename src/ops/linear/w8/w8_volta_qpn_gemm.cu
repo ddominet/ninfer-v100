@@ -156,6 +156,24 @@ void w8_qpn_launch_packed_typed(const dim3& grid, const Activation* x, const std
 // a row's predecessor from the same CTA, so its chunks hold whole requests: a multiple of width.
 constexpr int kPackedMaxRows = 64;
 
+// Store and SwiGLU-up epilogues of the quadpair kernel, for the tensor-core route.
+template <W8QpnEpilogue E>
+struct W8TcEpilogueOutput {
+    __nv_bfloat16* out;
+    std::int64_t ld;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        const std::int64_t offset = token * ld + row;
+        if constexpr (E == W8QpnEpilogue::SwiGluUp) {
+            const float gate = __bfloat162float(out[offset]);
+            const float up   = __bfloat162float(__float2bfloat16(value));
+            out[offset]      = __float2bfloat16_rn(silu(gate) * up);
+        } else {
+            out[offset] = __float2bfloat16(value);
+        }
+    }
+};
+
 template <W8QpnEpilogue E>
 void w8_qpn_launch_packed(const Tensor& x, const half* x_fp16, const std::uint8_t* codes,
                           const std::uint8_t* scales, __nv_bfloat16* out, int n, int out_ld,
@@ -179,6 +197,18 @@ void w8_qpn_launch_packed(const Tensor& x, const half* x_fp16, const std::uint8_
         const __nv_bfloat16* delta_chunk =
             finish_delta != nullptr ? finish_delta + first * 640 : nullptr;
         __nv_bfloat16* residual_chunk = residual != nullptr ? residual + first * 5120 : nullptr;
+        if constexpr (E == W8QpnEpilogue::Store || E == W8QpnEpilogue::SwiGluUp) {
+            // Past two row tiles the tensor-core route reads the weight once for all rows.
+            const W8VoltaTcOptionalDecoder decoder{
+                {reinterpret_cast<const uint4*>(codes), reinterpret_cast<const __half*>(scales),
+                 k / 128}};
+            const W8TcEpilogueOutput<E> policy{out_chunk, out_ld};
+            if (x_half != nullptr
+                    ? launch_volta_tc_skinny(decoder, x_half, n, k, t, 0, policy, stream)
+                    : launch_volta_tc_skinny(decoder, x_bf16, n, k, t, 0, policy, stream)) {
+                continue;
+            }
+        }
 #define NINFER_W8_PACKED(TILES, SPLITK)                                                          \
     do {                                                                                         \
         if (x_half != nullptr) {                                                                 \

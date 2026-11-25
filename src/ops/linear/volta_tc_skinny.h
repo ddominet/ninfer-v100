@@ -31,6 +31,9 @@ bool volta_tc_applies(int n, int k, int t, int format_min_tokens);
 // wins from 25 tokens (attention input 149 vs 218 us at 32); NVFP4 does not win at any width
 // yet (its decode-to-shared cost exceeds the quadpair kernel's), so its floor is past the range.
 inline constexpr int kVoltaTcFp8MinTokens   = 25;
+// Prepacked W8 (the DFlash2 draft's output and gate/up projections) against its quadpair kernel
+// with FP16-staged activations: 387 vs 495 us at 32 tokens on gate/up, 369 vs 403 at 24.
+inline constexpr int kVoltaTcW8MinTokens    = 17;
 inline constexpr int kVoltaTcNvfp4MinTokens = 65;
 
 struct VoltaTcSplitWorkspace {
