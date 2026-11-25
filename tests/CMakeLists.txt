@@ -327,6 +327,11 @@ add_executable(ninfer_volta_tc_skinny_bench EXCLUDE_FROM_ALL
 target_include_directories(ninfer_volta_tc_skinny_bench PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(ninfer_volta_tc_skinny_bench PRIVATE ninfer_ops)
+add_executable(ninfer_w8_pair_bench EXCLUDE_FROM_ALL
+  ops/linear/w8_pair_bench.cpp ops/linear/linear_test_common.cpp)
+target_include_directories(ninfer_w8_pair_bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_w8_pair_bench PRIVATE ninfer_ops)
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 endif()
