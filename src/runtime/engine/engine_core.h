@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
@@ -69,6 +70,14 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           decode_share_percent_(std::min<std::uint32_t>(options.decode_share_percent, 90)),
+          short_prefill_burst_limit_([]() {
+              const char* env = std::getenv("NINFER_SHORT_PREFILL_BURST_MS");
+              if (env != nullptr) {
+                  const long ms = std::strtol(env, nullptr, 10);
+                  return std::chrono::milliseconds(ms > 0 ? ms : 0);
+              }
+              return std::chrono::milliseconds(1400);
+          }()),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -1953,6 +1962,26 @@ private:
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
+                // Short-prompt burst fast-path: if a tiny prompt's active capture (<= 256 tokens,
+                // e.g. turn-closure rewrite checkpoint D2H) is in flight while forming a batch or
+                // finishing its tiny tail, finish the capture cleanly instead of launching a ~95 ms
+                // premature low-B decode round that staggers every arriving prompt by 100 ms.
+                if (decode_share_percent_ != 0 &&
+                    short_prefill_burst_limit_ > std::chrono::nanoseconds{0} &&
+                    previous_unit_was_decode &&
+                    (have_pending || scheduler_.prefill_lane().has_value()) &&
+                    short_prefill_burst_ < short_prefill_burst_limit_) {
+                    if (const auto cap = active_capture_owner();
+                        cap != nullptr && cap->admitted_begin &&
+                        cap->admitted_begin->prompt_tokens <= 256U) {
+                        const auto deadline = Clock::now() + std::chrono::milliseconds(60);
+                        while (instance_.program->has_context_transaction() &&
+                               Clock::now() < deadline) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                            (void)progress_context_transaction(have_pending);
+                        }
+                    }
+                }
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
@@ -1965,6 +1994,20 @@ private:
                         previous_unit_was_decode, instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
                     (void)try_admit_one();
+                    // Fresh admission (zero reused KV) only runs a <0.5 ms state reset on
+                    // transfer_stream; complete it in-place rather than falling through to a
+                    // ~95 ms decode round on the incomplete batch.
+                    if (decode_share_percent_ != 0 &&
+                        short_prefill_burst_limit_ > std::chrono::nanoseconds{0} &&
+                        materializing_.has_value() &&
+                        materializing_->summary.reusable_prompt_tokens == 0 &&
+                        decode_credit_ <= std::chrono::nanoseconds{0}) {
+                        const auto deadline = Clock::now() + std::chrono::milliseconds(30);
+                        while (materializing_.has_value() && Clock::now() < deadline) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                            (void)progress_context_transaction(false);
+                        }
+                    }
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }
 
@@ -2001,17 +2044,49 @@ private:
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    const auto started = Clock::now();
+                    const bool had_decode = !membership.empty();
+                    const auto started    = Clock::now();
                     run_prefill_step(cancelled_at_unit_start);
-                    if (decode_share_percent_ != 0) {
-                        // Bounded so a long prefill cannot bank unbounded decode priority.
-                        constexpr std::chrono::nanoseconds kMaxDecodeCredit = std::chrono::seconds(8);
-                        const auto spent = Clock::now() - started;
-                        decode_credit_   = std::min<std::chrono::nanoseconds>(
-                            kMaxDecodeCredit, decode_credit_ + spent * decode_share_percent_ /
-                                                                   (100 - decode_share_percent_));
+                    const auto spent = Clock::now() - started;
+                    // Short-prompt batch formation: when --decode-share is active and a short
+                    // prompt finishes prefilling quickly (<= 250 ms) — or pauses briefly for a
+                    // turn-closure checkpoint capture on a <= 256-token prompt — keep batching
+                    // within a bounded burst window (default 1400 ms) instead of staggering
+                    // arriving prompts behind premature low-batch decode rounds. Never accrue
+                    // decode credit when no decode lanes waited during the prefill.
+                    constexpr std::chrono::milliseconds kShortPrefillThreshold(250);
+                    const auto active_prefill_lane = scheduler_.prefill_lane();
+                    const bool short_capture_pause =
+                        active_prefill_lane.has_value() &&
+                        slots_[*active_prefill_lane] != nullptr &&
+                        slots_[*active_prefill_lane]->capture_pending &&
+                        slots_[*active_prefill_lane]->admitted_begin &&
+                        slots_[*active_prefill_lane]->admitted_begin->prompt_tokens <= 256U;
+                    const bool short_done =
+                        decode_share_percent_ != 0 &&
+                        short_prefill_burst_limit_ > std::chrono::nanoseconds{0} &&
+                        spent <= kShortPrefillThreshold &&
+                        ((!active_prefill_lane.has_value() && has_pending_requests()) ||
+                         short_capture_pause);
+                    if (!had_decode) {
+                        short_prefill_burst_     = std::chrono::nanoseconds{0};
+                        previous_unit_was_decode = short_done;
+                    } else if (short_done &&
+                               short_prefill_burst_ + spent <= short_prefill_burst_limit_) {
+                        short_prefill_burst_ += spent;
+                        previous_unit_was_decode = true;
+                    } else {
+                        short_prefill_burst_ = std::chrono::nanoseconds{0};
+                        if (decode_share_percent_ != 0) {
+                            // Bounded so a long prefill cannot bank unbounded decode priority.
+                            constexpr std::chrono::nanoseconds kMaxDecodeCredit =
+                                std::chrono::seconds(8);
+                            decode_credit_ = std::min<std::chrono::nanoseconds>(
+                                kMaxDecodeCredit, decode_credit_ + spent * decode_share_percent_ /
+                                                                       (100 - decode_share_percent_));
+                        }
+                        previous_unit_was_decode = false;
                     }
-                    previous_unit_was_decode = false;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -2019,6 +2094,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     const auto started = Clock::now();
                     run_decode_round(membership, cancelled_at_unit_start);
+                    short_prefill_burst_ = std::chrono::nanoseconds{0};
                     if (decode_share_percent_ != 0) {
                         decode_credit_ = std::max<std::chrono::nanoseconds>(
                             std::chrono::nanoseconds{0}, decode_credit_ - (Clock::now() - started));
@@ -2051,7 +2127,9 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const std::uint32_t decode_share_percent_;
+    const std::chrono::nanoseconds short_prefill_burst_limit_;
     std::chrono::nanoseconds decode_credit_{0};
+    std::chrono::nanoseconds short_prefill_burst_{0};
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
