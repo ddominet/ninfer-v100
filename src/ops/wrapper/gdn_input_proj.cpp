@@ -1109,4 +1109,35 @@ void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_wei
                                              initial_state_slots, query, key, value, stream);
 }
 
+bool gdn_input_proj_scatter_qkv(const Tensor& x, const Weight& query_key_value_z_weight,
+                                Tensor& qkv_padded, Tensor& z, const Tensor& qkv_columns,
+                                cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    constexpr std::int32_t kHidden  = 5120;
+    constexpr std::int32_t kQkvRows = 10240;
+    constexpr std::int32_t kZRows   = 6144;
+    const Weight& weight            = query_key_value_z_weight;
+    const std::int32_t cols         = x.ne[1];
+    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16S || cols <= 0 ||
+        weight.n != kQkvRows + kZRows || weight.k != kHidden) {
+        return false;
+    }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(z, kZRows, cols, "z");
+    if (qkv_padded.dtype != DType::BF16 || qkv_padded.ne[0] != kQkvRows ||
+        qkv_padded.ne[1] < cols || !qkv_padded.is_contiguous() ||
+        qkv_columns.dtype != DType::I32 || qkv_columns.ne[0] != cols ||
+        !qkv_columns.is_contiguous()) {
+        throw std::invalid_argument("gdn_input_proj_scatter_qkv: invalid operands");
+    }
+    detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_scatter_qkv");
+    return detail::launch_fp8_gdn_input_volta_qpn_scatter(x, weight, qkv_padded, z, qkv_columns,
+                                                          stream);
+#else
+    (void)x; (void)query_key_value_z_weight; (void)qkv_padded; (void)z; (void)qkv_columns;
+    (void)stream;
+    return false;
+#endif
+}
+
 } // namespace ninfer::ops

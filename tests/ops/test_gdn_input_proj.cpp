@@ -283,6 +283,55 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     return failures;
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// gdn_input_proj_scatter_qkv against the compact projection: token t's q/k/v land in padded
+// column map[t] bit for bit, z matches, and every other padded column keeps its old bytes.
+int run_fp8_scatter_case(DevicePackedWeight& parent, const std::vector<std::int32_t>& map,
+                         std::int32_t padded) {
+    constexpr std::int32_t kHidden = 5120, kQkv = 10240, kZ = 6144;
+    const std::int32_t tokens      = static_cast<std::int32_t>(map.size());
+    const auto activation          = bf16_bits(make_bf16_activation(kHidden, tokens, 977U + tokens));
+    DeviceBuffer x(activation.size() * 2);
+    x.copy_from_host(activation.data(), x.bytes);
+    DeviceBuffer qkv(static_cast<std::size_t>(kQkv) * tokens * 2), z(static_cast<std::size_t>(kZ) * tokens * 2);
+    DeviceBuffer qkv_padded(static_cast<std::size_t>(kQkv) * padded * 2), z2(z.bytes);
+    DeviceBuffer columns(map.size() * 4);
+    columns.copy_from_host(map.data(), columns.bytes);
+    cuda_check(cudaMemset(qkv_padded.p, 0x5a, qkv_padded.bytes), "fill padded");
+    Tensor tx(x.p, DType::BF16, {kHidden, tokens});
+    Tensor tqkv(qkv.p, DType::BF16, {kQkv, tokens}), tz(z.p, DType::BF16, {kZ, tokens});
+    Tensor tpad(qkv_padded.p, DType::BF16, {kQkv, padded}), tz2(z2.p, DType::BF16, {kZ, tokens});
+    Tensor tcol(columns.p, DType::I32, {tokens});
+    ops::gdn_input_proj(tx, parent.view(), tqkv, tz, nullptr);
+    if (!ops::gdn_input_proj_scatter_qkv(tx, parent.view(), tpad, tz2, tcol, nullptr)) {
+        std::cerr << "gdn_input_proj_scatter_qkv: no route at T=" << tokens << "\n";
+        return 1;
+    }
+    cuda_check(cudaDeviceSynchronize(), "scatter");
+    std::vector<std::uint16_t> a(static_cast<std::size_t>(kQkv) * tokens), b(static_cast<std::size_t>(kQkv) * padded);
+    std::vector<std::uint16_t> za(static_cast<std::size_t>(kZ) * tokens), zb(za.size());
+    qkv.copy_to_host(a.data(), qkv.bytes);
+    qkv_padded.copy_to_host(b.data(), qkv_padded.bytes);
+    z.copy_to_host(za.data(), z.bytes);
+    z2.copy_to_host(zb.data(), z2.bytes);
+    int failures = za == zb ? 0 : 1;
+    std::vector<bool> used(padded, false);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        used[map[t]] = true;
+        if (!std::equal(a.begin() + static_cast<std::size_t>(t) * kQkv, a.begin() + static_cast<std::size_t>(t + 1) * kQkv,
+                        b.begin() + static_cast<std::size_t>(map[t]) * kQkv)) { ++failures; }
+    }
+    for (std::int32_t c = 0; c < padded; ++c) {
+        if (used[c]) { continue; }
+        for (std::int32_t r = 0; r < kQkv; ++r) {
+            if (b[static_cast<std::size_t>(c) * kQkv + r] != 0x5a5a) { ++failures; break; }
+        }
+    }
+    if (failures != 0) { std::cerr << "gdn_input_proj_scatter_qkv T=" << tokens << " mismatch\n"; }
+    return failures;
+}
+#endif
+
 int run_fp8() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -326,6 +375,12 @@ int run_fp8() {
     for (const std::int32_t tokens : {12, 20, 32, 40, 64, 65, 192, 193}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::A16Only);
     }
+    // Kept columns of eight requests' padded blocks, across the quadpair and tensor-core widths.
+    failures += run_fp8_scatter_case(parent, {0, 1, 2, 8, 9, 16, 24, 25, 26, 63}, 64);
+    failures += run_fp8_scatter_case(parent, {3}, 8);
+    std::vector<std::int32_t> wide;
+    for (std::int32_t r = 0; r < 8; ++r) for (std::int32_t j = 0; j < 4; ++j) wide.push_back(r * 8 + j);
+    failures += run_fp8_scatter_case(parent, wide, 64);
 #endif
     return failures;
 }

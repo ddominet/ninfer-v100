@@ -215,6 +215,18 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
     ops::linear(hidden, weights.output_gate, gate, stream);
 }
 
+bool Variant::gdn_input_projection_scatter(const Tensor& hidden,
+                                           const GdnProjectionWeights& weights,
+                                           Tensor& qkv_padded, Tensor& output_gate,
+                                           const Tensor& qkv_columns, cudaStream_t stream) {
+    const auto* fused = std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
+    if (fused == nullptr) { return false; }
+    Tensor output_gate_flat =
+        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+    return ops::gdn_input_proj_scatter_qkv(hidden, fused->query_key_value_z, qkv_padded,
+                                           output_gate_flat, qkv_columns, stream);
+}
+
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {

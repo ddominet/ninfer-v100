@@ -67,6 +67,12 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
+    // The fused projection with q/k/v scattered to qkv_columns of a padded plane (gate compact);
+    // false when this weight format has no such route.
+    static bool gdn_input_projection_scatter(const Tensor& hidden,
+                                             const GdnProjectionWeights& weights,
+                                             Tensor& qkv_padded, Tensor& output_gate,
+                                             const Tensor& qkv_columns, cudaStream_t stream);
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);

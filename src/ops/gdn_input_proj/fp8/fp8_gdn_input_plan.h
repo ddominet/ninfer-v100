@@ -39,6 +39,11 @@ void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, 
 #ifdef NINFER_VOLTA_BUILD
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     const void* x_fp16, cudaStream_t stream);
+// q/k/v of token t written to column qkv_columns[t] of the wider qkv_padded plane; z compact.
+// Returns false, launching nothing, past the quadpair route's token range.
+bool launch_fp8_gdn_input_volta_qpn_scatter(const Tensor& x, const Weight& weight,
+                                            Tensor& qkv_padded, Tensor& z,
+                                            const Tensor& qkv_columns, cudaStream_t stream);
 #endif
 
 } // namespace ninfer::ops::detail

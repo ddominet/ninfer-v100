@@ -1088,16 +1088,34 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 // recurrence reads it, and it reads kept columns.
                 gate_kept_ = work_.alloc(DType::BF16, {kCfg.value_dim, T});
                 auto projection_scope = work_.scope();
-                Tensor qkv_kept  = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
-                Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept, gate_kept_, ph,
-                                              work_, s);
                 Tensor record_flat = records.conv.view({kCfg.conv_dim, P});
                 // Dropped columns are left unwritten: the projected conv, the recurrence and the
                 // replay fold all stop at each request's valid count (the conv writes zero q/k/v
                 // past it itself), so no reader reaches them.
-                ops::gather_columns_group({&qkv_kept, &g_kept_, &beta_kept_, nullptr},
-                                          {&record_flat, &g, &beta, nullptr},
-                                          *active_compaction_->padded_slots, s, false);
+                bool scattered = false;
+                if constexpr (requires {
+                                  Variant::gdn_input_projection_scatter(
+                                      kept_hidden, *w.projection, record_flat, gate_kept_,
+                                      *active_compaction_->live_columns, s);
+                              }) {
+                    // The projection writes each kept column straight into its padded record
+                    // column: no expansion of the 10240-row q/k/v.
+                    scattered = Variant::gdn_input_projection_scatter(
+                        kept_hidden, *w.projection, record_flat, gate_kept_,
+                        *active_compaction_->live_columns, s);
+                }
+                if (scattered) {
+                    ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
+                                              {&g, &beta, nullptr, nullptr},
+                                              *active_compaction_->padded_slots, s, false);
+                } else {
+                    Tensor qkv_kept = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
+                    Variant::gdn_input_projection(kept_hidden, *w.projection, qkv_kept,
+                                                  gate_kept_, ph, work_, s);
+                    ops::gather_columns_group({&qkv_kept, &g_kept_, &beta_kept_, nullptr},
+                                              {&record_flat, &g, &beta, nullptr},
+                                              *active_compaction_->padded_slots, s, false);
+                }
                 ops::gdn_projected_conv_record(records.conv, *w.conv1d, conv_states, valid,
                                                *active_linear_state_source_slots_, query_output,
                                                key_output, value_output, s);

@@ -264,4 +264,14 @@ void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_wei
                                const Tensor& initial_state_slots, Tensor& query, Tensor& key,
                                Tensor& value, cudaStream_t stream);
 
+/**
+ * gdn_input_proj for a fused FP8 parent weight with the q/k/v output scattered: token t's q/k/v
+ * go to column qkv_columns[t] (I32 [T]) of qkv_padded [10240, P]; z is [6144, T]. Other
+ * qkv_padded columns are untouched. Returns false, launching nothing, when this build or shape
+ * has no such route (callers then project compactly and gather).
+ */
+bool gdn_input_proj_scatter_qkv(const Tensor& x, const Weight& query_key_value_z_weight,
+                                Tensor& qkv_padded, Tensor& z, const Tensor& qkv_columns,
+                                cudaStream_t stream);
+
 } // namespace ninfer::ops
