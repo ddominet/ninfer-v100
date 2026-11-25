@@ -118,9 +118,10 @@ __global__ void dflash2_bf16_matvec_kernel(const __nv_bfloat16* __restrict__ w,
     }
 }
 
-// Four weight rows a CTA: each activation value is loaded once and used by four rows. One row a
-// CTA reread all `cols` activation columns per weight row, ~200 MB of cache traffic for a
-// 13 MB weight at 16 columns (104 us a call against ~30 here).
+// Four weight rows a CTA: each activation value is loaded once and used by four rows, 8 K values
+// a thread per step in 16-byte loads. One row a CTA reread every activation column per weight row
+// (~200 MB of cache traffic for the 13 MB weight at 16 columns, 104 us); scalar 2-byte loads still
+// held four rows at 64 us.
 template <int kCols>
 __global__ __launch_bounds__(128) void dflash2_bf16_control_rows4_kernel(
     const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
@@ -129,22 +130,42 @@ __global__ __launch_bounds__(128) void dflash2_bf16_control_rows4_kernel(
     constexpr int k      = 5120;
     constexpr int kTile  = 4;
     constexpr int kWarps = 4;
+    constexpr int kVec   = 8;
     const int row0       = static_cast<int>(blockIdx.x) * kTile;
     const int lane       = static_cast<int>(threadIdx.x) & 31;
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
     float acc[kTile][kCols] = {};
 
-    for (int i = static_cast<int>(threadIdx.x); i < k; i += 128) {
-        float xv[kCols];
-#pragma unroll
-        for (int col = 0; col < kCols; ++col) {
-            xv[col] = col < cols ? __bfloat162float(x[static_cast<std::int64_t>(col) * k + i]) : 0.0f;
-        }
+    for (int i = static_cast<int>(threadIdx.x) * kVec; i < k; i += 128 * kVec) {
+        float wv[kTile][kVec];
 #pragma unroll
         for (int r = 0; r < kTile; ++r) {
-            const float weight = __bfloat162float(w[static_cast<std::int64_t>(row0 + r) * k + i]);
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(
+                w + static_cast<std::int64_t>(row0 + r) * k + i));
+            const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
 #pragma unroll
-            for (int col = 0; col < kCols; ++col) { acc[r][col] = fmaf(weight, xv[col], acc[r][col]); }
+            for (int e = 0; e < kVec / 2; ++e) {
+                const float2 f = __bfloat1622float2(pairs[e]);
+                wv[r][2 * e]     = f.x;
+                wv[r][2 * e + 1] = f.y;
+            }
+        }
+#pragma unroll
+        for (int col = 0; col < kCols; ++col) {
+            if (col < cols) {
+                const uint4 raw = __ldg(
+                    reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(col) * k + i));
+                const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+                for (int e = 0; e < kVec / 2; ++e) {
+                    const float2 f = __bfloat1622float2(pairs[e]);
+#pragma unroll
+                    for (int r = 0; r < kTile; ++r) {
+                        acc[r][col] = fmaf(wv[r][2 * e], f.x, acc[r][col]);
+                        acc[r][col] = fmaf(wv[r][2 * e + 1], f.y, acc[r][col]);
+                    }
+                }
+            }
         }
     }
 
@@ -186,16 +207,17 @@ void dflash2_dynamic_conv_prepare_launch(const __nv_bfloat16* n, const __nv_bflo
 void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_bfloat16* x,
                                            int n_rows, int k, int cols, __nv_bfloat16* out,
                                            cudaStream_t stream) {
-    // Several K=7 requests project 8 positions each: run the eight-column kernel once per request
-    // block (one weight read each, about 37 us) instead of the scalar fallback, which rereads every
-    // weight row per column and measured 0.9 ms a call at eight requests. Same per-column
-    // reduction order, so the outputs match the fallback's bit for bit.
-    // Up to 16 columns per launch: each weight row is read once for all of them (eight requests'
-    // blocks are four launches instead of eight). Wider launches spill the accumulators.
+    // Up to 16 columns a launch through the four-row kernel: each weight row is read once for all
+    // of them, where the scalar fallback rereads every weight row per column (0.9 ms a call at
+    // eight requests). The vectorized reduction order differs from the scalar fallback's, so the
+    // two agree to rounding, not bit for bit (the projection feeds the draft only).
     int first = 0;
-    if (n_rows == 1280 && k == 5120) {
+    const bool aligned16 =
+        ((reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(x)) & 15u) == 0;
+    if (n_rows == 1280 && k == 5120 && aligned16) {
         // Any remainder takes the narrowest wide form that holds it: a 15-column block (three
         // drafts for five requests) was 8 + 7 scalar columns, the scalar part 124 us a call.
+        // The 16-byte loads need 16-byte aligned rows (k = 5120 keeps every row aligned).
         while (first < cols) {
             const int block = std::min(16, cols - first);
             if (block > 8) {

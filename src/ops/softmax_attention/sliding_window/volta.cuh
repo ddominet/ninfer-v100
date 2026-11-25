@@ -30,10 +30,10 @@ sliding_window_attention_volta_octet_partial_kernel(
     int padded_context, int max_context, int split_capacity, float scale,
     float* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l) {
-    // One warp a query token: eight for the full K=7 block, fewer for the narrowed blocks the
-    // kept-draft choice drafts under load (a narrow block took the per-token fallback, which
-    // streams the 2K window once per token: 146 us a call).
-    static_assert(Tokens >= 1 && Tokens <= 8, "one warp per query token, at most eight");
+    // Eight warps whatever the block width: all of them stage the shared K/V blocks, and warp w
+    // scores query token w when w < Tokens. (One warp a token left narrow blocks with too few
+    // threads to stream the window: 141 us a call at four tokens against 70 at eight.)
+    static_assert(Tokens >= 1 && Tokens <= 8, "at most eight query tokens");
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     constexpr int D                 = kContextQueryHeadDim;
     constexpr int Window            = 2048;
@@ -53,8 +53,8 @@ sliding_window_attention_volta_octet_partial_kernel(
     constexpr int RowStride = D + 1;
     __shared__ float key_s[KeyBlock * RowStride];
     __shared__ float value_s[KeyBlock * RowStride];
-    __shared__ float query_s[Tokens * D];
-    __shared__ float prob_s[Tokens * KeyBlock];
+    __shared__ float query_s[8 * D];
+    __shared__ float prob_s[8 * KeyBlock];
 
     const int q_head = static_cast<int>(blockIdx.x);
     const int split  = static_cast<int>(blockIdx.y);
@@ -93,7 +93,7 @@ sliding_window_attention_volta_octet_partial_kernel(
     const int key_end   = min(length, context_start + tile_end * KeyBlock);
     const bool owns_query = split == active_splits - 1;
     const int kv_head     = q_head / kContextQueryGroup;
-    const bool live       = token < valid;
+    const bool live       = token < Tokens && token < valid;
     const int query_position = live ? positions[token] : 0;
 
     float q_frag[4];
@@ -121,7 +121,7 @@ sliding_window_attention_volta_octet_partial_kernel(
         // 32 keys x 128 dims of K and V: one 16-byte load (8 elements) per thread and plane per
         // step, keys in cyclic-slot order so a block may wrap the 2048-slot ring.
         constexpr int ChunksPerKey = D / 8;
-        for (int c = tid; c < KeyBlock * ChunksPerKey; c += Tokens * 32) {
+        for (int c = tid; c < KeyBlock * ChunksPerKey; c += kSlidingWindowVoltaOctetThreads) {
             const int j     = c / ChunksPerKey;
             const int piece = c % ChunksPerKey;
             float* krow = key_s + j * RowStride + piece * 8;
@@ -194,8 +194,7 @@ sliding_window_attention_volta_octet_partial_kernel(
 
     if (owns_query) {
         for (int key_token = 0; key_token < valid; ++key_token) {
-            // Fewer than D threads at one to three query tokens: stride over the row.
-            for (int d = tid; d < D; d += Tokens * 32) {
+            for (int d = tid; d < D; d += kSlidingWindowVoltaOctetThreads) {
                 const auto index = context_query_query_kv_index(kv_head, d, key_token);
                 key_s[d]         = __bfloat162float(query_k[index]);
                 value_s[d]       = __bfloat162float(query_v[index]);
