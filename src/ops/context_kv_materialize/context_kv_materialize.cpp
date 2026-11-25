@@ -3,6 +3,7 @@
 #include "core/layout.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_pair.h"
 #include "ops/common/dflash2_rmsnorm_rope_volta.h"
 
 #include <algorithm>
@@ -40,7 +41,11 @@ void require_weight(const Weight& weight, const char* name) {
         static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
     constexpr std::uint64_t kScaleBytes =
         static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden / 32) * 2U;
-    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+    bool layout_ok = weight.layout == QuantLayout::RowSplit;
+#ifdef NINFER_VOLTA_BUILD
+    layout_ok = layout_ok || weight.layout == QuantLayout::VoltaQpnPrepacked;
+#endif
+    if (weight.qtype != QType::W8G32_F16S || !layout_ok ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
         weight.ndim != 2 || weight.n != kKVSize || weight.k != kHidden ||
         weight.shape[0] != kKVSize || weight.shape[1] != kHidden ||
@@ -156,8 +161,13 @@ void context_kv_materialize(
         Tensor key   = workspace.alloc(DType::BF16, {kKVSize, width_columns});
         Tensor value = workspace.alloc(DType::BF16, {kKVSize, width_columns});
 
-        linear(context_flat, layer.key_weight, key, stream);
-        linear(context_flat, layer.value_weight, value, stream);
+        if (layer.key_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+            // Prepacked DFlash2 key/value views: one tensor-core launch for both.
+            linear_pair(context_flat, layer.key_weight, layer.value_weight, key, value, stream);
+        } else {
+            linear(context_flat, layer.key_weight, key, stream);
+            linear(context_flat, layer.value_weight, value, stream);
+        }
 
         Tensor key_heads = key.view({kHeadDim, kKVHeads, width_columns});
         detail::dflash2_rmsnorm_rope_launch(key_heads, layer.key_norm_weight, positions_flat,
