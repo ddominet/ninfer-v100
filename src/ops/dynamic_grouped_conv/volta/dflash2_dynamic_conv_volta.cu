@@ -201,6 +201,8 @@ struct Bf16VoltaTcDecoder {
     static constexpr int kItemsPerTileChunk = 256; // 32 rows x 8 vectors of 8
     static constexpr int kMinTokens         = 1;
     static constexpr bool kMandatory        = false;
+    static constexpr int kTargetCtas        = 320; // 20 row blocks: split K 16 ways
+    static constexpr int kMinChunks         = 2;
     struct Raw {
         uint4 q;
     };
