@@ -250,6 +250,43 @@ stays about 9% behind in throughput there. Ablations that did not help: early ex
 (acceptance collapses: P(>=1) 0.74 -> 0.57 at four of five layers), a ragged draft block (~1 ms),
 tensor-core NVFP4 (slower than quadpair).
 
+### DFlash-only round costs and the final comparison (2026-11-25)
+
+Profiling under the high-load chat phase showed DFlash2 rounds ~4 ms dearer than MTP K=3 rounds
+for the same tokens per round. Removed since:
+
+- the draft q|k|v and its context key/value pair, the gate/up and output projections, and the
+  131 MB feature projection run prepacked, on the tensor-core skinny GEMM past 16 columns (a
+  mandatory prepacked W8 decoder; prefill appends in 64-token launches);
+- layout copies: the verify outputs expand with 16-byte copies and leave dropped columns
+  unwritten, the GDN gate stays in the kept layout, the gated norm reads the recurrence output
+  through a column map, the GDN input projection writes q/k/v straight into the padded record,
+  and dropped record/g/beta columns are left unwritten (their readers stop at the valid counts);
+- the draft window attention runs one CTA per K/V head for all four query heads (one read of
+  each window per K/V head, 164 -> 91 us at four tokens);
+- the control projection loads 16 bytes a step;
+- the verify-cost model counts 8-column target tiles.
+
+Not kept: eight warps for narrow attention blocks (slower: narrow blocks run at large batches);
+the control projection on the tensor-core route (its 20 row blocks need deep split-K, whose
+serial fix-up costs more than it saves); the draft down projection on the tensor-core route
+(the quadpair kernel is faster to 32 columns).
+
+Seeded chat traffic, same build (5cd25b38) and card, wall time per output token and mean decode:
+
+| Load | MTP K=3 | DFlash2 x7 |
+|---|---|---|
+| ~0.4 active | 14.4 ms, 70.7 tok/s | 12.1 ms, 85.8 tok/s |
+| ~2 active | 18.6 ms, 55.3 tok/s | 17.0 ms, 62.0 tok/s |
+| ~8 active | 30.4 ms, 42.0 tok/s | 31.6 ms, 42.7 tok/s |
+
+At eight active requests the decode time per request is equal (14.90 vs 14.94 s); the remaining
+wall-time difference is time waiting for a free slot (4.7 vs 4.2 s mean), which varies as much
+between two MTP runs (4.2 and 4.6 s). Single-prompt decode is at or above the original
+baseline at every context (83.5 / 91.8 / 85.9 / 74.6 / 59.0 / 56.0 tok/s from 60 to 172K
+tokens) and long-prompt prefill is ~2% faster. The full suite passes except the
+gdn_gating_proj test, which failed before this work.
+
 ## Phase 0: kernel profile of one DFlash2 round
 
 A per-kernel profile (`nsys`) of both engines' DFlash2 decode round at 60, 24K and 89K tokens of
