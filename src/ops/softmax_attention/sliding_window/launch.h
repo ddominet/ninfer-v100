@@ -21,7 +21,8 @@ struct SlidingWindowAttentionPlan {
 
 [[nodiscard]] SlidingWindowAttentionPlan
 sliding_window_attention_resolve_plan(std::int32_t tokens,
-                                      SlidingWindowAttentionExecutionEnvelope envelope);
+                                      SlidingWindowAttentionExecutionEnvelope envelope,
+                                      std::int32_t batch_size = 1);
 [[nodiscard]] const char* sliding_window_attention_route_name(SlidingWindowAttentionRoute route);
 
 void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,

@@ -365,14 +365,26 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                 target_ctas =
                     narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
             else if (cache_storage == KvCacheStorage::Int8Group64)
+#ifdef NINFER_VOLTA_BUILD
+                // Volta has 80 SMs (2 CTAs/SM = 160 resident CTAs for direct_i8 staged).
+                // Keeping multi-stream batches within 1 resident wave avoids oversplitting and
+                // partial-accumulator DRAM overhead at 24K..172K.
+                target_ctas = envelope.max_visible_keys > 4096 ? 160 : 80;
+#else
                 target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
+#endif
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
                 target_ctas = narrow ? 320 : 160;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
             // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
             // key-tile rounding and page alignment at the 262144-key resource limit.
             const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
+#ifdef NINFER_VOLTA_BUILD
+            const int min_splits = envelope.max_visible_keys <= 1024 ? 2 : 4;
+            return std::min(capacity, std::max({min_splits, grid_limit, page_limit}));
+#else
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
+#endif
         }
         return capacity;
     }

@@ -52,7 +52,8 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 SlidingWindowAttentionPlan
 sliding_window_attention_resolve_plan(std::int32_t tokens,
-                                      SlidingWindowAttentionExecutionEnvelope envelope) {
+                                      SlidingWindowAttentionExecutionEnvelope envelope,
+                                      std::int32_t batch_size) {
     if (tokens < 1 || tokens > 16) {
         throw std::invalid_argument("sliding_window_attention plan: T must be 1..16");
     }
@@ -67,7 +68,18 @@ sliding_window_attention_resolve_plan(std::int32_t tokens,
     const std::uint32_t context_rows             = std::min(envelope.max_context, 4095u);
     const std::int32_t context_tiles =
         static_cast<std::int32_t>((context_rows + key_block - 1u) / key_block);
+#ifdef NINFER_VOLTA_BUILD
+    // 80 SMs on V100: grid is (8 KV heads, splits, batch_size). Target ~160 CTAs (2 waves at
+    // 1 CTA/SM, 1 wave at 2 CTAs/SM) so multi-stream batches do not oversplit and burn time in
+    // the split reducer (was 2,048 CTAs at B=8 with hardcoded split_limit=32).
+    const std::int32_t eff_batch   = std::max<std::int32_t>(1, batch_size);
+    const std::int32_t target_ctas = 160;
+    const std::int32_t split_limit =
+        std::clamp((target_ctas + 8 * eff_batch - 1) / (8 * eff_batch), 2, 20);
+#else
+    (void)batch_size;
     constexpr std::int32_t split_limit = 32;
+#endif
     return {
         .route =
             direct ? SlidingWindowAttentionRoute::Direct : SlidingWindowAttentionRoute::SplitKv,
@@ -99,11 +111,9 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
     if (q.ne[2] >= 1 && q.ne[2] <= 8 && context.capacity == 2048 &&
         plan.route == SlidingWindowAttentionRoute::SplitKv) {
         auto run = [&]<int Tokens>() {
-            // One CTA per K/V head serving its four query heads (see the GQA kernel).
-            constexpr int kRows = kContextQueryGroup * Tokens;
-            constexpr int kSmem = (2 * 32 * (kContextQueryHeadDim + 1) +
-                                   kRows * kContextQueryHeadDim + kRows * 32) *
-                                  static_cast<int>(sizeof(float));
+            // One CTA per K/V head serving its 4*Tokens query rows via Volta mma.m8n8k4.
+            constexpr int kThreads = sliding_window_volta_gqa_warps<Tokens>() * 32;
+            constexpr int kSmem    = sliding_window_volta_gqa_smem_bytes<Tokens>();
             static const bool configured = [] {
                 CUDA_CHECK(cudaFuncSetAttribute(
                     sliding_window_attention_volta_gqa_partial_kernel<Tokens>,
@@ -114,7 +124,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
             const dim3 partial_grid(kContextQueryKVHeads, plan.split_capacity,
                                     static_cast<unsigned>(q.ne[3]));
             sliding_window_attention_volta_gqa_partial_kernel<Tokens>
-                <<<partial_grid, kRows * 32, kSmem, stream>>>(
+                <<<partial_grid, kThreads, kSmem, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
                     static_cast<const __nv_bfloat16*>(query_v.data),

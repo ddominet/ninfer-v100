@@ -276,10 +276,15 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, KvCacheStorage cache_storage) {
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads;
+    const std::int32_t min_width =
+        (cache_storage == KvCacheStorage::Int8Group64 &&
+         detail::causal_attention_volta_paged_prefill_enabled())
+            ? 17
+            : detail::kVoltaFlashMinimumWidth;
     return supported_geometry && batch_size == 1 &&
            (cache_storage == KvCacheStorage::BFloat16 ||
             cache_storage == KvCacheStorage::Int8Group64) &&
-           width >= detail::kVoltaFlashMinimumWidth;
+           width >= min_width;
 }
 
 struct VoltaFlashWorkspace {

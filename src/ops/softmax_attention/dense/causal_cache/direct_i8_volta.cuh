@@ -490,7 +490,7 @@ constexpr int causal_attention_staged_i8_smem_bytes(int tiles) {
 // kernel measured 11-28% faster from 8K to 172K keys (305 -> 220 us at 24K, 829 -> 674 at 90K).
 // Two CTAs of the six-tile form use 92 KB of shared memory, inside the 96 KB carve-out.
 template <int Warps>
-inline constexpr int kStagedMinBlocks = Warps >= 5 ? 2 : 1;
+inline constexpr int kStagedMinBlocks = Warps >= 3 ? 2 : 3;
 
 #define __syncthreads() __syncthreads()
 template <typename Geometry, int Warps>

@@ -846,6 +846,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
                                 "DFlash exact-b graph allowance");
             }
+            if (const char* env = std::getenv("NINFER_GRAPH_ALLOWANCE_MIB"); env != nullptr) {
+                const long mib = std::strtol(env, nullptr, 10);
+                if (mib > 0) {
+                    impl->graph_allowance_bytes = static_cast<std::size_t>(mib) * kMiB;
+                }
+            }
         }
     }
 

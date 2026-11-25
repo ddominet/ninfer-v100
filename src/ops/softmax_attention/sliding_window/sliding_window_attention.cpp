@@ -102,7 +102,8 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
         throw std::invalid_argument(
             "sliding_window_attention workspace: invalid envelope or token interval");
     }
-    const auto plan = detail::sliding_window_attention_resolve_plan(max_tokens, envelope);
+    const auto plan =
+        detail::sliding_window_attention_resolve_plan(max_tokens, envelope, batch_size);
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, max_tokens, plan.split_capacity, batch_size);
     return layout.peak_bytes(1);
@@ -159,7 +160,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     }
 
     auto scope               = workspace.scope();
-    const auto plan          = detail::sliding_window_attention_resolve_plan(tokens, envelope);
+    const auto plan = detail::sliding_window_attention_resolve_plan(tokens, envelope, batch);
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
                                             scale, context, plan, partial.acc, partial.m, partial.l,

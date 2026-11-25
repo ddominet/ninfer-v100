@@ -18,7 +18,11 @@
 #include <cstdint>
 
 #ifndef NINFER_CAUSAL_DIRECT_MIN_WINDOW
+#ifdef NINFER_VOLTA_BUILD
+#define NINFER_CAUSAL_DIRECT_MIN_WINDOW 64
+#else
 #define NINFER_CAUSAL_DIRECT_MIN_WINDOW 2048
+#endif
 #endif
 
 namespace ninfer::ops {
@@ -110,7 +114,7 @@ inline constexpr int kCausalDirectMinWindow = NINFER_CAUSAL_DIRECT_MIN_WINDOW;
 inline constexpr int kCausalDirectMaxTokens = 8;
 inline constexpr int kCausalDirectMaxSplits = 176;
 // Windows at which the keys-per-split tier, and so the split count, steps down.
-inline constexpr int kCausalDirectTierEnds[] = {3072, 4096, 12288};
+inline constexpr int kCausalDirectTierEnds[] = {512, 3072, 4096, 12288};
 
 // Six to eight tokens run the staged kernel at two CTAs per SM (direct_i8_volta.cuh); past 120
 // splits its extra CTAs cost more in partial writes and reduction than they add in parallelism
@@ -118,11 +122,13 @@ inline constexpr int kCausalDirectTierEnds[] = {3072, 4096, 12288};
 inline constexpr int kCausalDirectWideMaxSplits = 120;
 
 __host__ __device__ constexpr int causal_direct_splits(int window, int tokens) {
-    const int keys = tokens == 1 ? (window <= 4096 ? 64 : window <= 12288 ? 128 : 256)
-                                 : (window <= 3072 ? 128 : window <= 12288 ? 256 : 512);
+    const int keys = tokens == 1
+                         ? (window <= 512 ? 32 : window <= 4096 ? 64 : window <= 12288 ? 128 : 256)
+                         : (window <= 512 ? 64 : window <= 3072 ? 128 : window <= 12288 ? 256 : 512);
     const int cap    = tokens >= 6 ? kCausalDirectWideMaxSplits : kCausalDirectMaxSplits;
     const int splits = (window + keys - 1) / keys;
-    return splits < 4 ? 4 : (splits > cap ? cap : splits);
+    const int floor  = window <= 128 ? 1 : (window <= 256 ? 2 : 4);
+    return splits < floor ? floor : (splits > cap ? cap : splits);
 }
 
 template <typename Geometry, bool Int8>

@@ -464,10 +464,24 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
     out.candidate_selector.hidden_projection =
         bind_weight(binder, "dflash2/candidate_selector/hidden_projection", NumericFormat::BF16,
                     {256, 5120}, placement);
-    out.candidate_selector.predecessor_codebook = bind_tensor(
-        "dflash2/candidate_selector/predecessor_codebook", NumericFormat::BF16, {248320, 256});
-    out.candidate_selector.successor_codebook = bind_tensor(
-        "dflash2/candidate_selector/successor_codebook", NumericFormat::BF16, {248320, 256});
+    // The selector codebooks (2 x 248320 x 256 BF16 = 243 MiB) are token-ID gathered once per
+    // decode round (at most ~450 KiB/round). On Volta, keep them in pinned host-mapped memory like
+    // the token embedding to free 243 MiB of VRAM for KV/graph headroom.
+    artifact::TensorPlacement codebook_placement = placement;
+#ifdef NINFER_VOLTA_BUILD
+    if (placement == artifact::TensorPlacement::Device) {
+        const char* value = std::getenv("NINFER_HOST_SELECTOR_CODEBOOKS");
+        if (value == nullptr || value[0] != '0') {
+            codebook_placement = artifact::TensorPlacement::HostMapped;
+        }
+    }
+#endif
+    out.candidate_selector.predecessor_codebook =
+        artifact::bind_tensor(binder, "dflash2/candidate_selector/predecessor_codebook",
+                              NumericFormat::BF16, {248320, 256}, codebook_placement);
+    out.candidate_selector.successor_codebook =
+        artifact::bind_tensor(binder, "dflash2/candidate_selector/successor_codebook",
+                              NumericFormat::BF16, {248320, 256}, codebook_placement);
     return out;
 }
 
