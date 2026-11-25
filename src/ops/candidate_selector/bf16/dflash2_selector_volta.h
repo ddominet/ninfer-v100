@@ -16,6 +16,7 @@ void dflash2_candidate_selector_walk_launch(const Tensor& candidate_ids, const T
                                             const SamplingConfig* configs,
                                             const Tensor& predecessor_codebook,
                                             const Tensor& successor_codebook, Tensor& drafts,
-                                            Tensor& proposal_q, cudaStream_t stream);
+                                            Tensor& proposal_q, cudaStream_t stream,
+                                            float* draft_confidence = nullptr);
 
 } // namespace ninfer::ops::detail

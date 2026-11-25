@@ -48,6 +48,6 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream);
+                             cudaStream_t stream, Tensor* draft_confidence = nullptr);
 
 } // namespace ninfer::ops

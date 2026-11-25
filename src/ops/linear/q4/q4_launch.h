@@ -61,6 +61,7 @@ void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
 // consuming a whole cache line per lane per iteration.
 constexpr std::int32_t kVoltaQpnMinT    = 5;
 constexpr std::int32_t kVoltaQpnMaxT    = 8;
+constexpr std::int32_t kVoltaQpnTopKPrepackedMaxT = 32;
 constexpr std::int32_t kVoltaQpnMinRows = 4096;
 constexpr std::int32_t kVoltaQpnRowsPerTopKProducer = 32;
 

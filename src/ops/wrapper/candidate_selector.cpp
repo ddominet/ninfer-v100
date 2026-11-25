@@ -89,7 +89,7 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, Tensor* draft_confidence) {
     const std::int32_t batch_size = candidate_ids.ne[2];
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
@@ -115,9 +115,17 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                        successor_codebook, base_positions, configs, drafts, proposal_q);
 
     (void)workspace;
+    float* conf_ptr = nullptr;
+    if (draft_confidence != nullptr && draft_confidence->data != nullptr) {
+        if (draft_confidence->dtype != DType::FP32 || draft_confidence->ne[0] != kSteps ||
+            draft_confidence->ne[1] != batch_size || !draft_confidence->is_contiguous()) {
+            throw std::invalid_argument("candidate_selector_path: invalid draft_confidence");
+        }
+        conf_ptr = static_cast<float*>(draft_confidence->data);
+    }
     detail::dflash2_candidate_selector_walk_launch(
         candidate_ids, unary_scores, projected_hidden, anchors, base_positions, configs,
-        predecessor_codebook, successor_codebook, drafts, proposal_q, stream);
+        predecessor_codebook, successor_codebook, drafts, proposal_q, stream, conf_ptr);
 }
 
 } // namespace ninfer::ops

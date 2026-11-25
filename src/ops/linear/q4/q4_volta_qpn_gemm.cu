@@ -1,8 +1,10 @@
 #include "core/device.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q4/q4_volta_qpn_gemm.cuh"
+#include "ops/linear/volta_fp16_stage.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <stdexcept>
 
@@ -65,19 +67,46 @@ void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
     const std::int32_t t = x.ne[1];
     const std::int32_t padded_groups = w.padded_shape[1] / Q4RowSplitStorage::kGroupK;
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
+    const half* x_fp16 = volta_stage_fp16_activation(x, stream);
+    const auto* ids    = static_cast<const std::int32_t*>(row_to_global_ids.data);
+    const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* scales = static_cast<const std::uint8_t*>(w.scales);
+
+    const auto dispatch_tiles = [&]<int kTiles, int kBlk, bool kPrepacked>() {
+        if (x_fp16 != nullptr) {
+            q4_volta_qpn_gemm_kernel<kTiles, kBlk, true, kPrepacked, half>
+                <<<grid, S::kThreads, 0, stream>>>(codes, scales, x_fp16, nullptr, n, k, t,
+                                                   padded_groups, 0, ids, partial_keys,
+                                                   producer_groups);
+        } else {
+            q4_volta_qpn_gemm_kernel<kTiles, kBlk, true, kPrepacked, __nv_bfloat16>
+                <<<grid, S::kThreads, 0, stream>>>(codes, scales,
+                                                   static_cast<const __nv_bfloat16*>(x.data),
+                                                   nullptr, n, k, t, padded_groups, 0, ids,
+                                                   partial_keys, producer_groups);
+        }
+    };
+
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        // Two groups a lane per block measured best on the prepacked layout (770 vs 913 us).
-        q4_volta_qpn_gemm_kernel<1, 2, true, true><<<grid, S::kThreads, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-            static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
-            static_cast<const std::int32_t*>(row_to_global_ids.data), partial_keys,
-            producer_groups);
+        if (t <= 8) {
+            dispatch_tiles.template operator()<1, 2, true>();
+        } else if (t <= 16) {
+            dispatch_tiles.template operator()<2, 2, true>();
+        } else if (t <= 24) {
+            dispatch_tiles.template operator()<3, 2, true>();
+        } else if (t <= 32) {
+            dispatch_tiles.template operator()<4, 2, true>();
+        } else {
+            throw std::invalid_argument("Q4 QPN top-K: prepacked launch supports T <= 32");
+        }
     } else {
-        q4_volta_qpn_gemm_kernel<1, 4, true><<<grid, S::kThreads, 0, stream>>>(
-            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-            static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
-            static_cast<const std::int32_t*>(row_to_global_ids.data), partial_keys,
-            producer_groups);
+        if (t <= 8) {
+            dispatch_tiles.template operator()<1, 4, false>();
+        } else if (t <= 16) {
+            dispatch_tiles.template operator()<2, 4, false>();
+        } else {
+            throw std::invalid_argument("Q4 QPN top-K: row-split launch supports T <= 16");
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

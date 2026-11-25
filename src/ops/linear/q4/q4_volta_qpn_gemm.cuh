@@ -56,6 +56,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -78,10 +79,13 @@ struct Q4VoltaQpnSchedule {
 // `kPrepacked` reads the load-time order of q4_prepack_sm70.cu: codes [tile][group][lane][32 B]
 // and scales [tile][group][lane], so a warp's 32 lanes read one contiguous 1 KB line per group
 // instead of 32 rows a row pitch apart (1.4x on the 131,072-row DFlash2 proposal head).
-template <int kTiles, int kBlk, bool kProduceTopK = false, bool kPrepacked = false>
-__global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_gemm_kernel(
+template <int kTiles, int kBlk, bool kProduceTopK = false, bool kPrepacked = false,
+          typename Activation = __nv_bfloat16>
+__global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads,
+                             kTiles == 1 ? 8 : (kTiles == 2 ? 6 : 4)) void
+q4_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
+    const Activation* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
     int padded_groups, int out_ld, const std::int32_t* __restrict__ row_to_global_ids = nullptr,
     std::uint64_t* __restrict__ partial_keys = nullptr, int producer_groups = 0) {
     using S = Q4VoltaQpnSchedule;
@@ -192,16 +196,26 @@ __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_
                 const int row = tile * S::kRowsPerTile + r;
                 half2 a[4];
                 if (row < t) {
-                    const __nv_bfloat16* xrow = x + static_cast<std::int64_t>(row) * k + kbase;
-                    const uint4 raw           = *reinterpret_cast<const uint4*>(xrow);
-                    const auto* src           = reinterpret_cast<const __nv_bfloat16*>(&raw);
-                    __half tmp[8];
+                    const Activation* xrow = x + static_cast<std::int64_t>(row) * k + kbase;
+                    if constexpr (std::is_same_v<Activation, half>) {
+                        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(xrow));
+                        a[0]            = *reinterpret_cast<const half2*>(&raw.x);
+                        a[1]            = *reinterpret_cast<const half2*>(&raw.y);
+                        a[2]            = *reinterpret_cast<const half2*>(&raw.z);
+                        a[3]            = *reinterpret_cast<const half2*>(&raw.w);
+                    } else {
+                        const uint4 raw = *reinterpret_cast<const uint4*>(xrow);
+                        const auto* src = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                        __half tmp[8];
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        tmp[j] = __float2half(__bfloat162float(src[j]));
+                        for (int j = 0; j < 8; ++j) {
+                            tmp[j] = __float2half(__bfloat162float(src[j]));
+                        }
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            a[j] = *reinterpret_cast<const half2*>(tmp + 2 * j);
+                        }
                     }
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) { a[j] = *reinterpret_cast<const half2*>(tmp + 2 * j); }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 4; ++j) { a[j] = __half2half2(__ushort_as_half(0)); }
@@ -242,7 +256,8 @@ __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_
             }
         }
     } else {
-        static_assert(kTiles == 1, "the DFlash2 fused top-K route is limited to T <= 8");
+        static_assert(kTiles >= 1 && kTiles <= 4,
+                      "the DFlash2 fused top-K route supports T <= 32 (kTiles 1..4)");
         // The QPN CTA already owns exactly 32 vocabulary rows. Reduce its four K partitions,
         // reproduce the materialized BF16-logit rounding boundary, sort the 32 order keys in a
         // warp, and emit the best 16 directly. The ordinary merge kernels combine CTA winners.

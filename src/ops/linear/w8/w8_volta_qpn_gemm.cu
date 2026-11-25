@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "ops/dynamic_grouped_conv/volta/dflash2_dynamic_conv_volta.h"
 #include "ops/linear/w8/w8_launch.h"
 #include "ops/linear/w8/w8_volta_qpn_gemm.cuh"
 #include "ops/linear/volta_fp16_stage.h"
@@ -207,6 +208,29 @@ void w8_qpn_launch_packed(const Tensor& x, const half* x_fp16, const std::uint8_
                     ? launch_volta_tc_skinny(decoder, x_half, n, k, t, 0, policy, stream)
                     : launch_volta_tc_skinny(decoder, x_bf16, n, k, t, 0, policy, stream)) {
                 continue;
+            }
+        } else if constexpr (E == W8QpnEpilogue::DynamicConvAdd) {
+            // Draft down projections (5120 x 17408) past 16 tokens: project once through
+            // volta_tc_skinny into the L2-resident 1 MiB stream scratch (<=640 KiB) and finish
+            // with the 2-tap dynamic conv + residual add (~85 us vs 144 us on quadpair kTiles=4).
+            if (t > 16 && n == 5120 && width > 0 && (t % width) == 0) {
+                auto* scratch = static_cast<__nv_bfloat16*>(volta_stream_scratch(
+                    stream, static_cast<std::size_t>(n) * t * sizeof(__nv_bfloat16)));
+                if (scratch != nullptr) {
+                    const W8VoltaTcOptionalDecoder decoder{
+                        {reinterpret_cast<const uint4*>(codes),
+                         reinterpret_cast<const __half*>(scales), k / 128}};
+                    const W8TcEpilogueOutput<W8QpnEpilogue::Store> policy{scratch, n};
+                    const bool launched =
+                        x_half != nullptr
+                            ? launch_volta_tc_skinny(decoder, x_half, n, k, t, 0, policy, stream)
+                            : launch_volta_tc_skinny(decoder, x_bf16, n, k, t, 0, policy, stream);
+                    if (launched) {
+                        dflash2_dynamic_conv_finish_add_launch(scratch, delta_chunk, base, width,
+                                                               t / width, residual_chunk, stream);
+                        continue;
+                    }
+                }
             }
         }
 #define NINFER_W8_PACKED(TILES, SPLITK)                                                          \

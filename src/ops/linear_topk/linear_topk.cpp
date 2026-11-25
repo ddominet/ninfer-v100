@@ -134,10 +134,12 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
     // over chunks of 5..8 columns. Each chunk reads the head once (about 0.45 ms); the dense
     // BF16 logits route below writes and re-reads a 131,072-row logit plane per column instead.
     const std::int32_t total = hidden.ne[1];
-    const std::int32_t chunks = (total + detail::kVoltaQpnMaxT - 1) / detail::kVoltaQpnMaxT;
-    // A load-time prepacked head is readable only by the fused route, so it takes every column
-    // count (chunks below five columns are correct, only slower than the dense route).
-    const bool prepacked = head.layout == QuantLayout::VoltaQpnPrepacked;
+    // A load-time prepacked head reads the 356.5 MiB weight once for up to 32 proposal positions
+    // (kTiles 1..4) with FP16-staged activations, avoiding 3-7x weight re-reads under concurrency.
+    const bool prepacked         = head.layout == QuantLayout::VoltaQpnPrepacked;
+    const std::int32_t max_chunk = prepacked ? detail::kVoltaQpnTopKPrepackedMaxT
+                                             : detail::kVoltaQpnMaxT;
+    const std::int32_t chunks    = (total + max_chunk - 1) / max_chunk;
     if (profile == HeadProfile::Q4Optimized &&
         (prepacked || (total >= detail::kVoltaQpnMinT && total / chunks >= detail::kVoltaQpnMinT))) {
         for (std::int32_t chunk = 0, first = 0; chunk < chunks; ++chunk) {
@@ -186,9 +188,9 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
     const std::int32_t chunk = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
     std::size_t capacity = static_cast<std::size_t>(head_rows) * chunk * sizeof(std::uint16_t);
 #ifdef NINFER_VOLTA_BUILD
-    // Fused chunks of at most eight columns (a prepacked head takes every count).
+    // Fused chunks of up to 32 columns for the prepacked Q4 head.
     if (qtype == QType::Q4G64_F16S && head_rows == detail::kLinearTopKOptimizedRows) {
-        const int columns = std::min(max_columns, detail::kVoltaQpnMaxT);
+        const int columns = std::min(max_columns, detail::kVoltaQpnTopKPrepackedMaxT);
         WorkspaceLayoutBuilder layout;
         (void)detail::allocate_linear_topk_workspace(
             layout, head_rows, columns, detail::kVoltaQpnRowsPerTopKProducer);

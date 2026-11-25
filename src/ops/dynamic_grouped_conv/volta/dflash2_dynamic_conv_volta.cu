@@ -11,9 +11,11 @@
 // `finish_delta` [group(320) x tap(2) x col]. add (side 1) reads that `finish_delta` back.
 
 #include "core/device.h"
+#include "ops/common/volta_mma.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <algorithm>
 #include <cstdint>
 
@@ -118,76 +120,96 @@ __global__ void dflash2_bf16_matvec_kernel(const __nv_bfloat16* __restrict__ w,
     }
 }
 
-// Four weight rows a CTA: each activation value is loaded once and used by four rows, 8 K values
-// a thread per step in 16-byte loads. One row a CTA reread every activation column per weight row
-// (~200 MB of cache traffic for the 13 MB weight at 16 columns, 104 us); scalar 2-byte loads still
-// held four rows at 64 us.
-template <int kCols>
-__global__ __launch_bounds__(128) void dflash2_bf16_control_rows4_kernel(
-    const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16* __restrict__ out, int cols) {
-    constexpr int kRows  = 1280;
-    constexpr int k      = 5120;
-    constexpr int kTile  = 4;
-    constexpr int kWarps = 4;
-    constexpr int kVec   = 8;
-    const int row0       = static_cast<int>(blockIdx.x) * kTile;
-    const int lane       = static_cast<int>(threadIdx.x) & 31;
-    const int warp       = static_cast<int>(threadIdx.x) >> 5;
-    float acc[kTile][kCols] = {};
+// Volta HMMA (mma.sync.m8n8k4) BF16 projection for DFlash2 control (N=1280, K=5120) and
+// candidate-selector hidden projection (N=256, K=5120). Each CTA owns 8 output rows with 4
+// K-split warps (160 CTAs = 2.0 exact waves on 80 SMs for N=1280; zero global semaphores or
+// partials). One 16-byte weight load feeds all 32*kColTiles columns via Tensor Cores.
+__device__ __forceinline__ void bf16x8_to_half2x4(uint4 raw, unsigned& h0, unsigned& h1,
+                                                  unsigned& h2, unsigned& h3) {
+    const auto* p   = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    const float2 f0 = __bfloat1622float2(p[0]);
+    const float2 f1 = __bfloat1622float2(p[1]);
+    const float2 f2 = __bfloat1622float2(p[2]);
+    const float2 f3 = __bfloat1622float2(p[3]);
+    const __half2 q0 = __floats2half2_rn(f0.x, f0.y);
+    const __half2 q1 = __floats2half2_rn(f1.x, f1.y);
+    const __half2 q2 = __floats2half2_rn(f2.x, f2.y);
+    const __half2 q3 = __floats2half2_rn(f3.x, f3.y);
+    h0 = *reinterpret_cast<const unsigned*>(&q0);
+    h1 = *reinterpret_cast<const unsigned*>(&q1);
+    h2 = *reinterpret_cast<const unsigned*>(&q2);
+    h3 = *reinterpret_cast<const unsigned*>(&q3);
+}
 
-    for (int i = static_cast<int>(threadIdx.x) * kVec; i < k; i += 128 * kVec) {
-        float wv[kTile][kVec];
+template <int kColTiles>
+__global__ __launch_bounds__(128) void dflash2_bf16_hmma_kernel(
+    const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ out, int n_rows, int k, int cols) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+    constexpr int kWarps  = 4;
+    constexpr int kMaxCol = kColTiles * 32;
+    const int row0        = static_cast<int>(blockIdx.x) * 8;
+    const int tid         = static_cast<int>(threadIdx.x);
+    const int lane        = tid & 31;
+    const int warp        = tid >> 5;
+    const int r           = (lane & 3) + ((lane & 16) ? 4 : 0);
+    const int qp          = (lane >> 2) & 3;
+    const int b_sel       = qp * 4 + (lane & 3) + ((lane & 16) ? 16 : 0);
+
+    float d[kColTiles][8];
 #pragma unroll
-        for (int r = 0; r < kTile; ++r) {
-            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(
-                w + static_cast<std::int64_t>(row0 + r) * k + i));
-            const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    for (int ct = 0; ct < kColTiles; ++ct) {
 #pragma unroll
-            for (int e = 0; e < kVec / 2; ++e) {
-                const float2 f = __bfloat1622float2(pairs[e]);
-                wv[r][2 * e]     = f.x;
-                wv[r][2 * e + 1] = f.y;
-            }
-        }
+        for (int i = 0; i < 8; ++i) { d[ct][i] = 0.0f; }
+    }
+
+    const int k_per_warp = (k / 8) / kWarps;
+    const int kk_begin   = warp * k_per_warp * 8;
+    const int kk_end     = (warp == kWarps - 1) ? k : (warp + 1) * k_per_warp * 8;
+    const __nv_bfloat16* w_row = w + static_cast<std::int64_t>(row0 + r) * k;
+
+    for (int kk = kk_begin; kk < kk_end; kk += 8) {
+        const uint4 a_raw = __ldg(reinterpret_cast<const uint4*>(w_row + kk));
+        unsigned a0, a1, a2, a3;
+        bf16x8_to_half2x4(a_raw, a0, a1, a2, a3);
 #pragma unroll
-        for (int col = 0; col < kCols; ++col) {
+        for (int ct = 0; ct < kColTiles; ++ct) {
+            const int col = ct * 32 + b_sel;
+            unsigned b0 = 0u, b1 = 0u, b2 = 0u, b3 = 0u;
             if (col < cols) {
-                const uint4 raw = __ldg(
-                    reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(col) * k + i));
-                const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
-#pragma unroll
-                for (int e = 0; e < kVec / 2; ++e) {
-                    const float2 f = __bfloat1622float2(pairs[e]);
-#pragma unroll
-                    for (int r = 0; r < kTile; ++r) {
-                        acc[r][col] = fmaf(wv[r][2 * e], f.x, acc[r][col]);
-                        acc[r][col] = fmaf(wv[r][2 * e + 1], f.y, acc[r][col]);
-                    }
-                }
+                const uint4 b_raw =
+                    __ldg(reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(col) * k + kk));
+                bf16x8_to_half2x4(b_raw, b0, b1, b2, b3);
             }
+            volta_mma_qp_n(d[ct], a0, a1, b0, b1);
+            volta_mma_qp_n(d[ct], a2, a3, b2, b3);
         }
     }
 
-    __shared__ float sums[kWarps][kTile][kCols];
+    __shared__ float smem[kWarps][8][kMaxCol];
+    const int c_row_lo = ((lane & 16) ? 4 : 0) | (lane & 1);
+    const int c_sel    = qp * 4 + (((lane >> 1) & 1) << 1);
 #pragma unroll
-    for (int r = 0; r < kTile; ++r) {
+    for (int ct = 0; ct < kColTiles; ++ct) {
 #pragma unroll
-        for (int col = 0; col < kCols; ++col) {
-            const float total = warp_reduce_sum(acc[r][col]);
-            if (lane == 0) { sums[warp][r][col] = total; }
+        for (int i = 0; i < 8; ++i) {
+            const int rr = (i & 2) | c_row_lo;
+            const int cc = ct * 32 + c_sel + (i & 1) + ((i >> 2) << 4);
+            smem[warp][rr][cc] = d[ct][i];
         }
     }
     __syncthreads();
-    for (int e = static_cast<int>(threadIdx.x); e < kTile * kCols; e += 128) {
-        const int r   = e / kCols;
-        const int col = e % kCols;
-        if (col < cols) {
+
+    for (int e = tid; e < 8 * kMaxCol; e += 128) {
+        const int rr = e & 7;
+        const int cc = e >> 3;
+        if (cc < cols) {
             const float total =
-                (sums[0][r][col] + sums[2][r][col]) + (sums[1][r][col] + sums[3][r][col]);
-            out[row0 + r + static_cast<std::int64_t>(col) * kRows] = __float2bfloat16_rn(total);
+                (smem[0][rr][cc] + smem[2][rr][cc]) + (smem[1][rr][cc] + smem[3][rr][cc]);
+            out[row0 + rr + static_cast<std::int64_t>(cc) * n_rows] = __float2bfloat16_rn(total);
         }
     }
+#endif
 }
 
 } // namespace
@@ -207,27 +229,20 @@ void dflash2_dynamic_conv_prepare_launch(const __nv_bfloat16* n, const __nv_bflo
 void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_bfloat16* x,
                                            int n_rows, int k, int cols, __nv_bfloat16* out,
                                            cudaStream_t stream) {
-    // Up to 16 columns a launch through the four-row kernel: each weight row is read once for all
-    // of them, where the scalar fallback rereads every weight row per column (0.9 ms a call at
-    // eight requests). The vectorized reduction order differs from the scalar fallback's, so the
-    // two agree to rounding, not bit for bit (the projection feeds the draft only).
     int first = 0;
     const bool aligned16 =
         ((reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(x)) & 15u) == 0;
-    if (n_rows == 1280 && k == 5120 && aligned16) {
-        // Any remainder takes the narrowest wide form that holds it: a 15-column block (three
-        // drafts for five requests) was 8 + 7 scalar columns, the scalar part 124 us a call.
-        // The 16-byte loads need 16-byte aligned rows (k = 5120 keeps every row aligned).
+    if ((n_rows % 8) == 0 && (k % 32) == 0 && aligned16) {
         while (first < cols) {
-            const int block = std::min(16, cols - first);
-            if (block > 8) {
-                dflash2_bf16_control_rows4_kernel<16><<<n_rows / 4, 128, 0, stream>>>(
+            const int block = std::min(64, cols - first);
+            if (block > 32) {
+                dflash2_bf16_hmma_kernel<2><<<n_rows / 8, 128, 0, stream>>>(
                     w, x + static_cast<std::int64_t>(first) * k,
-                    out + static_cast<std::int64_t>(first) * n_rows, block);
+                    out + static_cast<std::int64_t>(first) * n_rows, n_rows, k, block);
             } else {
-                dflash2_bf16_control_rows4_kernel<8><<<n_rows / 4, 128, 0, stream>>>(
+                dflash2_bf16_hmma_kernel<1><<<n_rows / 8, 128, 0, stream>>>(
                     w, x + static_cast<std::int64_t>(first) * k,
-                    out + static_cast<std::int64_t>(first) * n_rows, block);
+                    out + static_cast<std::int64_t>(first) * n_rows, n_rows, k, block);
             }
             CUDA_CHECK(cudaGetLastError());
             first += block;
