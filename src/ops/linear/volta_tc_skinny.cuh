@@ -242,8 +242,7 @@ struct VoltaTcSchedule {
 // Measured on the 27B FP8 projection shapes (volta_tc_skinny_bench --sweep): 64-row CTAs, and K
 // split only until about 160 CTAs are in flight (the 5120-row output projection splits in two;
 // the 14336- and 16384-row input projections do not split).
-inline VoltaTcSchedule volta_tc_schedule(int n, int k, int t, int target_ctas = 160,
-                                         int min_chunks = 8) {
+inline VoltaTcSchedule volta_tc_schedule(int n, int k, int t) {
     const VoltaTcControl& control = volta_tc_control();
     VoltaTcSchedule schedule;
     // The 16384-row GDN input projection measured best at 128 rows up to 32 tokens (191 vs
@@ -254,10 +253,7 @@ inline VoltaTcSchedule volta_tc_schedule(int n, int k, int t, int target_ctas = 
     int splits          = control.splits;
     if (splits == 0) {
         splits = 1;
-        while (splits < 16 && blocks * splits < target_ctas &&
-               chunks / (splits * 2) >= min_chunks) {
-            splits *= 2;
-        }
+        while (splits < 8 && blocks * splits < 160 && chunks / (splits * 2) >= 8) { splits *= 2; }
     }
     schedule.splits = splits;
     return schedule;
@@ -309,17 +305,7 @@ bool launch_volta_tc_skinny(const Decoder& decoder, const Activation* x, int n, 
     // A mandatory decoder is the only reader of its weight layout: it runs whatever the controls.
     if (!Decoder::kMandatory && !volta_tc_applies(n, k, t, Decoder::kMinTokens)) { return false; }
     if (reinterpret_cast<std::uintptr_t>(x) % 16 != 0) { return false; }
-    // A decoder may ask for more CTAs: the 1280-row BF16 control weight split four ways left 80
-    // CTAs streaming two bytes a weight.
-    constexpr int kTargetCtas = [] {
-        if constexpr (requires { Decoder::kTargetCtas; }) { return Decoder::kTargetCtas; }
-        return 160;
-    }();
-    constexpr int kMinChunks = [] {
-        if constexpr (requires { Decoder::kMinChunks; }) { return Decoder::kMinChunks; }
-        return 8;
-    }();
-    const VoltaTcSchedule schedule = volta_tc_schedule(n, k, t, kTargetCtas, kMinChunks);
+    const VoltaTcSchedule schedule = volta_tc_schedule(n, k, t);
     if (schedule.rows != 64 && schedule.rows != 128) { return false; }
     if (n % schedule.rows != 0) { return false; }
     VoltaTcSplitWorkspace workspace{};
