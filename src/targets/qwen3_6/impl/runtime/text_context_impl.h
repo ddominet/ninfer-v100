@@ -807,9 +807,14 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
             Tensor flat_tokens_row     = flat_tokens.view({1, columns});
             const Tensor tokens_c_row  = tokens_c.view({1, live});
-            ops::gather_columns_group({&hidden_c, &logits_c, &tokens_c_row, nullptr},
-                                      {&flat_hidden, &flat_logits, &flat_tokens_row, nullptr},
-                                      padded_slots, stream);
+            // Acceptance reads each request's verified extent, which is its kept columns: the
+            // dropped columns of the padded hidden and logits are never read, so they are not
+            // zeroed. The 4-byte token row goes separately: in the group it held the
+            // vocabulary-wide logits to 4-byte copies (192 us a round, the costliest gather).
+            ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
+                                      {&flat_hidden, &flat_logits, nullptr, nullptr},
+                                      padded_slots, stream, false);
+            ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
             active_tap_scratch_ = Tensor{};
         }
     }

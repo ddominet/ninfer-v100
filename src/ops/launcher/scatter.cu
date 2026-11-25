@@ -89,6 +89,7 @@ __global__ void gather_columns_group_kernel(GatherColumnsGroup group,
     const std::int64_t end   = begin + chunk_words < words ? begin + chunk_words : words;
     const std::int32_t from  = indices[column];
     auto* out = static_cast<Word*>(group.destination[pair]) + column * words;
+    if (from < 0 && !group.zero_dropped) { return; }
     if (from < 0) {
         for (std::int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) { out[i] = Word{}; }
         return;

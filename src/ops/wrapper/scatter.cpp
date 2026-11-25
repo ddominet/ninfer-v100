@@ -53,8 +53,9 @@ void gather_columns(const Tensor& source, const Tensor& indices, Tensor& destina
 }
 
 void gather_columns_group(const Tensor* const (&sources)[4], Tensor* const (&destinations)[4],
-                          const Tensor& indices, cudaStream_t stream) {
+                          const Tensor& indices, cudaStream_t stream, bool zero_dropped) {
     detail::GatherColumnsGroup group;
+    group.zero_dropped = zero_dropped;
     const std::int32_t columns = indices.ne[0];
     for (int i = 0; i < 4; ++i) {
         if (sources[i] == nullptr) { break; }

@@ -104,9 +104,11 @@ void gather_columns(const Tensor& source, const Tensor& indices, Tensor& destina
 /**
  * gather_columns over up to four (source, destination) pairs sharing one index list, in one
  * launch. Each pair follows gather_columns' contract; pairs may differ in dtype and row count but
- * every destination has indices.ne[0] columns. Unused trailing pairs are null.
+ * every destination has indices.ne[0] columns. Unused trailing pairs are null. With
+ * `zero_dropped` false, destination columns whose index is negative are left untouched instead of
+ * zeroed (for consumers that never read them).
  */
 void gather_columns_group(const Tensor* const (&sources)[4], Tensor* const (&destinations)[4],
-                          const Tensor& indices, cudaStream_t stream);
+                          const Tensor& indices, cudaStream_t stream, bool zero_dropped = true);
 
 } // namespace ninfer::ops

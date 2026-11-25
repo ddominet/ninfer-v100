@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace ninfer;
@@ -196,6 +197,67 @@ int gather_case(DType dtype, std::int32_t rows, const std::vector<std::int32_t>&
     return (same ? 0 : 1) + device_destination.verify_guards("gather_columns destination");
 }
 
+// gather_columns_group: two pairs (BF16 `rows_a` and FP32 `rows_b` rows) sharing one index list.
+// With zero_dropped, -1 columns become zeros; without, they keep the destination's old bytes.
+int gather_group_case(std::int32_t rows_a, std::int32_t rows_b,
+                      const std::vector<std::int32_t>& indices, std::int32_t source_columns,
+                      bool zero_dropped) {
+    const std::int32_t columns = static_cast<std::int32_t>(indices.size());
+    int failures               = 0;
+    const auto run = [&](std::int32_t rows, DType dtype, std::size_t element, std::uint32_t seed,
+                         GuardedDeviceBuffer& source, GuardedDeviceBuffer& destination,
+                         std::vector<std::uint8_t>& expected) {
+        const std::size_t column_bytes = static_cast<std::size_t>(rows) * element;
+        std::vector<std::uint8_t> host(column_bytes * source_columns);
+        for (std::size_t i = 0; i < host.size(); ++i) {
+            host[i] = static_cast<std::uint8_t>((i * 2654435761u + seed) >> 7);
+        }
+        source.copy_from_host(host.data(), host.size());
+        destination.fill(0x5a);
+        expected.assign(column_bytes * columns, 0x5a);
+        for (std::int32_t j = 0; j < columns; ++j) {
+            const std::int32_t from = indices[static_cast<std::size_t>(j)];
+            std::uint8_t* out       = expected.data() + column_bytes * j;
+            if (from >= 0) {
+                std::memcpy(out, host.data() + column_bytes * from, column_bytes);
+            } else if (zero_dropped) {
+                std::memset(out, 0, column_bytes);
+            }
+        }
+        (void)dtype;
+    };
+    GuardedDeviceBuffer source_a(static_cast<std::size_t>(rows_a) * 2 * source_columns);
+    GuardedDeviceBuffer source_b(static_cast<std::size_t>(rows_b) * 4 * source_columns);
+    GuardedDeviceBuffer destination_a(static_cast<std::size_t>(rows_a) * 2 * columns);
+    GuardedDeviceBuffer destination_b(static_cast<std::size_t>(rows_b) * 4 * columns);
+    GuardedDeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
+    device_indices.copy_from_host(indices.data(), indices.size() * sizeof(std::int32_t));
+    std::vector<std::uint8_t> expected_a, expected_b;
+    run(rows_a, DType::BF16, 2, 11u, source_a, destination_a, expected_a);
+    run(rows_b, DType::FP32, 4, 29u, source_b, destination_b, expected_b);
+    cuda_synchronize();
+    const Tensor a(source_a.data(), DType::BF16, {rows_a, source_columns});
+    const Tensor b(source_b.data(), DType::FP32, {rows_b, source_columns});
+    Tensor out_a(destination_a.data(), DType::BF16, {rows_a, columns});
+    Tensor out_b(destination_b.data(), DType::FP32, {rows_b, columns});
+    Tensor index_tensor(device_indices.data(), DType::I32, {columns});
+    ops::gather_columns_group({&a, &b, nullptr, nullptr}, {&out_a, &out_b, nullptr, nullptr},
+                              index_tensor, nullptr, zero_dropped);
+    cuda_synchronize();
+    for (auto [buffer, expected, label] :
+         {std::tuple{&destination_a, &expected_a, "a"}, std::tuple{&destination_b, &expected_b, "b"}}) {
+        std::vector<std::uint8_t> actual(expected->size());
+        buffer->copy_to_host(actual.data(), actual.size());
+        if (actual != *expected) {
+            std::cerr << "gather_columns_group pair " << label << " rows " << rows_a << "/" << rows_b
+                      << " zero_dropped " << zero_dropped << " mismatch\n";
+            ++failures;
+        }
+        failures += buffer->verify_guards("gather_columns_group destination");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -220,6 +282,12 @@ int main() {
     failures += gather_case<std::int32_t>(DType::I32, 1, {7, 0, -1, 3}, 8);
     failures += gather_case<std::int32_t>(DType::I32, 16, {1, 0, -1}, 2);
     failures += gather_case<std::int32_t>(DType::FP32, 48, {3, -1, 0, 1, -1}, 4);
+    // Group form, 16-byte and 4-byte words, columns longer than one 8 KB chunk, both drop modes.
+    for (const bool zero : {true, false}) {
+        failures += gather_group_case(10240, 48, {0, 1, -1, 3, -1, 5, 6, -1}, 7, zero);
+        failures += gather_group_case(248320 / 64, 48, {2, -1, 0}, 3, zero);
+        failures += gather_group_case(6, 3, {1, -1, 0, -1}, 2, zero);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }
