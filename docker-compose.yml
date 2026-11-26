@@ -46,10 +46,13 @@ services:
       - "6144"
       - --prefill-chunk
       - "2048"
+      - --decode-share
+      - "50"
+      - --no-cuda-graph
       - --spec
-      - mtp
+      - "${NINFER_SPEC:-dflash2}"
       - --draft-tokens
-      - "${NINFER_DRAFT_TOKENS:-3}"
+      - "${NINFER_DRAFT_TOKENS:-7}"
       - --lm-head-draft
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]

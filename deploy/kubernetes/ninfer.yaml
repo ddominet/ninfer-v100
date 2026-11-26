@@ -66,10 +66,13 @@ spec:
             - "6144"
             - --prefill-chunk
             - "2048"
+            - --decode-share
+            - "50"
+            - --no-cuda-graph
             - --spec
-            - "mtp"
+            - "dflash2"
             - --draft-tokens
-            - "3"
+            - "7"
             - --lm-head-draft
           ports:
             - name: http

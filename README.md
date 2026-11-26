@@ -1,153 +1,128 @@
-# NInfer for Tesla V100 — performance rework
+# NInfer for Tesla V100 (v2.0)
 
-A from-scratch C++/CUDA inference engine for selected Qwen checkpoints, tuned for a single
-NVIDIA Tesla V100 (Volta, `sm_70`). It serves text, image, and video input through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident
-model, 1–8 active requests.
+A C++/CUDA inference engine for **Qwen3.8-27B** tuned specifically for a single NVIDIA Tesla V100 (`sm_70`, 32 GB). It serves text, image, and video input through a local CLI or OpenAI- and Anthropic-compatible HTTP APIs, built around one GPU, one resident model, and 1–8 concurrent requests.
 
-This repository is a performance-focused fork of
-[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Both builds were measured
-through the HTTP server on one V100-PCIe-32GB with the published Qwen3.8-27B NVFP4 artifact and
-natural-text prompts (reference prose, fiction, source code). This fork was faster in every cell
-measured:
+> **Scope note:** While the underlying engine retains support for the other NInfer Qwen artifacts, all v1.0 and v2.0 kernel, scheduler, and speculative-decoding optimizations in this repository are **specifically built and tuned for `Qwen3.8-27B` NVFP4 on Tesla V100**. Other models are not tuned or benchmarked here.
 
-| Workload | Upstream port | This fork | Gain |
+This repository is the v2.0 release of [ddominet/ninfer-v100](https://github.com/ddominet/ninfer-v100), originally forked from [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Version 1.0 focused on decode attention, prefill, long-context scaling, and multi-session MTP throughput. **The goal of v2.0 is to keep all of those v1.0 strengths—high multi-session throughput and strong long-context performance—with DFlash2 enabled**, so a single serving configuration (`--spec dflash2 --draft-tokens 7`) wins across single-stream decode, prompt processing, long-context depth, and 8-stream aggregate throughput without requantizing weights.
+
+> **Use DFlash2 for best performance:** Run with `--spec dflash2 --draft-tokens 7 --lm-head-draft --kv-dtype int8 --decode-share 50 --no-cuda-graph` (see [Serve](#serve-recommended-v20-production-flags) below). Unlike v1.0—where you had to choose between MTP for multi-session throughput and DFlash2 for single-stream decode—v2.0's DFlash2 path is faster than MTP across both single-stream and 8-stream workloads.
+
+---
+
+## Benchmarks (Tesla V100-PCIe-32GB)
+
+Every server below was measured on the same **Tesla V100-PCIe-32GB** (CUDA 12.8) over HTTP using the same cold natural-text prompts (reference prose, fiction, and source code from `eval/corpora/perplexity-1m`), greedy decoding, thinking off, and 256 output tokens per request (6 requests/cell up to 24K, 3 requests/cell at 90K–180K).
+
+Engines compared:
+- **[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100)** — original V100 port (`b37d0dd`), Qwen3.8-27B NVFP4, INT8 KV, MTP K=3 / K=1.
+- **[tuxKOH/ninfer-v100xN](https://github.com/tuxKOH/ninfer-v100xN)** — V100 fork, Qwen3.8-27B NVFP4, INT8 KV, MTP K=3 / K=1.
+- **[ddominet/ninfer-v100](https://github.com/ddominet/ninfer-v100) (v1.0)** — previous release of this fork, Qwen3.8-27B NVFP4, INT8 KV, MTP K=3 / K=1 and unoptimized DFlash2.
+- **[inscora/llama-superfast-v100-BWE-q8-dflash2](https://github.com/inscora/llama-superfast-v100-BWE-q8-dflash2)** — V100 llama.cpp fork with Unsloth `UD-Q4_K_XL`, z-lab DFlash2 `Q4_K_M` (`K=7`), Q8_0 KV.
+- **This release (v2.0)** — Qwen3.8-27B NVFP4, INT8 KV, `--spec dflash2 --draft-tokens 7 --lm-head-draft --decode-share 50 --no-cuda-graph`.
+
+### Single-stream decode (tok/s, higher is better)
+
+| Prompt context | geoffwatts (MTP3) | tuxKOH (MTP3) | ddominet v1.0 (MTP3) | ddominet v1.0 (DF7) | llama-superfast (DF7) | **v2.0 (DF7)** |
+|---:|---:|---:|---:|---:|---:|---:|
+| ~60 | 65.5 | 70.4 | 72.7 | 76.8 | 83.3 | **91.6** |
+| 1K | 67.5 | 75.1 | 72.9 | 83.1 | 87.2 | **100.8** |
+| 6K | 66.0 | 75.5 | 75.3 | 72.8 | 84.4 | **90.8** |
+| 24K | 57.2 | 69.9 | 70.0 | 68.3 | 78.1 | **81.0** |
+| 90K | 41.4 | 56.9 | 57.9 | 51.3 | 64.4 | **65.3** |
+| 180K | 31.9 | 48.5 | 53.5 | 44.6 | 51.8 | **54.3** |
+
+### Prompt processing / prefill (tok/s, higher is better)
+
+| Prompt context | geoffwatts | tuxKOH | ddominet v1.0 | llama-superfast | **v2.0 (DF7)** |
+|---:|---:|---:|---:|---:|---:|
+| ~60 | 152.1 | 155.1 | 336.8 | 388.6 | **415.6** |
+| 1K | 949.0 | 955.2 | 976.0 | 975.1 | **1046.1** |
+| 6K | 1075.4 | 1082.3 | 1160.3 | 1121.9 | **1211.5** |
+| 24K | 974.2 | 1009.1 | 1076.3 | 1052.6 | **1118.2** |
+| 90K | 666.2 | 779.3 | 820.9 | 814.0 | **834.5** |
+| 180K | 454.2 | 595.2 | 622.6 | 620.5 | **627.0** |
+
+### Multi-stream aggregate decode (tok/s, mean of 3 runs, higher is better)
+
+| Streams | geoffwatts (MTP3 / K1) | tuxKOH (MTP3 / K1) | llama-superfast (DF7) | ddominet v1.0 (MTP3 / K1) | ddominet v1.0 (DF7) | v2.0 (MTP3) | **v2.0 (DF7)** |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 57.5 / 45.0 | 64.2 / 50.2 | 76.8 | 66.4 / 53.1 | 65.3 | 71.2 | **82.2** |
+| 2 | 92.8 / 80.0 | 101.3 / 88.5 | 120.4 | 113.2 / 95.6 | 96.2 | 122.3 | **137.0** |
+| 4 | 109.1 / 125.3 | 122.3 / 135.7 | 135.0 | 157.3 / 160.0 | 95.2 | 160.9 | **176.0** |
+| 8 | 129.6 / 155.7 | 145.5 / 175.8 | 151.7 | 211.8 / 243.3 | 121.3 | 245.9 | **252.1** |
+
+### Mixed-arrival Poisson chat (`rate=0.5 req/s`)
+
+| Engine | Makespan | Aggregate throughput | Errors |
 |---|---:|---:|---:|
-| Decode, 1.1K-token prompt, MTP K=3 | 67.5 tok/s | 72.9 tok/s | 1.08× |
-| Decode, 24K-token prompt, MTP K=3 | 57.2 tok/s | 70.0 tok/s | 1.22× |
-| Decode, 89K-token prompt, MTP K=3 | 41.4 tok/s | 57.9 tok/s | 1.40× |
-| Decode, 172K-token prompt, MTP K=3 | 31.9 tok/s | 53.5 tok/s | 1.68× |
-| Decode, 172K-token prompt, MTP off | 14.1 tok/s | 24.2 tok/s | 1.72× |
-| 8 concurrent streams, MTP K=1 | 155.7 tok/s | 243.3 tok/s | 1.56× |
-| 8 concurrent streams, MTP K=3 | 129.6 tok/s | 211.8 tok/s | 1.63× |
-| Prefill, 52–66 token prompts | 154 tok/s | 339 tok/s | 2.21× |
-| Prefill, 172K-token prompt | 455 tok/s (380 s) | 625 tok/s (276 s) | 1.37× |
+| llama-superfast (DF7) | 152.4 s | 166.3 tok/s | 0 |
+| v2.0 (MTP3) | 104.5 s | 242.1 tok/s | 0 |
+| **v2.0 (DF7)** | **100.3 s** | **248.2 tok/s** | **0** |
 
-Decode rows are means over three to six requests; draft acceptance at K=3 was 53–60% on both
-builds. Full tables, per-request spread, acceptance rates, derived memory and arithmetic
-throughput, and the method are in [V100 performance rework](docs/v100-rework.md).
+### Context × concurrency grid (total wall time in seconds, lower is better)
 
-## Credits
+End-to-end wall time (cold prefill + 256 decoded tokens per stream) across 14 context/concurrency cells. `v2.0 (DF7)` finishes first in all **14/14 cells**:
 
-This work stands on other people's engines and ideas:
+| Cell | ddominet v1.0 (DF7) | ddominet v1.0 (MTP3) | llama-superfast (DF7) | **v2.0 (DF7)** |
+|---|---:|---:|---:|---:|
+| 1K × 1 | 3.725 s | 4.169 s | 4.095 s | **3.248 s** |
+| 1K × 2 | 6.989 s | 6.666 s | 6.192 s | **5.281 s** |
+| 1K × 4 | 13.560 s | 11.906 s | 12.077 s | **10.982 s** |
+| 1K × 8 | 24.936 s | 20.313 s | 23.102 s | **18.373 s** |
+| 6K × 1 | 8.002 s | 7.945 s | 7.949 s | **7.268 s** |
+| 6K × 2 | 16.113 s | 15.633 s | 15.938 s | **14.603 s** |
+| 6K × 4 | 35.215 s | 34.204 s | 32.638 s | **32.369 s** |
+| 6K × 8 | 71.494 s | 67.774 s | 65.296 s | **64.742 s** |
+| 24K × 1 | 26.879 s | 26.115 s | 26.378 s | **24.973 s** |
+| 24K × 2 | 54.054 s | 52.170 s | 53.320 s | **50.184 s** |
+| 24K × 4 | 112.694 s | 107.059 s | 108.573 s | **103.786 s** |
+| 24K × 8 | 215.074 s | 204.131 s | 213.919 s | **198.966 s** |
+| 90K × 1 | 117.292 s | 114.275 s | 113.587 s | **111.117 s** |
+| 90K × 2 | 243.859 s | 235.047 s | 247.820 s | **230.085 s** |
 
-- **[Neroued/ninfer](https://github.com/Neroued/ninfer)** — the original NInfer engine, its
-  artifact format, serving stack, and the published model artifacts. Everything here is that
-  engine.
-- **[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100)** — the Tesla V100 port
-  this fork starts from: the `sm_70` build, software NVFP4 on Volta tensor cores, the
-  quadpair-split-N linear kernels, load-time weight prepacking, and the INT8 paged KV cache. The
-  rework below tunes that design; it does not replace it.
-- **[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny)** — inspiration for the Volta
-  QPN prepacking and fragment maps used by the port.
-- **[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)** — inspiration for
-  context-lookup MTP.
+---
 
-## What changed from the upstream port
+## What changed
 
-Baseline is upstream `master` at `b37d0dd`. No model artifact, API, or output contract changed;
-every change is in the Volta execution path.
+### In v1.0 (from `geoffwatts/ninfer-v100`)
 
-**Decode attention**
-- New tensor-core attention kernels over the paged INT8 KV cache for rounds of 1–8 tokens: a
-  register-direct kernel for one token and a staged kernel that dequantises each key/value tile
-  once and shares it across all rows, instead of every row re-fetching it.
-- Queries are Hadamard-rotated once per round, not once per kernel block.
-- Split sizes follow context length and round width, with fewer, longer splits at long context.
-- The kernels handle several streams in one launch.
+Version 1.0 rebuilt the core V100 attention, linear, prefill, and memory paths:
 
-**Linear layers**
-- The decode-width (QPN) kernels now cover rounds up to 64 rows; previously anything above 32
-  rows fell through to the prefill GEMM with a per-call weight dequantisation.
-- Activations are staged once per round as FP16 in the layout the kernels read, instead of being
-  converted inside the weight-streaming loop.
-- FP8 MLP layers process the full round in one pass.
+- **Decode attention:** Replaced per-row KV re-fetches with tensor-core paged INT8 attention kernels (register-direct 1-token kernel plus a staged multi-token kernel that dequantizes each KV tile once), moved Hadamard query rotation to once per round, tuned split-KV granularity by context depth, and batched multiple streams per launch.
+- **Linear layers:** Extended Volta QPN decode-width kernels up to 64 rows so batched rounds stop falling back to prefill GEMMs, staged activations as FP16 once per round, and ran FP8 MLP layers in a single pass.
+- **Prefill:** Added fused prefill attention reading paged INT8 KV directly (no gather workspace), routed short prompts onto decode-width kernels (over 2× faster on short prompts), kept NVFP4 wide-route SwiGLU in FP32, and software-pipelined the Gated Delta Net (GDN) recurrence.
+- **Engine & memory:** Added `--decode-share` time-sliced decode/prefill interleaving, moved GDN scratch into the planned workspace, fixed an FP8 GDN convolution workspace under-allocation, and made full 256K INT8 KV + 2048-token prefill chunks fit reliably within 32 GB with startup capacity checks.
 
-**Prefill**
-- A fused prefill attention kernel reads the paged INT8 cache directly, with no gather workspace.
-- Short prompts no longer pay the wide-prefill route: a 55-token prompt is 2.5× faster.
-- The NVFP4 MLP keeps gate and up in FP32 through SwiGLU on the wide route, matching the
-  reference more closely.
-- The Gated Delta Net recurrence is software-pipelined and reads pre-normalised inputs.
+### New in v2.0 (from `ddominet/ninfer-v100` v1.0)
 
-**Engine and memory**
-- `--decode-share` interleaves decode rounds with long prefills by time share.
-- Gated Delta Net scratch moved into the planned workspace; the remaining activation staging uses
-  small fixed per-stream blocks instead of buffers that grow on demand.
-- 2,048-token prefill chunks and CUDA Graphs fit alongside a 262,144-token INT8 KV pool with MTP up
-  to K=5 and no device state slots; configurations that do not fit are refused at startup with the
-  byte counts.
-- An FP8 GDN convolution workspace under-allocation that could abort under load is fixed.
+Version 2.0 turns **DFlash2** into the fastest path for both single-stream and 8-stream serving while cutting target-model round latency and kernel-launch overhead across the board (`B=1` round time down to `35.58 ms` with `831` kernels/round and only `0.187 ms` eager launch gap under `--no-cuda-graph`):
 
-## Models
+- **Full DFlash2 draft stack on Volta:**
+  - Load-time QPN prepacking for all DFlash2 W8 draft weights (`q|k|v`, `o_proj`, `gate|up`, `down`, `fc`) with specialized `Split2`/`Split3` small-T QPN kernels and FP16-staged tensor-core skinny GEMMs (`ROWS=128` through `T=48`, warp-aware split-K capped at 4 splits).
+  - Coalesced 8-warp double-buffered HMMA dynamic grouped convolution (~2.5× faster).
+  - Coalesced half-split Q4 proposal head with register bitonic Top-K and QPN routing through `T=32` (cutting `B=8` head latency from ~1.7 ms to ~0.66 ms).
+  - Grouped-query sliding-window draft attention (32 keys/step, 8 warps) and 2-CTA/SM 6–8 token verify attention over paged INT8 KV.
+  - Host-mapped token embedding and selector codebooks to keep full 256K INT8 KV + 8 concurrent streams comfortably inside 32 GB VRAM.
+- **Adaptive multi-stream DFlash2 runtime:**
+  - Online-fitted round-cost budgeting (`DFlashCostModel`) and kept-column verify compaction so DFlash2 scales to 252 tok/s at 8 streams instead of stalling at ~121 tok/s.
+  - Sliding-window prefill skip (avoids materializing draft KV for prompt tokens outside the window), in-place kept-column GDN norm/scatter, and compacted DFlash2 context append/materialize.
+  - High-priority main stream + low-priority `gdn_fold_stream_` so GDN replay folds overlap completely inside the DFlash2 proposal window.
+  - Vectorized penalized argmax, batched token-count updates, and improved short-prompt batching / decode-credit accounting.
+- **Target compute & launch-overhead elimination (`-298` kernel launches/round):**
+  - SM70 CUTLASS W8/NVFP4/FP8 prefill GEMMs and fused target RMSNorm+RoPE.
+  - Fused NVFP4 and FP8 MLP pipeline (`Block=640` staged RMSNorm → staged SwiGLU → fused `ResidualAdd` down projection) and fused FP8 attention input RMSNorm across all 64 layers.
+  - High-occupancy pre-unpacked `gdn_norm_gating_27` (`Threads=640/320`, `Tile=2/4`) plus direct FP16 output from `gdn_norm_gating_27`, `gated_rmsnorm`, and `sigmoid_mul` straight into FP8 QPN/TC—cutting `fp8_stage_bf16_activation` from 139 launches/round down to 27.
 
-| Model | Weights | Artifact | Download and model card |
-|---|---|---|---|
-| Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
-| Qwen3.6-27B | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
-| Qwen3.8-27B | `groupwise-int` | `qwen3_8_27b.ninfer` | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) |
-| Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
-| Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
-
-Artifacts contain the exact model weights, tokenizer, chat template, and required media frontend resources.
-
-## Performance
-
-Numbers are from the HTTP server on a Tesla V100-PCIe-32GB, CUDA 12.8, the published Qwen3.8-27B
-NVFP4 artifact at the revision pinned in the quick start, INT8 group-64 KV. Each request is a cold
-natural-text prompt of the stated size followed by 256 greedily decoded tokens; cells are means
-over six requests (three from 89K).
-
-Single-stream decode, tok/s (upstream port → this fork):
-
-| Prompt tokens | MTP off | K=1 | K=3 | K=4 |
-|---:|---|---|---|---|
-| 60 | 29.4 → 33.8 | 49.2 → 55.7 | 65.5 → 72.7 | 63.3 → 74.7 |
-| 1.1K | 29.2 → 33.6 | 49.1 → 55.5 | 67.5 → 72.9 | 69.1 → 80.7 |
-| 5.9K | 28.0 → 33.2 | 47.2 → 54.9 | 66.0 → 75.3 | 67.8 → 81.1 |
-| 24K | 24.3 → 32.1 | 41.8 → 53.9 | 57.2 → 70.0 | 56.8 → 75.7 |
-| 89K | 18.8 → 27.9 | 31.8 → 47.2 | 41.4 → 57.9 | 41.4 → 60.9 |
-| 172K | 14.1 → 24.2 | – | 31.9 → 53.5 | – |
-
-Time per decode round, ms (independent of draft acceptance):
-
-| Prompt tokens | MTP off | K=1 | K=3 | K=4 |
-|---:|---|---|---|---|
-| 60 | 34.0 → 29.6 | 36.9 → 32.6 | 41.3 → 37.1 | 45.4 → 39.0 |
-| 24K | 41.2 → 31.1 | 43.5 → 33.4 | 49.6 → 39.5 | 54.6 → 41.6 |
-| 89K | 53.1 → 35.9 | 58.0 → 38.4 | 65.4 → 45.8 | 71.4 → 48.4 |
-| 172K | 71.0 → 41.3 | – | 87.6 → 51.7 | – |
-
-Prefill, tok/s:
-
-| Prompt tokens | Upstream port | This fork | Gain |
-|---:|---:|---:|---:|
-| 60 | 154 | 339 | 2.21× |
-| 1,127 | 946 | 978 | 1.03× |
-| 5,935 | 1,072 | 1,163 | 1.08× |
-| 24,108 | 973 | 1,078 | 1.11× |
-| 88,515 | 665 | 822 | 1.24× |
-| 171,901 | 455 | 625 | 1.37× |
-
-Draft acceptance in this test is 78–83% at K=1, 53–60% at K=3 and 45–53% at K=4, about the same
-on both builds, and it varies with the text: at K=3 reference prose is accepted 59–74% of the
-time and fiction 36–55%. Decode throughput depends on it, so every MTP figure in
-[the full report](docs/v100-rework.md) is published with its acceptance rate.
-
-The gain is smallest for short prompts on a single stream (8–20%) and largest at long context
-and under concurrency (40–72%).
-
-The upstream port's own published figures, measured with the `ninfer_bench` tool on a synthetic
-high-acceptance corpus, remain in the [V100 port notes](docs/v100.md).
+---
 
 ## Quick start
 
-NInfer requires 64-bit Linux, a Tesla V100 with CUDA Toolkit 12.8, CMake 3.28 or newer, a C++20
-host compiler, Ninja, `pkg-config`, FFmpeg
-development libraries (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and
-`libswscale >= 7`), and `libcurl >= 7.85`. This port builds for `sm_70`.
+### Requirements
 
-Select CUDA 12.8 and Volta explicitly:
+64-bit Linux, a Tesla V100-32GB, **CUDA Toolkit 12.8** (the last toolkit with `sm_70` support), CMake ≥ 3.28, a C++20 compiler, Ninja, `pkg-config`, FFmpeg dev libraries (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, `libswscale >= 7`), and `libcurl >= 7.85`.
+
+### Build
 
 ```bash
 cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -156,20 +131,11 @@ cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-v100 -j
 ```
 
-The same five `.ninfer` artifacts use the public Engine/CLI/serving routes. See the
-[V100 port notes](docs/v100.md) for qualification and the preferred-GPU launcher.
+At startup on Volta, NVFP4, FP8, W8, and Q4 weights are repacked in place on the GPU into native Volta QPN fragment layouts. The `.ninfer` file on disk is untouched and temporary repack memory is freed before serving begins.
 
-On Volta, loading an NVFP4 artifact repacks each dense MLP gate/up and down payload in place on the
-GPU into the QPN fragment order used by the decode kernels. Row-scaled FP8 payloads are likewise
-permuted into their native Volta QPN stream. The `.ninfer` file and host-side artifact bytes
-are unchanged, the device allocation remains the same size, and temporary repack storage is
-released before inference. These device-resident weights are therefore deliberately mutated at
-load; the V100 path does not retain checkpoint-native immutable layout for those payloads.
+### Download the model
 
-Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
-target or packaged binary distribution; run NInfer from its source build tree.
-
-Download the artifact used by this example with the Hugging Face CLI:
+Pin the v2 artifact revision (later revisions on Hugging Face use a newer container format and will be rejected with `artifact magic is not NInfer v2`):
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
@@ -178,36 +144,39 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir models
 ```
 
-The revision matters. This engine reads the v2 artifact format; the file currently at the head of
-that Hugging Face repository is a later format and is rejected at startup with
-`artifact magic is not NInfer v2`. The pinned revision loads in this build
-(SHA-256 `552c374c685dce302603b95fbe940fb04243c0cd44c083efc644ad3d980d462c`).
-The other model links in the table above have not been checked against this build.
+Expected SHA-256: `552c374c685dce302603b95fbe940fb04243c0cd44c083efc644ad3d980d462c`.
 
-Start a long-running text/vision server with one active-request lane and Device/Host
-checkpoint retention:
+### Serve (recommended v2.0 production flags)
+
+For the best all-around performance on a V100-32GB (single-stream decode, long context, and up to 8 concurrent sessions), **use DFlash2 with these flags**:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --max-context 240000 \
+./build-v100/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --host 0.0.0.0 --port 8080 \
+  --max-context 262144 \
+  --kv-capacity 262144 \
   --prefill-chunk 2048 \
-  --kv-capacity auto \
-  --max-concurrency 1 \
+  --max-concurrency 8 \
+  --device-state-slots 0 \
+  --host-kv-mib 6144 \
+  --host-state-slots 16 \
+  --decode-share 50 \
+  --no-cuda-graph \
   --kv-dtype int8 \
-  --device-state-slots 1 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 4 \
-  --lm-head-draft \
-  --preserve-thinking \
-  --vision
+  --spec dflash2 --draft-tokens 7 \
+  --lm-head-draft
 ```
 
-Each request has a 240,000-token logical ceiling. The Device KV pool is sized from the memory left
-after weights, workspace, state, Vision, and graph allocations. The cache tiers provide one Device
-checkpoint slot, eight pinned Host State slots, and 8 GiB of pinned Host KV.
+Why these options matter:
+- `--spec dflash2 --draft-tokens 7 --lm-head-draft`: enables the v2.0 DFlash2 draft stack with the optimized 7-token draft window and fused Q4 proposal head.
+- `--kv-dtype int8 --max-context 262144 --kv-capacity 262144`: uses the Volta tensor-core INT8 paged KV cache for full 256K context capacity inside 32 GB VRAM.
+- `--max-concurrency 8 --decode-share 50`: supports up to 8 active sessions while interleaving decode rounds with long prefills so active streams stay responsive.
+- `--no-cuda-graph`: saves graph capture VRAM for the full 256K KV pool; v2.0's kernel fusions cut eager launch overhead down to ~0.19 ms/round, so there is no throughput penalty.
+- `--device-state-slots 0 --host-kv-mib 6144 --host-state-slots 16`: keeps prefix checkpoints in pinned host RAM so GPU memory goes to KV capacity.
 
-Send an OpenAI-style request:
+Add `--vision` if you need image/video input (note that `--vision` reserves extra VRAM, so use `--kv-capacity auto` when enabling it).
+
+Send a test request:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -219,164 +188,81 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Run a one-shot CLI request with a 32,768-token allocation:
+### One-shot CLI
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build-v100/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode, then give a concise conclusion." \
   --max-context 32768 \
-  --max-new 8192 \
-  --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
+  --max-new 4096 \
+  --kv-dtype int8 \
+  --spec dflash2 --draft-tokens 7 \
   --lm-head-draft
 ```
 
-Answer content is written to stdout. Structured startup/runtime-error records and the CLI-owned
-reasoning, timing, throughput, memory, and speculative-decoding report are written to stderr;
-reasoning and the result report remain unprefixed product output. On a terminal, weight
-materialization additionally uses one transient progress line. Redirected stderr receives only
-persistent structured phase records, including rate-limited progress for long loads. Option and
-local input errors remain direct command diagnostics. Use `--messages FILE` and `--vision` for
-structured image/video input; see the [CLI guide](docs/cli.md) and
-[committed examples](examples/cli/).
+---
 
-## Resource-aware long-context reuse
+## Docker & Kubernetes
 
-A reusable prefix checkpoint contains KV and the complete continuation state for its exact prompt
-frontier. A Device-resident checkpoint resumes directly. Under pressure, the planner weighs Device
-retention, pinned Host State/KV, and eviction by immediate restore work and later reuse cost. Active
-requests retain their completion reservations.
+### Docker Compose
 
-See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
-reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
-
-## Evaluation
-
-This section is about answer quality, not speed. The scores below are the original NInfer
-project's published results, carried over unchanged. They were not re-measured for the V100 port
-or for this fork, which changes kernels and scheduling but not the model artifacts.
-
-Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
-enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
-
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
-|---|---:|---:|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
-| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
-
-The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8 rows used temperature
-1.0 and presence penalty 0.0. Multimodal evaluation used `--vision` and an 81,920-token context
-limit. Text evaluation used 262,144 tokens except Qwen3.8-27B NVFP4, which used 252,928 tokens for
-its measured memory envelope. Each score is one sample per problem; model cards contain the
-correct/total counts and evaluation notes.
-
-## Startup notes
-
-GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
-`--vision` selects Vision residency. DFlash is available for text-only Qwen3.6-35B-A3B execution,
-and DFlash2 for Qwen3.8-27B.
-
-## Docker
-
-The image builds for `sm_70` with CUDA 12.8.
-[`.github/workflows/image.yml`](.github/workflows/image.yml) builds it on pushes to `master` and
-pushes it to GitHub Container Registry.
-
-Run with Docker Compose on a host with the NVIDIA Container Toolkit:
+The image builds for `sm_70` with CUDA 12.8 ([`Dockerfile`](Dockerfile), [`.github/workflows/image.yml`](.github/workflows/image.yml)). With the NVIDIA Container Toolkit installed:
 
 ```bash
 mkdir -p models
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer \
   --revision 11dbbbbbc33db198afe2f02c9232c771ff7031be --local-dir models
-docker compose up -d            # pulls the published image
-docker compose up -d --build    # or builds it locally
+docker compose up -d            # pull published image
+docker compose up -d --build    # or build locally
 ```
 
-[`docker-compose.yml`](docker-compose.yml) serves on port 8080 with a 262,144-token context, eight
-request lanes, INT8 KV, and MTP with three draft tokens. `NINFER_GPU`, `NINFER_PORT`,
-`NINFER_MODELS`, `NINFER_MAX_CONTEXT`, `NINFER_MAX_CONCURRENCY`, and `NINFER_DRAFT_TOKENS` override
-the defaults.
+[`docker-compose.yml`](docker-compose.yml) defaults to the v2.0 DFlash2 configuration (`262,144` context, 8 streams, INT8 KV, `--spec dflash2 --draft-tokens 7`). Override via `NINFER_GPU`, `NINFER_PORT`, `NINFER_MODELS`, `NINFER_MAX_CONTEXT`, `NINFER_MAX_CONCURRENCY`, `NINFER_SPEC`, and `NINFER_DRAFT_TOKENS`.
 
-## Kubernetes
+### Kubernetes
 
-[`deploy/kubernetes/ninfer.yaml`](deploy/kubernetes/ninfer.yaml) defines a model volume claim, a
-one-replica Deployment that requests one `nvidia.com/gpu`, and a Service:
+[`deploy/kubernetes/ninfer.yaml`](deploy/kubernetes/ninfer.yaml) provides a PVC, single-GPU `Recreate` Deployment, and Service:
 
 ```bash
 kubectl create namespace ninfer
 kubectl -n ninfer apply -f deploy/kubernetes/ninfer.yaml
 ```
 
-Place `qwen3_8_27b_nvfp4.ninfer` on the `ninfer-models` claim before the first start. The
-Deployment uses the `Recreate` strategy because one V100 cannot hold two copies of the model, and
-pulls `latest` on every restart, so `kubectl rollout restart deployment/ninfer` deploys the newest
-published image.
+Place `qwen3_8_27b_nvfp4.ninfer` on the `ninfer-models` PVC before starting the pod.
 
-## Capabilities and limits
+---
 
-All registered model IDs support:
+## Capabilities & limits
 
-- text generation with thinking and non-thinking prompt modes;
-- image, multi-image, video, and mixed multimodal messages;
-- chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
-- MTP speculative decoding with draft windows from one to seven;
-- DFlash2 masked-block speculative decoding for Qwen3.8-27B (from the upstream integration),
-  draft windows from one to fifteen;
-- BF16, INT8, and FP8 KV storage;
-- offline causal-perplexity scoring;
-- private and shared exact-prefix reuse with Device/Host State and KV retention;
-- model-aware sampling defaults and explicit sampler overrides;
-- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
-  tools, local response state, token counting, and usage accounting.
+Supported on Qwen3.8-27B:
+- Text generation (thinking and non-thinking modes) and multimodal image/video input (`--vision`).
+- Chunked prefill, `--decode-share` decode/prefill interleaving, and 1–8 concurrent request lanes.
+- DFlash2 masked-block speculative decoding (`--spec dflash2 --draft-tokens 7`, recommended) and MTP (`--spec mtp`).
+- INT8, FP8, and BF16 paged KV cache with exact-prefix reuse across Device and pinned Host tiers.
+- OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages APIs (streaming, tool calls, token counting, usage accounting).
 
-The 35B-A3B target additionally supports text-only DFlash with draft windows from one to fifteen.
+Intentional scope boundaries:
+- Single Tesla V100 and one resident model per process (no multi-GPU or weight offload).
+- Fixed startup capacity of 1–8 active requests with bounded FIFO ingress.
+- Optimizations are tailored specifically for **Qwen3.8-27B NVFP4**.
 
-The product boundary remains intentionally small:
+---
 
-- one Tesla V100 and one resident model per Engine;
-- a startup-fixed capacity of one to eight active requests with bounded FIFO ingress;
-- no request preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or
-  distributed serving;
-- one shared startup-fixed KV pool across active requests and retained prefixes;
-- no runtime model discovery or unregistered checkpoint fallback;
-- parsed tool calls are returned to the client; NInfer does not execute tools;
-- the in-tree C++ headers are not distributed as an installed SDK.
+## Credits
 
-`--max-context` is each sequence's logical limit. `--kv-capacity` sizes the shared Main Text KV pool
-used by active requests and retained prefixes; `auto` resolves the largest legal capacity at
-startup from the memory remaining after weights while keeping 1 GiB of sizing headroom. Explicit
-capacities remain fixed for the process lifetime.
+- **[Neroued/ninfer](https://github.com/Neroued/ninfer)** — original NInfer engine, artifact container, serving stack, and published model artifacts.
+- **[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100)** — original Tesla V100 (`sm_70`) port, software NVFP4 on Volta tensor cores, quadpair-split-N kernels, load-time prepacking, and INT8 paged KV cache.
+- **[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny)** — inspiration for Volta QPN prepacking and fragment layouts.
+- **[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)** — inspiration for context-lookup MTP.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
-- [CLI](docs/cli.md)
+- [CLI guide](docs/cli.md)
 - [HTTP serving](docs/serving.md)
-- [V100 performance rework and benchmarks](docs/v100-rework.md)
+- [V100 performance rework notes](docs/v100-rework.md)
 - [V100 port notes](docs/v100.md)
-- [Perplexity evaluation](docs/perplexity.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-- [Serve TTFT benchmark](tools/bench/ttft/)
-- [CLI examples](examples/cli/)
-- [Contributing](CONTRIBUTING.md)
-
-Run the relevant `--help` for the exact current option contract.
 
 ## License
 
-NInfer is licensed under the [Apache License 2.0](LICENSE).
-
-The published artifacts are derived from
-[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
-[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The Qwen3.6-27B NVFP4 artifact
-also uses the fixed packed weights from
-[rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
-The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
-[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
-repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
-under `third_party/`.
+Apache License 2.0 ([`LICENSE`](LICENSE)). Model artifacts are derived from [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) (Apache-2.0). Vendored dependencies retain their own licenses under `third_party/`.
