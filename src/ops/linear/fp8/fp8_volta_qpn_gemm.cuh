@@ -277,10 +277,11 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
     // for all T columns instead of one per 8-row tile.
     if constexpr (std::is_same_v<Activation, half> || std::is_same_v<Activation, __nv_bfloat16>) {
         if (prepacked && t > S::kRowsPerTile) {
-            // Vocabulary head (N=248320) fills 24 waves with zero split-K, so TC skinny already
-            // beats 3-tile QPN starting at T=17 (cuts 2.47 ms -> ~1.65 ms on T=17..24).
+            // Attention input (N=14336, 224x1 CTAs) and vocabulary head (N=248320) beat 3-tile
+            // QPN starting at T=17; 16384/17408 and 5120 keep the 25-token floor (measured 190 us
+            // QPN3 vs 193 us TC at T=24, and 196 us TC splits=1 at T=32).
             const bool launched =
-                n >= 65536
+                (n == 14336 || n >= 65536)
                     ? launch_volta_tc_skinny(
                           Fp8VoltaTcDecoder<17>{reinterpret_cast<const uint4*>(codes), scales,
                                                 k / 128},

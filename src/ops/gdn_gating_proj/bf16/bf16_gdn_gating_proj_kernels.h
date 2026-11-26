@@ -28,7 +28,8 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, cudaStream_t stream,
-                                         const std::int32_t* scatter_cols = nullptr);
+                                         const std::int32_t* scatter_cols = nullptr,
+                                         bool write_fp16                  = false);
 
 // Cooperative launchers return false without submitting work only when the selected device cannot
 // make one complete token tile resident. The Op wrapper owns the non-cooperative fallback.

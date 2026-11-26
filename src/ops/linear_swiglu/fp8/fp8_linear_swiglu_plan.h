@@ -5,6 +5,9 @@
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
+#ifdef NINFER_VOLTA_BUILD
+#include <cuda_fp16.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +30,9 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
                                         float* gate_scratch, float* up_scratch,
                                         void* activation_scratch,
                                         cudaStream_t stream);
+void fp8_linear_swiglu_qpn_split_fp16_io_launch(const Tensor& x_shape, const half* x_fp16,
+                                                const Weight& weight, half* out_fp16,
+                                                float* gate_scratch, cudaStream_t stream);
 [[nodiscard]] bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k,
                                                           std::int32_t t) noexcept;
 #endif

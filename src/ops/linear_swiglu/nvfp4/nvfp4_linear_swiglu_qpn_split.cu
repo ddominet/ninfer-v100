@@ -129,6 +129,35 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     }
 }
 
+void nvfp4_linear_swiglu_qpn_split_group_major_io_launch(const Tensor& x_shape,
+                                                         const VoltaGroupMajorHalf* x_gm,
+                                                         const Weight& weight,
+                                                         VoltaGroupMajorHalf* out_gm,
+                                                         float* gate_scratch,
+                                                         cudaStream_t stream) {
+    const std::int32_t k               = x_shape.ne[0];
+    const std::int32_t t               = x_shape.ne[1];
+    const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
+
+    Weight gate_weight = weight;
+    gate_weight.n      = kIntermediate;
+
+    Weight up_weight = weight;
+    up_weight.n       = kIntermediate;
+    up_weight.qdata   = static_cast<const std::uint8_t*>(weight.qdata) +
+                       static_cast<std::int64_t>(kIntermediate) * (k / 2);
+    up_weight.scales = static_cast<const std::uint8_t*>(weight.scales) +
+                       static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512;
+
+    launch_nvfp4_volta_qpn_with_group_major_activation(
+        x_shape, gate_weight, x_gm, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
+        kIntermediate, inverse_weight_divisor, stream);
+    const Nvfp4QpnSwiGluGroupMajorOutput swiglu_gm{gate_scratch, out_gm, kIntermediate,
+                                                   volta_group_major_tiles(t)};
+    launch_nvfp4_volta_qpn_with_group_major_activation(
+        x_shape, up_weight, x_gm, swiglu_gm, kIntermediate, inverse_weight_divisor, stream);
+}
+
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

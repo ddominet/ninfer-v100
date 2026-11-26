@@ -54,9 +54,22 @@ struct Variant {
                                      Tensor& gate, Tensor& key, Tensor& value,
                                      qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                      cudaStream_t stream);
+#ifdef NINFER_VOLTA_BUILD
+    static bool attention_projection_from_residual(
+        const Tensor& residual, const Tensor& input_norm, float eps,
+        const FullAttentionProjectionWeights& weights, Tensor& query, Tensor& gate, Tensor& key,
+        Tensor& value, qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream);
+#endif
     static void attention_output_projection(const Tensor& attention, const Weight& weight,
                                             Tensor& residual, qwen3_6::TextPhase phase,
                                             WorkspaceArena& workspace, cudaStream_t stream);
+#ifdef NINFER_VOLTA_BUILD
+    static bool attention_output_projection_from_gated(const Tensor& gate, Tensor& attention,
+                                                       const Weight& weight, Tensor& residual,
+                                                       qwen3_6::TextPhase phase,
+                                                       WorkspaceArena& workspace,
+                                                       cudaStream_t stream);
+#endif
     static void mtp_attention_projection(const Tensor& hidden,
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
@@ -102,9 +115,34 @@ struct Variant {
                                                     const Tensor& scatter_columns, Tensor& hidden,
                                                     Tensor& g_padded, Tensor& beta_padded,
                                                     cudaStream_t stream);
+#ifdef NINFER_VOLTA_BUILD
+    static bool gdn_norm_control_projection_fp16(const Tensor& residual, const Tensor& norm_weight,
+                                                 float eps, const GdnProjectionWeights& weights,
+                                                 const Tensor* scatter_columns, Tensor& hidden_fp16,
+                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
+    static bool gdn_input_projection_scatter_fp16(const Tensor& hidden_fp16,
+                                                  const GdnProjectionWeights& weights,
+                                                  Tensor& qkv_padded, Tensor& output_gate,
+                                                  const Tensor& qkv_columns, cudaStream_t stream);
+    static void gdn_input_projection_record_fp16(
+        const Tensor& hidden_fp16, const GdnProjectionWeights& weights, const Tensor& conv_weight,
+        const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
+        Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
+        cudaStream_t stream);
+    static bool gdn_output_projection_from_gated_norm(
+        const Tensor& o, const Tensor& gdn_norm, const Tensor& z, float eps,
+        const Tensor* live_columns, Tensor& on_scratch, const Weight& weight, Tensor& residual,
+        qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream);
+#endif
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, const ::ninfer::ops::SparseMoeHints& hints,
                            WorkspaceArena& workspace, cudaStream_t stream);
+#ifdef NINFER_VOLTA_BUILD
+    static bool post_mixer_from_residual(Tensor& residual, const Tensor& post_norm, float eps,
+                                         const PostMixerWeights& weights, qwen3_6::TextPhase phase,
+                                         const ::ninfer::ops::SparseMoeHints& hints,
+                                         WorkspaceArena& workspace, cudaStream_t stream);
+#endif
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t

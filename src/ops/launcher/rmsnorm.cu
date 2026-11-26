@@ -174,4 +174,47 @@ void gated_rmsnorm_columns_launch(const Tensor& x, const Tensor& weight, const T
     CUDA_CHECK(cudaGetLastError());
 }
 
+#ifdef NINFER_VOLTA_BUILD
+void gated_rmsnorm_fp16_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                               Tensor& out_fp16, cudaStream_t stream) {
+    const std::int32_t d    = x.ne[0];
+    const std::int64_t rows = out_fp16.numel() / d;
+    constexpr int kBlock         = 512;
+    constexpr int kWarpsPerBlock = kBlock / kWarpSize;
+    const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    if (blocks > kRmsPrefetchBlocks) {
+        rmsnorm_warp_bf16x2_kernel<RmsEpilogue::Gated, kBlock, false, 0, true>
+            <<<blocks, kBlock, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
+                                            static_cast<const __nv_bfloat162*>(weight.data),
+                                            static_cast<const __nv_bfloat162*>(z.data),
+                                            out_fp16.data, d, rows, eps);
+    } else {
+        rmsnorm_warp_bf16x2_kernel<RmsEpilogue::Gated, kBlock, true, 0, true>
+            <<<blocks, kBlock, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
+                                            static_cast<const __nv_bfloat162*>(weight.data),
+                                            static_cast<const __nv_bfloat162*>(z.data),
+                                            out_fp16.data, d, rows, eps);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gated_rmsnorm_columns_fp16_launch(const Tensor& x, const Tensor& weight, const Tensor& z,
+                                       float eps, const Tensor& x_columns, Tensor& out_fp16,
+                                       cudaStream_t stream) {
+    const std::int32_t d               = out_fp16.ne[0];
+    const std::int32_t rows_per_column = out_fp16.ne[1];
+    const std::int64_t rows            = static_cast<std::int64_t>(rows_per_column) * out_fp16.ne[2];
+    constexpr int kBlock               = 512;
+    constexpr int kWarpsPerBlock       = kBlock / kWarpSize;
+    const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    rmsnorm_warp_bf16x2_kernel<RmsEpilogue::Gated, kBlock, true, 0, true>
+        <<<blocks, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(x.data),
+            static_cast<const __nv_bfloat162*>(weight.data),
+            static_cast<const __nv_bfloat162*>(z.data), out_fp16.data, d, rows, eps,
+            static_cast<const std::int32_t*>(x_columns.data), rows_per_column);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
 } // namespace ninfer::ops::detail

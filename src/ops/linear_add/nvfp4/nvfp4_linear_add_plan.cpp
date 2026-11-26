@@ -7,6 +7,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #endif
 
 #include <cstdlib>
@@ -89,14 +90,29 @@ bool nvfp4_down_t1_gemv_enabled() {
 
 void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
                              WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope         = workspace.scope();
     if (nvfp4_down_t1_gemv_enabled() && x.ne[1] == 1 && weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        auto scope = workspace.scope();
         // T=1: the shared prepack GEMV (~590 GB/s in-situ) replaces the QPN2 pass (~419 GB/s,
         // 6.71 ms/token over 56 layers in the d8k nsys decode profile).
         nvfp4_linear_add_gemv_t1_sm70_launch(x, weight, residual, workspace, stream);
         return;
     }
-    Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
+    if (x.ne[1] < kVoltaCutlassMinT &&
+        nvfp4_volta_qpn_supported(weight.n, weight.k, std::min(x.ne[1], kVoltaQpnMaxTokens))) {
+        for (std::int32_t begin = 0; begin < x.ne[1]; begin += kVoltaQpnMaxTokens) {
+            const std::int32_t active = std::min(kVoltaQpnMaxTokens, x.ne[1] - begin);
+            Tensor input(static_cast<std::uint8_t*>(x.data) +
+                             static_cast<std::int64_t>(begin) * weight.k * sizeof(std::uint16_t),
+                         DType::BF16, {weight.k, active});
+            Tensor output(static_cast<std::uint8_t*>(residual.data) +
+                              static_cast<std::int64_t>(begin) * weight.n * sizeof(std::uint16_t),
+                          DType::BF16, {weight.n, active});
+            nvfp4_linear_add_qpn_launch(input, weight, output, stream);
+        }
+        return;
+    }
+    auto scope       = workspace.scope();
+    Tensor projected = allocate_projected(workspace, weight.n, x.ne[1]);
     if (x.ne[1] >= kVoltaCutlassMinT) {
         nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);
     } else {
@@ -112,6 +128,10 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
 
 std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                             std::int32_t tokens) {
+    if (tokens < kVoltaCutlassMinT &&
+        nvfp4_volta_qpn_supported(output_rows, input_rows, std::min(tokens, kVoltaQpnMaxTokens))) {
+        return 0;
+    }
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, output_rows, tokens);
     const std::size_t linear_bytes = tokens >= kVoltaCutlassMinT

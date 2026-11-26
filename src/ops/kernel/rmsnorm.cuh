@@ -6,6 +6,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -28,10 +29,10 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
+template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0, bool WriteFp16 = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out,
+                                    const __nv_bfloat162* z, void* out_raw,
                                     std::int32_t input_d, std::int64_t rows, float eps,
                                     const std::int32_t* x_columns   = nullptr,
                                     std::int32_t rows_per_column = 1) {
@@ -93,9 +94,14 @@ __launch_bounds__(Block) __global__
             const float2 wf = __bfloat1622float2(w_pair);
             float2 zf{0.0f, 0.0f};
             if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
-            out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
-                                      rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+            const float o0 = rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x);
+            const float o1 = rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y);
+            if constexpr (WriteFp16) {
+                static_cast<__half2*>(out_raw)[row_base + pair] = __floats2half2_rn(o0, o1);
+            } else {
+                static_cast<__nv_bfloat162*>(out_raw)[row_base + pair] =
+                    __floats2bfloat162_rn(o0, o1);
+            }
         }
     }
 }

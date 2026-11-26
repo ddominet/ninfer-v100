@@ -3,6 +3,9 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/volta_fp16_stage.h"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -31,6 +34,12 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
                                           float* gate_scratch, float* up_scratch,
                                           void* activation_scratch,
                                           cudaStream_t stream);
+void nvfp4_linear_swiglu_qpn_split_group_major_io_launch(const Tensor& x_shape,
+                                                         const VoltaGroupMajorHalf* x_gm,
+                                                         const Weight& weight,
+                                                         VoltaGroupMajorHalf* out_gm,
+                                                         float* gate_scratch,
+                                                         cudaStream_t stream);
 [[nodiscard]] bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept;
 #endif
 

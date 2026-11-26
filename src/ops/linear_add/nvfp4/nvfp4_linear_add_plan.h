@@ -4,6 +4,9 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/volta_fp16_stage.h"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -26,6 +29,14 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream);
+
+#ifdef NINFER_VOLTA_BUILD
+void nvfp4_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                 cudaStream_t stream);
+void nvfp4_linear_add_qpn_group_major_launch(const Tensor& x_shape,
+                                             const VoltaGroupMajorHalf* x_gm, const Weight& weight,
+                                             Tensor& residual, cudaStream_t stream);
+#endif
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);

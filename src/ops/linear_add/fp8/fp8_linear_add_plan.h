@@ -6,6 +6,10 @@
 
 #include <cuda_runtime.h>
 
+#ifdef NINFER_VOLTA_BUILD
+#include <cuda_fp16.h>
+#endif
+
 #include <cstddef>
 #include <cstdint>
 
@@ -26,6 +30,8 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
 #ifdef NINFER_VOLTA_BUILD
 void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                cudaStream_t stream);
+void fp8_linear_add_qpn_fp16_launch(const Tensor& x_shape, const half* x_fp16, const Weight& weight,
+                                    Tensor& residual, cudaStream_t stream);
 #endif
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,

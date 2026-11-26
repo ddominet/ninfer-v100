@@ -10,6 +10,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -45,6 +46,26 @@ __launch_bounds__(256) __global__
             xv.pair[pair] = sigmoid_gate_mul_pair(gv.pair[pair], xv.pair[pair]);
         }
         store_vec(x + i, xv);
+    }
+}
+
+__launch_bounds__(256) __global__ void sigmoid_gate_mul_bf16x8_to_fp16_kernel(
+    const Bf16x8Pack* __restrict__ gate, Bf16x8Pack* __restrict__ x, std::int64_t packs) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    auto* out                 = reinterpret_cast<uint4*>(x);
+    for (std::int64_t i = start; i < packs; i += stride) {
+        const Bf16x8Pack gv = load_vec<Bf16x8Pack>(gate + i);
+        const Bf16x8Pack xv = load_vec<Bf16x8Pack>(x + i);
+        uint4 dst;
+        auto* h2 = reinterpret_cast<__half2*>(&dst);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float r0 = __low2float(xv.pair[pair]) * sigmoid(__low2float(gv.pair[pair]));
+            const float r1 = __high2float(xv.pair[pair]) * sigmoid(__high2float(gv.pair[pair]));
+            h2[pair]       = __floats2half2_rn(r0, r1);
+        }
+        out[i] = dst;
     }
 }
 

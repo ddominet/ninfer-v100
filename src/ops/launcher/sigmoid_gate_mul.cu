@@ -22,6 +22,26 @@ void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cu
     CUDA_CHECK(cudaGetLastError());
 }
 
+#ifdef NINFER_VOLTA_BUILD
+bool sigmoid_gate_mul_to_fp16_launch(const Tensor& gate, Tensor& x, cudaStream_t stream) {
+    const std::int64_t n = x.numel();
+    const auto gate_addr = reinterpret_cast<std::uintptr_t>(gate.data);
+    const auto x_addr    = reinterpret_cast<std::uintptr_t>(x.data);
+    if (n <= 0 || (n % 8) != 0 || ((gate_addr | x_addr) & (alignof(Bf16x8Pack) - 1)) != 0) {
+        return false;
+    }
+    constexpr int kBlock     = 256;
+    constexpr int kMaxGrid   = 4096;
+    const std::int64_t packs = n / 8;
+    const int grid           = static_cast<int>(std::min<std::int64_t>(
+        kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(kBlock)))));
+    sigmoid_gate_mul_bf16x8_to_fp16_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data), packs);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif
+
 void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     const std::int64_t n   = x.numel();
     constexpr int kBlock   = 256;

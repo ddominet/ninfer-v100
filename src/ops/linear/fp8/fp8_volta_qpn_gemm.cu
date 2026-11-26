@@ -7,6 +7,7 @@
 #include "core/device.h"
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
+#include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
 
@@ -115,7 +116,116 @@ __global__ void volta_stage_group_major_kernel(const __nv_bfloat16* __restrict__
     }
     reinterpret_cast<uint4*>(output)[vec] = packed;
 }
+
+template <bool kGroupMajor>
+__launch_bounds__(640, 2) __global__
+    void volta_rmsnorm_offset_d5120_staged_kernel(const __nv_bfloat16* __restrict__ x,
+                                                  const __nv_bfloat16* __restrict__ weight,
+                                                  half* __restrict__ out, int t, int tiles,
+                                                  float eps) {
+    constexpr int kBlock = 640; // 20 warps, 1 uint4 (8 elements) per thread -> 5120 exact
+    constexpr int kWarps = kBlock / 32;
+    const int row        = static_cast<int>(blockIdx.x);
+    const int tid        = static_cast<int>(threadIdx.x);
+
+    if constexpr (kGroupMajor) {
+        const int tile  = row >> 3;
+        const int r     = row & 7;
+        const int group = tid >> 1;
+        const int khalf = tid & 1;
+        if (row >= t) {
+            const std::int64_t vec =
+                ((static_cast<std::int64_t>(group) * tiles + tile) * 2 + khalf) * 8 + r;
+            reinterpret_cast<uint4*>(out)[vec] = make_uint4(0u, 0u, 0u, 0u);
+            return;
+        }
+    } else {
+        if (row >= t) { return; }
+    }
+
+    const uint4 xv =
+        __ldg(reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(row) * 5120) + tid);
+    const uint4 wv = __ldg(reinterpret_cast<const uint4*>(weight) + tid);
+    const auto* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+    float sum      = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 xf = __bfloat1622float2(xp[j]);
+        sum += xf.x * xf.x + xf.y * xf.y;
+    }
+
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    sum            = ninfer::ops::warp_reduce_sum(sum);
+    __shared__ float warp_sums[kWarps];
+    __shared__ float inv_shared;
+    if (lane == 0) { warp_sums[warp] = sum; }
+    __syncthreads();
+    if (warp == 0) {
+        float wsum = lane < kWarps ? warp_sums[lane] : 0.0f;
+        wsum       = ninfer::ops::warp_reduce_sum(wsum);
+        if (lane == 0) { inv_shared = rsqrtf(wsum * (1.0f / 5120.0f) + eps); }
+    }
+    __syncthreads();
+    const float inv = inv_shared;
+
+    const auto* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
+    uint4 packed;
+    auto* dst = reinterpret_cast<half2*>(&packed);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 xf         = __bfloat1622float2(xp[j]);
+        const float2 wf         = __bfloat1622float2(wp[j]);
+        const __nv_bfloat162 bf = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
+                                                        xf.y * inv * (wf.y + 1.0f));
+        dst[j]                  = __float22half2_rn(__bfloat1622float2(bf));
+    }
+    if constexpr (kGroupMajor) {
+        const int tile         = row >> 3;
+        const int r            = row & 7;
+        const int group        = tid >> 1;
+        const int khalf        = tid & 1;
+        const std::int64_t vec =
+            ((static_cast<std::int64_t>(group) * tiles + tile) * 2 + khalf) * 8 + r;
+        reinterpret_cast<uint4*>(out)[vec] = packed;
+    } else {
+        reinterpret_cast<uint4*>(out)[static_cast<std::int64_t>(row) * 640 + tid] = packed;
+    }
+}
 } // namespace
+
+bool volta_stage_fp16_enabled() noexcept {
+    static const bool enabled = volta_stage_enabled("NINFER_VOLTA_STAGE_FP16");
+    return enabled;
+}
+
+bool volta_group_major_enabled() noexcept {
+    static const bool enabled =
+        volta_stage_enabled("NINFER_VOLTA_STAGE_FP16") &&
+        volta_stage_enabled("NINFER_VOLTA_GROUP_MAJOR");
+    return enabled;
+}
+
+void volta_rmsnorm_offset_d5120_to_fp16(const Tensor& x, const Tensor& weight, float eps,
+                                        half* out_fp16, cudaStream_t stream) {
+    const int t = x.ne[1];
+    volta_rmsnorm_offset_d5120_staged_kernel<false><<<static_cast<unsigned>(t), 640, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        out_fp16, t, 0, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void volta_rmsnorm_offset_d5120_to_group_major(const Tensor& x, const Tensor& weight, float eps,
+                                               VoltaGroupMajorHalf* out_gm, cudaStream_t stream) {
+    const int t     = x.ne[1];
+    const int tiles = volta_group_major_tiles(t);
+    volta_rmsnorm_offset_d5120_staged_kernel<true>
+        <<<static_cast<unsigned>(tiles * 8), 640, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data), reinterpret_cast<half*>(out_gm), t,
+            tiles, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void* volta_stream_scratch(cudaStream_t stream, std::size_t bytes) {
     return volta_stage_scratch(stream, bytes, 1);

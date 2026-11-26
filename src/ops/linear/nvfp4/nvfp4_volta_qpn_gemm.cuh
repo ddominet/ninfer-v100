@@ -510,11 +510,15 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         const int row  = e / S::kColsPerCta;
         const int col  = e % S::kColsPerCta;
         const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
-        if (row < t && ocol < n) {
-            float value = 0.0f;
+        if (ocol < n) {
+            if (row < t) {
+                float value = 0.0f;
 #pragma unroll
-            for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
-            output.store(ocol, row, value);
+                for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
+                output.store(ocol, row, value);
+            } else if constexpr (requires { output.store_zero(ocol, row); }) {
+                output.store_zero(ocol, row);
+            }
         }
     }
 }
@@ -581,19 +585,21 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool split_half = (n == 17408 && k == 5120);
     // Past one 8-row tile, a prepacked weight goes through the tensor-core route: one weight read
     // for all T columns instead of one per 8-row tile.
-    if (prepacked && t > S::kRowsPerTile) {
-        const int x_tiles =
-            std::is_same_v<Activation, VoltaGroupMajorHalf> ? volta_group_major_tiles(t) : 0;
-        const bool launched = nvfp4_can_fold_rebias(inverse_weight_divisor)
-                                  ? launch_volta_tc_skinny(
-                                        Nvfp4VoltaTcDecoder<true>{codes, scales, k / S::kGroupK,
-                                                                  inverse_weight_divisor},
-                                        xd, n, k, t, x_tiles, output, stream)
-                                  : launch_volta_tc_skinny(
-                                        Nvfp4VoltaTcDecoder<false>{codes, scales, k / S::kGroupK,
-                                                                   inverse_weight_divisor},
-                                        xd, n, k, t, x_tiles, output, stream);
-        if (launched) { return; }
+    if constexpr (!requires { output.store_zero(0, 0); }) {
+        if (prepacked && t > S::kRowsPerTile) {
+            const int x_tiles =
+                std::is_same_v<Activation, VoltaGroupMajorHalf> ? volta_group_major_tiles(t) : 0;
+            const bool launched = nvfp4_can_fold_rebias(inverse_weight_divisor)
+                                      ? launch_volta_tc_skinny(
+                                            Nvfp4VoltaTcDecoder<true>{codes, scales, k / S::kGroupK,
+                                                                      inverse_weight_divisor},
+                                            xd, n, k, t, x_tiles, output, stream)
+                                      : launch_volta_tc_skinny(
+                                            Nvfp4VoltaTcDecoder<false>{codes, scales, k / S::kGroupK,
+                                                                       inverse_weight_divisor},
+                                            xd, n, k, t, x_tiles, output, stream);
+            if (launched) { return; }
+        }
     }
     if (t <= S::kRowsPerTile) {
         if (t == 1 && split_half) {

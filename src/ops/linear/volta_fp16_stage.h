@@ -38,4 +38,15 @@ const VoltaGroupMajorHalf* volta_stage_fp16_group_major(const Tensor& x, cudaStr
 // callers keep their unstaged route.
 void* volta_stream_scratch(cudaStream_t stream, std::size_t bytes);
 
+[[nodiscard]] bool volta_stage_fp16_enabled() noexcept;
+[[nodiscard]] bool volta_group_major_enabled() noexcept;
+
+// Fused D=5120 unit-offset RMSNorm -> BF16-rounded FP16 staged activation (row-major or
+// group-major with rows past T zero-filled). Eliminates both the intermediate BF16 hidden plane
+// and the subsequent BF16->FP16 staging kernel launch.
+void volta_rmsnorm_offset_d5120_to_fp16(const Tensor& x, const Tensor& weight, float eps,
+                                        half* out_fp16, cudaStream_t stream);
+void volta_rmsnorm_offset_d5120_to_group_major(const Tensor& x, const Tensor& weight, float eps,
+                                               VoltaGroupMajorHalf* out_gm, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail
