@@ -5,6 +5,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ops/common/dflash2_rmsnorm_rope_volta.h"
+#include "ops/kv_cache/append/launch.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/w8/w8_cutlass_sm70.h"
 #endif
@@ -187,6 +188,42 @@ void context_kv_materialize(
         Tensor value_batch = value.view({kHeadDim, kKVHeads, width, batch});
         kv_cache_append_prefix(key_batch, value_batch, positions, counts, state_slots,
                                append_envelope, layer.cache, stream);
+    }
+}
+
+void context_kv_materialize_compact(
+    const Tensor& context, const Tensor& positions, const Tensor& state_slots,
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t live = context.ne[1];
+    if (live <= 0 || context.dtype != DType::BF16 || context.ne[0] != kHidden ||
+        positions.dtype != DType::I32 || positions.ne[0] != live ||
+        state_slots.dtype != DType::I32 || state_slots.ne[0] != live) {
+        throw std::invalid_argument("context_kv_materialize_compact: invalid inputs");
+    }
+    for (const ContextKVMaterializeLayerView& layer : layers) {
+        auto layer_scope = workspace.scope();
+        Tensor key       = workspace.alloc(DType::BF16, {kKVSize, live});
+        Tensor value     = workspace.alloc(DType::BF16, {kKVSize, live});
+        if (layer.key_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+#ifdef NINFER_VOLTA_BUILD
+            if (!detail::w8_cutlass_sm70_try_launch_pair(context, layer.key_weight,
+                                                         layer.value_weight, key, value, workspace,
+                                                         stream))
+#endif
+            {
+                linear_pair(context, layer.key_weight, layer.value_weight, key, value, stream);
+            }
+        } else {
+            linear(context, layer.key_weight, key, stream);
+            linear(context, layer.value_weight, value, stream);
+        }
+        Tensor key_heads = key.view({kHeadDim, kKVHeads, live});
+        detail::dflash2_rmsnorm_rope_launch(key_heads, layer.key_norm_weight, positions, 1.0e-6F,
+                                            1.0e7F, stream);
+        detail::kv_cache_append_compact_cyclic_launch(
+            key.view({kHeadDim, kKVHeads, live}), value.view({kHeadDim, kKVHeads, live}), positions,
+            state_slots, layer.cache, stream);
     }
 }
 

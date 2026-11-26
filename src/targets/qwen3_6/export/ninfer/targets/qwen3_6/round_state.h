@@ -102,6 +102,14 @@ struct DFlashDecodeIngress {
     // Columns of the context-append block: the most target features any request appends this
     // round (0 = the full verify width). Each request appends only its last round's commits.
     std::int32_t append_width = 0;
+    // Compacted context-append columns for eager DFlash2 rounds: -1 skips empty append (0 live
+    // tokens), 0 uses the legacy ragged append path, >0 packs only the listed live (lane, col)
+    // pairs so feature_projection and 5x context_kv_materialize process zero padded columns.
+    std::int32_t append_live = 0;
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> append_src_lanes{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> append_src_cols{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> append_dst_positions{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> append_dst_slots{};
     // Draft block width this round (0 = the full K + 1). A narrower block drafts only as many
     // positions as any request keeps; draft_expand maps each K-wide draft column i + K*b to its
     // narrow column i + k'*b, or -1.

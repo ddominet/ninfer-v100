@@ -141,6 +141,12 @@ struct VerifyCompaction {
     bool skip_logits_expand        = false;
 };
 
+struct GreedyVerifyArgmax {
+    const Tensor* drafts               = nullptr;
+    const Tensor* extents              = nullptr;
+    const ops::SamplingConfig* configs = nullptr;
+};
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
@@ -241,13 +247,15 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens,
-                             const VerifyCompaction* compaction = nullptr);
+                             const VerifyCompaction* compaction        = nullptr,
+                             const GreedyVerifyArgmax* greedy_argmax   = nullptr);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink,
-                             const VerifyCompaction* compaction = nullptr);
+                             const VerifyCompaction* compaction        = nullptr,
+                             const GreedyVerifyArgmax* greedy_argmax   = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -285,7 +293,8 @@ private:
                                   const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap,
-                                  const VerifyCompaction* compaction);
+                                  const VerifyCompaction* compaction,
+                                  const GreedyVerifyArgmax* greedy_argmax);
     // Padded [rows, W*B] copy of a compact [rows, C] tensor (dropped columns zero) and back.
     [[nodiscard]] Tensor expand_verify_columns(const Tensor& compact, std::int32_t rows);
     [[nodiscard]] Tensor compact_verify_columns(const Tensor& padded, std::int32_t rows);

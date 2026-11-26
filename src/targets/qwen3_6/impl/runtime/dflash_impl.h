@@ -506,6 +506,46 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
     }
 }
 
+template <class V>
+void append_context_compact_impl(DFlashBatchContext& state, std::int32_t append_live) {
+    if constexpr (V::DFlashConfig::coherent_selector) {
+        using Config                      = typename V::DFlashConfig;
+        qwen3_6::DFlashDecodeState& frame = state.frame;
+        auto* ingress_bytes               = static_cast<unsigned char*>(frame.ingress.data);
+        const Tensor src_lanes(
+            ingress_bytes + offsetof(qwen3_6::DFlashDecodeIngress, append_src_lanes), DType::I32,
+            {append_live});
+        const Tensor src_cols(
+            ingress_bytes + offsetof(qwen3_6::DFlashDecodeIngress, append_src_cols), DType::I32,
+            {append_live});
+        const Tensor dst_positions(
+            ingress_bytes + offsetof(qwen3_6::DFlashDecodeIngress, append_dst_positions),
+            DType::I32, {append_live});
+        const Tensor dst_slots(
+            ingress_bytes + offsetof(qwen3_6::DFlashDecodeIngress, append_dst_slots), DType::I32,
+            {append_live});
+        Tensor compact_features =
+            state.execution.work.alloc(DType::BF16, {Config::feature_rows, append_live});
+        ops::prepare_compact_prefix(dflash_state(state).pending_features, src_lanes, src_cols,
+                                    compact_features, state.execution.device.stream);
+        auto roots =
+            workspace_recipe::dflash_context<Config>(state.execution.work, append_live);
+        ops::linear(compact_features, state.execution.model.dflash->feature_projection,
+                    roots.projected, ops::LinearPolicy::A16Only, state.execution.work,
+                    state.execution.device.stream);
+        ops::rmsnorm(roots.projected, state.execution.model.dflash->context_norm,
+                     Config::rms_epsilon, false, roots.normalized, state.execution.device.stream);
+        std::array<ops::ContextKVMaterializeLayerView, Config::layers> layers;
+        for (int layer = 0; layer < Config::layers; ++layer) {
+            const auto& weights = state.execution.model.dflash->layers[layer];
+            layers[layer]       = {weights.context_key, weights.context_value, weights.key_norm,
+                                   dflash_state(state).local_layer(layer)};
+        }
+        ops::context_kv_materialize_compact(roots.normalized, dst_positions, dst_slots, layers,
+                                            state.execution.work, state.execution.device.stream);
+    }
+}
+
 void dflash_propose_stage_impl(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                                DFlashEnvelopes envelopes, bool emit_confidence) {
     if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) || k == 0 ||
@@ -527,17 +567,26 @@ void dflash_propose_stage_impl(DFlashBatchContext& state, std::int32_t batch_siz
     Tensor append_counts      = frame.append_counts.slice(0, 0, batch_size);
 
     state.execution.work.reset();
-    const std::int32_t append_width =
-        state.host_ingress.append_width > 0 ? std::min(state.host_ingress.append_width, width)
-                                            : width;
-    append_positions = Tensor(append_positions.data, DType::I32, {append_width, batch_size});
-    Tensor compact_features = state.execution.work.alloc(
-        DType::BF16, {Variant::DFlashConfig::feature_rows, append_width, batch_size});
-    const Tensor pending = dflash_state(state).pending_features.slice(1, 0, append_width);
-    ops::prepare_ragged_prefix(pending, active_lanes, context_starts, frontiers, compact_features,
-                               append_positions, append_counts, state.execution.device.stream);
-    append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
-                                 state_destinations, dflash_rows, envelopes.append);
+    const std::int32_t append_live = state.host_ingress.append_live;
+    if (Variant::DFlashConfig::coherent_selector && append_live < 0) {
+        // Zero new tokens to append (e.g. first decode round right after prefill): skip
+        // feature_projection and all 5 context KV projections completely.
+    } else if (Variant::DFlashConfig::coherent_selector && append_live > 0) {
+        append_context_compact_impl<Variant>(state, append_live);
+    } else {
+        const std::int32_t append_width = state.host_ingress.append_width > 0
+                                              ? std::min(state.host_ingress.append_width, width)
+                                              : width;
+        append_positions = Tensor(append_positions.data, DType::I32, {append_width, batch_size});
+        Tensor compact_features = state.execution.work.alloc(
+            DType::BF16, {Variant::DFlashConfig::feature_rows, append_width, batch_size});
+        const Tensor pending = dflash_state(state).pending_features.slice(1, 0, append_width);
+        ops::prepare_ragged_prefix(pending, active_lanes, context_starts, frontiers,
+                                   compact_features, append_positions, append_counts,
+                                   state.execution.device.stream);
+        append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
+                                     state_destinations, dflash_rows, envelopes.append);
+    }
 
     const std::int32_t draft_width = state.host_ingress.draft_width;
     std::int32_t conf_k            = static_cast<std::int32_t>(k);
@@ -665,7 +714,7 @@ void dflash_verify_stage_impl(DFlashBatchContext& state, std::int32_t batch_size
     const Tensor attention_source =
         ingress_tensor(offsetof(qwen3_6::DFlashDecodeIngress, attention_source));
     VerifyCompaction compaction{&live_columns, &padded_slots, live};
-    compaction.skip_logits_expand = state.all_raw_greedy;
+    compaction.skip_logits_expand = state.all_greedy;
     if (state.host_ingress.attention_width > 0) {
         compaction.attention_width  = state.host_ingress.attention_width;
         compaction.attention_slots  = &attention_slots;
@@ -711,7 +760,8 @@ void dflash_verify_stage_impl(DFlashBatchContext& state, std::int32_t batch_size
                 .sampling        = frame.sampling,
                 .feature_sink    = &sink,
                 .compaction      = live > 0 && live < width * batch_size ? &compaction : nullptr,
-                .all_raw_greedy  = state.all_raw_greedy,
+                .all_greedy      = state.all_greedy,
+                .any_penalties   = state.any_penalties,
             },
             target_envelope);
     }

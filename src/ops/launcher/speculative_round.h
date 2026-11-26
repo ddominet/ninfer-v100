@@ -36,4 +36,10 @@ void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tenso
 void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t* id_map,
                                      std::int32_t n, cudaStream_t stream);
 
+void speculative_penalized_argmax_launch(const Tensor& logits, const Tensor* padded_slots,
+                                         const Tensor& drafts, const Tensor& current_extents,
+                                         const SamplingConfig* configs, std::int32_t token_domain,
+                                         std::int32_t width, Tensor& target_tokens,
+                                         DeviceSpan workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

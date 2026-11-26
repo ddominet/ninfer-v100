@@ -248,4 +248,28 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
     launch_cyclic(k, v, positions, counts, lanes, cache, plan, stream);
 }
 
+void kv_cache_append_compact_cyclic_launch(const Tensor& k, const Tensor& v,
+                                           const Tensor& positions, const Tensor& lanes,
+                                           CyclicKVCacheLayerView cache, cudaStream_t stream) {
+    const int live = k.ne[2];
+    if (live <= 0) { return; }
+    const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
+    const auto* input_v = static_cast<const __nv_bfloat16*>(v.data);
+    const auto* pos     = static_cast<const std::int32_t*>(positions.data);
+    const auto* lane    = static_cast<const std::int32_t*>(lanes.data);
+    auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
+    auto* cache_v       = static_cast<__half*>(cache.v.data);
+    const int padded    = static_cast<int>(cache.padded_capacity);
+    if (cache.capacity == 2048) {
+        kv_cache_append_compact_cyclic_kernel<2048><<<static_cast<unsigned>(live), 128, 0, stream>>>(
+            input_k, input_v, pos, lane, cache_k, cache_v, padded);
+    } else if (cache.capacity == 4096) {
+        kv_cache_append_compact_cyclic_kernel<4096><<<static_cast<unsigned>(live), 128, 0, stream>>>(
+            input_k, input_v, pos, lane, cache_k, cache_v, padded);
+    } else {
+        throw std::invalid_argument("kv_cache_append_compact_cyclic: unsupported cyclic capacity");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

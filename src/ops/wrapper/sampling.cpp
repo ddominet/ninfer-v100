@@ -75,4 +75,16 @@ void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaS
     detail::increment_token_counts_launch(token_ids, token_counts, stream);
 }
 
+void increment_token_counts_batch(const Tensor& licensed_tokens,
+                                  const TokenCountBatchUpdate& update, Tensor& token_counts,
+                                  cudaStream_t stream) {
+    if (update.batch <= 0 || update.batch > 8 || update.row_stride <= 0 || update.row_stride > 16 ||
+        update.token_domain <= 0 || licensed_tokens.dtype != DType::I32 ||
+        token_counts.dtype != DType::I32 || licensed_tokens.data == nullptr ||
+        token_counts.data == nullptr) {
+        throw std::invalid_argument("increment_token_counts_batch: invalid arguments");
+    }
+    detail::increment_token_counts_batch_launch(licensed_tokens, update, token_counts, stream);
+}
+
 } // namespace ninfer::ops

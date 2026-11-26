@@ -252,4 +252,25 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
+void speculative_penalized_argmax(const Tensor& logits, const Tensor* padded_slots,
+                                  const Tensor& drafts, const Tensor& current_extents,
+                                  const SamplingConfig* configs, std::int32_t token_domain,
+                                  std::int32_t width, Tensor& target_tokens,
+                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    if (width < 2 || width > 16 || drafts.ne[0] != width - 1 || drafts.ne[1] < 1 ||
+        drafts.ne[1] > kSparseMaxBatch || logits.dtype != DType::BF16 ||
+        token_domain <= 0 || token_domain > logits.ne[0] || configs == nullptr) {
+        throw std::invalid_argument("speculative_penalized_argmax: invalid arguments");
+    }
+    auto scope = workspace.scope();
+    const std::size_t batch = static_cast<std::size_t>(drafts.ne[1]);
+    const std::size_t bytes =
+        static_cast<std::size_t>(width) * batch * sizeof(unsigned long long) +
+        batch * sizeof(std::int32_t);
+    const DeviceSpan scratch = workspace.alloc_bytes(bytes, 16);
+    detail::speculative_penalized_argmax_launch(logits, padded_slots, drafts, current_extents,
+                                                configs, token_domain, width, target_tokens,
+                                                scratch, stream);
+}
+
 } // namespace ninfer::ops

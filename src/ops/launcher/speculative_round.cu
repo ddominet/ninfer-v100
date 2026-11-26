@@ -174,4 +174,43 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_penalized_argmax_launch(const Tensor& logits, const Tensor* padded_slots,
+                                         const Tensor& drafts, const Tensor& current_extents,
+                                         const SamplingConfig* configs, std::int32_t token_domain,
+                                         std::int32_t width, Tensor& target_tokens,
+                                         DeviceSpan workspace, cudaStream_t stream) {
+    const std::int32_t physical_rows = logits.ne[0];
+    const std::int32_t batch         = drafts.ne[1];
+    const std::size_t best_bytes =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(batch) *
+        sizeof(unsigned long long);
+    const std::size_t done_bytes = static_cast<std::size_t>(batch) * sizeof(std::int32_t);
+    const std::size_t total_bytes = best_bytes + done_bytes;
+    CUDA_CHECK(cudaMemsetAsync(workspace.data, 0, total_bytes, stream));
+
+    auto* global_best = static_cast<unsigned long long*>(workspace.data);
+    auto* tile_done   = reinterpret_cast<std::int32_t*>(
+        static_cast<unsigned char*>(workspace.data) + best_bytes);
+    const auto* slots_ptr =
+        padded_slots != nullptr ? static_cast<const std::int32_t*>(padded_slots->data) : nullptr;
+    constexpr int kTilesPerRow = 64;
+    const dim3 grid(kTilesPerRow, static_cast<unsigned int>(batch));
+    if (width <= 8) {
+        speculative_penalized_argmax_kernel<8><<<grid, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), slots_ptr,
+            static_cast<const std::int32_t*>(drafts.data),
+            static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
+            physical_rows, width, global_best, tile_done,
+            static_cast<std::int32_t*>(target_tokens.data));
+    } else {
+        speculative_penalized_argmax_kernel<16><<<grid, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), slots_ptr,
+            static_cast<const std::int32_t*>(drafts.data),
+            static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
+            physical_rows, width, global_best, tile_done,
+            static_cast<std::int32_t*>(target_tokens.data));
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

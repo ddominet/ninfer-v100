@@ -33,4 +33,21 @@ __global__ void prepare_ragged_prefix_kernel(
     }
 }
 
+__global__ void prepare_compact_prefix_kernel(
+    const uint4* __restrict__ source, const std::int32_t* __restrict__ src_lanes,
+    const std::int32_t* __restrict__ src_cols, uint4* __restrict__ destination,
+    std::int32_t vectors_per_column, std::int64_t source_column_stride,
+    std::int64_t source_lane_stride) {
+    const int col          = static_cast<int>(blockIdx.x);
+    const int feature_tile = static_cast<int>(blockIdx.y);
+    const std::int64_t src_base =
+        static_cast<std::int64_t>(src_lanes[col]) * source_lane_stride +
+        static_cast<std::int64_t>(src_cols[col]) * source_column_stride;
+    const std::int64_t dst_base = static_cast<std::int64_t>(col) * vectors_per_column;
+    for (int vec = feature_tile * kRaggedPrefixVectorsPerBlock + threadIdx.x;
+         vec < vectors_per_column; vec += gridDim.y * kRaggedPrefixVectorsPerBlock) {
+        destination[dst_base + vec] = source[src_base + vec];
+    }
+}
+
 } // namespace ninfer::ops

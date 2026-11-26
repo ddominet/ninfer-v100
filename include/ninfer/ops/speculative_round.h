@@ -188,4 +188,13 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
 
+// Single-pass penalized greedy argmax directly on compact or dense BF16 logits [physical_rows, C].
+// Reads each row's token_counts once across all 1..extent+1 live columns and outputs exact
+// penalty-adjusted argmax ids into target_tokens [width, batch] (bit-identical to sampling.h).
+void speculative_penalized_argmax(const Tensor& logits, const Tensor* padded_slots,
+                                  const Tensor& drafts, const Tensor& current_extents,
+                                  const SamplingConfig* configs, std::int32_t token_domain,
+                                  std::int32_t width, Tensor& target_tokens,
+                                  WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops

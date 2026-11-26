@@ -81,4 +81,17 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 // [token_domain] committed count array. IDs must be in [0,token_domain).
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
 
+struct TokenCountBatchUpdate {
+    std::int32_t batch        = 0;
+    std::int32_t row_stride   = 0;
+    std::int32_t token_domain = 0;
+    std::int32_t counts[8]    = {};
+    std::int32_t lanes[8]     = {}; // < 0 skips row
+};
+
+// Batched token-count update across up to 8 lanes in one kernel launch.
+void increment_token_counts_batch(const Tensor& licensed_tokens,
+                                  const TokenCountBatchUpdate& update, Tensor& token_counts,
+                                  cudaStream_t stream);
+
 } // namespace ninfer::ops

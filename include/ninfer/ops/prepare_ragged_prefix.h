@@ -25,4 +25,8 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
                            const Tensor& ends, Tensor& destination, Tensor& positions,
                            Tensor& counts, cudaStream_t stream);
 
+// Compact gather of live (lane, column) pairs from pending features [D, W, C] into [D, live].
+void prepare_compact_prefix(const Tensor& source, const Tensor& src_lanes, const Tensor& src_cols,
+                            Tensor& destination, cudaStream_t stream);
+
 } // namespace ninfer::ops

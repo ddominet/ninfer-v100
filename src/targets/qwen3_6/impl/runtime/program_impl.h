@@ -897,7 +897,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const char* async_fold_env = std::getenv("NINFER_ASYNC_GDN_FOLD");
         if (speculative_backend == SpeculativeBackend::DFlash2 && !use_cuda_graph &&
             !(async_fold_env != nullptr && async_fold_env[0] == '0')) {
-            CUDA_CHECK(cudaStreamCreateWithFlags(&gdn_fold_stream_, cudaStreamNonBlocking));
+            int least_prio    = 0;
+            int greatest_prio = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_prio, &greatest_prio));
+            if (greatest_prio < least_prio) {
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                cudaStream_t high_stream = nullptr;
+                CUDA_CHECK(cudaStreamCreateWithPriority(&high_stream, cudaStreamNonBlocking,
+                                                        greatest_prio));
+                CUDA_CHECK(cudaStreamDestroy(device.stream));
+                device.stream = high_stream;
+            }
+            CUDA_CHECK(cudaStreamCreateWithPriority(&gdn_fold_stream_, cudaStreamNonBlocking,
+                                                    least_prio));
             async_gdn_fold_ = true;
         }
     }
@@ -932,10 +944,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         dflash_trace         = trace != nullptr && trace[0] == '1';
         const char* force    = std::getenv("NINFER_DFLASH_FORCE_KEEP");
         dflash_force_keep    = force != nullptr ? std::atoi(force) : -1;
-        // Prior: profiled V100 costs (36 ms flat to 8 target columns, ~5.5 ms/tile, ~1.24 ms per
-        // head chunk, 12 ms/100K fixed context, 0.45 ms/8 draft-block cols, 8 ms/100K width-scaled
-        // context attention), refined online from the rounds this engine runs.
-        dflash_cost.reset({36.0, 1.2, 5.5, 1.24, 12.0, 0.45, 8.0},
+        // Prior: profiled V100 costs (35.2 ms flat to 8 target columns, ~5.8 ms/tile, ~0.85 ms per
+        // prepacked Q4 head pass, 12 ms/100K fixed context, 0.55 ms/8 draft-block cols, 8 ms/100K
+        // width-scaled context attention), refined online from the rounds this engine runs.
+        dflash_cost.reset({35.2, 1.2, 5.8, 0.85, 12.0, 0.55, 8.0},
                           {25.0, 1.0, 9.0, 0.5, 25.0, 0.25, 16.0});
     }
     if (plan.persistent.dflash) {
@@ -10255,20 +10267,27 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             gdn_fold_pending_ = true;
         }
 
-        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
+        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend
+        // in one batched kernel launch across all penalized lanes.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
+            ops::TokenCountBatchUpdate update{};
+            update.batch        = static_cast<std::int32_t>(lanes.size());
+            update.row_stride   = io.dflash_decode->licensed_tokens.ne[0];
+            update.token_domain = TextConfig::token_domain;
+            bool any_active     = false;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
+                    update.lanes[row]  = -1;
+                    update.counts[row] = 0;
                     continue;
                 }
-                const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
-                Tensor ids =
-                    io.dflash_decode->licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
-                        .slice(0, 0, count)
-                        .view({count});
-                Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(lanes[row]), 1)
-                                    .view({TextConfig::token_domain});
-                ops::increment_token_counts(ids, counts, device.stream);
+                update.lanes[row]  = static_cast<std::int32_t>(lanes[row]);
+                update.counts[row] = static_cast<std::int32_t>(accepted_tokens[row]);
+                any_active         = true;
+            }
+            if (any_active) {
+                ops::increment_token_counts_batch(io.dflash_decode->licensed_tokens, update,
+                                                  token_counts, device.stream);
             }
         }
 
@@ -12576,6 +12595,36 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        // Compact DFlash2 context-append columns: skip empty round-0 appends and pack
+        // non-uniform multi-stream prefixes so feature_projection & 5x KV materialize
+        // process zero padded columns.
+        dflash_host_ingress->append_live = 0;
+        if (!use_cuda_graph && speculative_backend == SpeculativeBackend::DFlash2) {
+            std::int32_t live_append = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& sequence = active_sequence(lanes[row]);
+                const std::uint32_t cnt       = std::min(
+                    sequence.execution_frontier - sequence.dflash_context_frontier, width);
+                for (std::uint32_t c = 0; c < cnt; ++c) {
+                    const auto idx = static_cast<std::size_t>(live_append++);
+                    dflash_host_ingress->append_src_lanes[idx] =
+                        dflash_host_ingress->active_lanes[row];
+                    dflash_host_ingress->append_src_cols[idx] = static_cast<std::int32_t>(c);
+                    dflash_host_ingress->append_dst_positions[idx] =
+                        checked_i32(sequence.dflash_context_frontier + c, "DFlash append pos");
+                    dflash_host_ingress->append_dst_slots[idx] =
+                        dflash_host_ingress->state_destination_slots[row];
+                }
+            }
+            const std::int32_t padded_append =
+                dflash_host_ingress->append_width * static_cast<std::int32_t>(lanes.size());
+            if (live_append == 0) {
+                dflash_host_ingress->append_live = -1;
+            } else if (live_append < padded_append) {
+                dflash_host_ingress->append_live = live_append;
+            }
+        }
+
         const auto pack_verify_ingress = [&]() {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 const SequenceState& sequence = active_sequence(lanes[row]);
@@ -12698,14 +12747,17 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
         }
 
-        bool all_raw_greedy = !use_cuda_graph && speculative_backend == SpeculativeBackend::DFlash2;
-        if (all_raw_greedy) {
+        bool all_greedy    = !use_cuda_graph && speculative_backend == SpeculativeBackend::DFlash2;
+        bool any_penalties = false;
+        if (all_greedy) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 const ops::SamplingConfig& cfg = dflash_host_ingress->sampling[row];
-                if (cfg.temperature > 0.0f || cfg.presence_penalty != 0.0f ||
-                    cfg.frequency_penalty != 0.0f) {
-                    all_raw_greedy = false;
+                if (cfg.temperature > 0.0f) {
+                    all_greedy = false;
                     break;
+                }
+                if (cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f) {
+                    any_penalties = true;
                 }
             }
         }
@@ -12720,7 +12772,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *dflash_host_egress,
                                                     state_images->continuation_hidden_store(),
                                                     gdn_fold_pending_ ? &gdn_fold_done_ : nullptr,
-                                                    all_raw_greedy};
+                                                    all_greedy,
+                                                    any_penalties};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         if (use_post_conf) {

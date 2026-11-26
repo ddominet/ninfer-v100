@@ -71,6 +71,13 @@ void context_kv_materialize(
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
     ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
 
+// Compact variant: context is BF16 [5120, live], positions/state_slots are device I32 [live].
+// Materializes and scatters only the live columns across all 5 cyclic caches with zero padding.
+void context_kv_materialize_compact(
+    const Tensor& context, const Tensor& positions, const Tensor& state_slots,
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    WorkspaceArena& workspace, cudaStream_t stream);
+
 /**
  * Return transient capacity for every registered W in the inclusive interval at the exact batch
  * size, covering every valid count envelope and its selected route.

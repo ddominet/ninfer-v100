@@ -13,23 +13,33 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    const GreedyVerifyArgmax greedy_argmax_cfg{
+        .drafts  = &frame.drafts,
+        .extents = &frame.current_extents,
+        .configs = frame.sampling,
+    };
+    const GreedyVerifyArgmax* greedy_argmax =
+        (frame.proposal_q.data != nullptr && frame.all_greedy && frame.any_penalties)
+            ? &greedy_argmax_cfg
+            : nullptr;
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens, *frame.feature_sink, frame.compaction);
+                                 frame.target_tokens, *frame.feature_sink, frame.compaction,
+                                 greedy_argmax);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens, frame.compaction);
+                                 frame.target_tokens, frame.compaction, greedy_argmax);
     }
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            TextConfig::token_domain, frame.sampling, {frame.all_raw_greedy}, execution.work,
+            TextConfig::token_domain, frame.sampling, {frame.all_greedy}, execution.work,
             execution.device.stream);
     } else {
         ops::speculative_accept_greedy_drafts(

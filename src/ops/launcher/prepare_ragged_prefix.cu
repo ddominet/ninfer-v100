@@ -25,4 +25,19 @@ void prepare_ragged_prefix_launch(const Tensor& source, const Tensor& lanes, con
     CUDA_CHECK(cudaGetLastError());
 }
 
+void prepare_compact_prefix_launch(const Tensor& source, const Tensor& src_lanes,
+                                   const Tensor& src_cols, Tensor& destination,
+                                   cudaStream_t stream) {
+    const int vectors = source.ne[0] / 8;
+    const int tiles   = (vectors + kRaggedPrefixVectorsPerBlock - 1) / kRaggedPrefixVectorsPerBlock;
+    const dim3 grid(static_cast<unsigned>(destination.ne[1]),
+                    static_cast<unsigned>(std::min(tiles, 65535)), 1u);
+    prepare_compact_prefix_kernel<<<grid, kRaggedPrefixVectorsPerBlock, 0, stream>>>(
+        static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(src_lanes.data),
+        static_cast<const std::int32_t*>(src_cols.data), static_cast<uint4*>(destination.data),
+        vectors, source.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
+        source.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

@@ -40,4 +40,16 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
                                          counts, stream);
 }
 
+void prepare_compact_prefix(const Tensor& source, const Tensor& src_lanes, const Tensor& src_cols,
+                            Tensor& destination, cudaStream_t stream) {
+    const std::int32_t live = destination.ne[1];
+    if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 || source.ne[0] <= 0 ||
+        (source.ne[0] % 8) != 0 || live <= 0 || destination.ne[0] != source.ne[0] ||
+        src_lanes.dtype != DType::I32 || src_lanes.ne[0] != live || src_cols.dtype != DType::I32 ||
+        src_cols.ne[0] != live) {
+        throw std::invalid_argument("prepare_compact_prefix: invalid tensor geometry");
+    }
+    detail::prepare_compact_prefix_launch(source, src_lanes, src_cols, destination, stream);
+}
+
 } // namespace ninfer::ops

@@ -16,6 +16,19 @@ __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std
     if (index < count) { atomicAdd(&token_counts[token_ids[index]], 1); }
 }
 
+__global__ void increment_token_counts_batch_kernel(const std::int32_t* __restrict__ licensed,
+                                                    TokenCountBatchUpdate update,
+                                                    std::int32_t* __restrict__ token_counts) {
+    const int tid = static_cast<int>(threadIdx.x);
+    const int row = tid >> 4;
+    const int col = tid & 15;
+    if (row >= update.batch || col >= update.counts[row]) { return; }
+    const int lane = update.lanes[row];
+    if (lane < 0) { return; }
+    const int token = licensed[row * update.row_stride + col];
+    atomicAdd(&token_counts[static_cast<std::int64_t>(lane) * update.token_domain + token], 1);
+}
+
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }
@@ -56,6 +69,16 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
     const int count      = token_ids.ne[0];
     increment_token_counts_kernel<<<div_up(count, kBlock), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(token_ids.data), count,
+        static_cast<std::int32_t*>(token_counts.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void increment_token_counts_batch_launch(const Tensor& licensed_tokens,
+                                         const TokenCountBatchUpdate& update, Tensor& token_counts,
+                                         cudaStream_t stream) {
+    if (update.batch <= 0) { return; }
+    increment_token_counts_batch_kernel<<<1, 128, 0, stream>>>(
+        static_cast<const std::int32_t*>(licensed_tokens.data), update,
         static_cast<std::int32_t*>(token_counts.data));
     CUDA_CHECK(cudaGetLastError());
 }

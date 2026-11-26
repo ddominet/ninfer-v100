@@ -86,7 +86,8 @@ struct DFlashBatchContext {
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     const CudaCompletionEvent* gdn_fold_done = nullptr;
-    bool all_raw_greedy                      = false;
+    bool all_greedy                          = false;
+    bool any_penalties                       = false;
 };
 
 struct DFlashAppendContext {
@@ -132,7 +133,8 @@ struct TargetVerifyFrameView {
     DFlashFeatureSink* feature_sink        = nullptr;
     // Kept draft columns only (DFlash eager rounds); null verifies every padded column.
     const VerifyCompaction* compaction     = nullptr;
-    bool all_raw_greedy                    = false;
+    bool all_greedy                        = false;
+    bool any_penalties                     = false;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

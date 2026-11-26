@@ -30,6 +30,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/speculative_round.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/common/dflash2_rmsnorm_rope_volta.h"
 #endif
@@ -699,7 +700,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& linear_state_source_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                           Tap& tap, const VerifyCompaction* compaction) {
+                                           Tap& tap, const VerifyCompaction* compaction,
+                                           const GreedyVerifyArgmax* greedy_argmax) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -749,7 +751,13 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             }
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
             ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+            if (greedy_argmax != nullptr) {
+                ops::speculative_penalized_argmax(
+                    flat_logits, nullptr, *greedy_argmax->drafts, *greedy_argmax->extents,
+                    greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_, stream);
+            } else {
+                ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+            }
         } else {
             const std::int32_t live = compaction->live;
             if (live <= 0 || live > columns || compaction->live_columns == nullptr ||
@@ -806,24 +814,33 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden_c, stream);
             Tensor logits_c = work_.alloc(DType::BF16, {kCfg.vocab, live});
             ops::linear(hidden_c, *lm_head_, logits_c, stream);
-            Tensor tokens_c = work_.alloc(DType::I32, {live});
-            ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
-            Tensor flat_tokens_row     = flat_tokens.view({1, columns});
-            const Tensor tokens_c_row  = tokens_c.view({1, live});
-            // Acceptance reads each request's verified extent, which is its kept columns: the
-            // dropped columns of the padded hidden and logits are never read, so they are not
-            // zeroed. The 4-byte token row goes separately: in the group it held the
-            // vocabulary-wide logits to 4-byte copies (192 us a round, the costliest gather).
-            if (compaction->skip_logits_expand) {
+            if (greedy_argmax != nullptr) {
+                ops::speculative_penalized_argmax(
+                    logits_c, &padded_slots, *greedy_argmax->drafts, *greedy_argmax->extents,
+                    greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_, stream);
                 ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
                                           {&flat_hidden, nullptr, nullptr, nullptr}, padded_slots,
                                           stream, false);
             } else {
-                ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
-                                          {&flat_hidden, &flat_logits, nullptr, nullptr},
-                                          padded_slots, stream, false);
+                Tensor tokens_c = work_.alloc(DType::I32, {live});
+                ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
+                Tensor flat_tokens_row    = flat_tokens.view({1, columns});
+                const Tensor tokens_c_row = tokens_c.view({1, live});
+                // Acceptance reads each request's verified extent, which is its kept columns: the
+                // dropped columns of the padded hidden and logits are never read, so they are not
+                // zeroed. The 4-byte token row goes separately: in the group it held the
+                // vocabulary-wide logits to 4-byte copies (192 us a round, the costliest gather).
+                if (compaction->skip_logits_expand) {
+                    ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
+                                              {&flat_hidden, nullptr, nullptr, nullptr},
+                                              padded_slots, stream, false);
+                } else {
+                    ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
+                                              {&flat_hidden, &flat_logits, nullptr, nullptr},
+                                              padded_slots, stream, false);
+                }
+                ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
             }
-            ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
             active_tap_scratch_ = Tensor{};
         }
     }
@@ -862,11 +879,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                      const VerifyCompaction* compaction) {
+                                      const VerifyCompaction* compaction,
+                                      const GreedyVerifyArgmax* greedy_argmax) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap, compaction);
+                             tap, compaction, greedy_argmax);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -876,10 +894,11 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink,
-                                      const VerifyCompaction* compaction) {
+                                      const VerifyCompaction* compaction,
+                                      const GreedyVerifyArgmax* greedy_argmax) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink, compaction);
+                             sink, compaction, greedy_argmax);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -932,7 +951,6 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -942,8 +960,27 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
-                                  s);
+    bool projected   = false;
+#ifdef NINFER_VOLTA_BUILD
+    projected = [&]<class V>() -> bool {
+        if constexpr (requires {
+                          V::attention_projection_from_residual(
+                              x, *w.input_norm, kCfg.rms_eps, *w.projection, q_flat, gate_flat,
+                              k_flat, v_flat, ph, work_, s);
+                      }) {
+            return V::attention_projection_from_residual(
+                x, *w.input_norm, kCfg.rms_eps, *w.projection, q_flat, gate_flat, k_flat, v_flat,
+                ph, work_, s);
+        } else {
+            return false;
+        }
+    }.template operator()<Variant>();
+#endif
+    if (!projected) {
+        ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+        Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph,
+                                      work_, s);
+    }
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -1024,9 +1061,23 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                                       batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a, s);
     }
-    ops::sigmoid_mul(gate, a, s);
-
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    bool fused_attn_out = false;
+#ifdef NINFER_VOLTA_BUILD
+    fused_attn_out = [&]<class V>() -> bool {
+        if constexpr (requires {
+                          V::attention_output_projection_from_gated(gate, a, *w.o_proj, x, ph,
+                                                                    work_, s);
+                      }) {
+            return V::attention_output_projection_from_gated(gate, a, *w.o_proj, x, ph, work_, s);
+        } else {
+            return false;
+        }
+    }.template operator()<Variant>();
+#endif
+    if (!fused_attn_out) {
+        ops::sigmoid_mul(gate, a, s);
+        Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    }
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -1046,19 +1097,40 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     // On the record path the input projection also runs on the kept columns (projected_record
     // below); only the in-place snapshot path needs the padded hidden.
     const bool compact_projection = compact && gdn_state_action_ == GdnStateAction::RecordForReplay;
+    const bool record_verify = ph == Phase::Verify && gdn_state_action_ == GdnStateAction::RecordForReplay;
     bool control_scattered        = false;
+    bool hidden_is_fp16           = false;
     if (compact) {
         if (active_compaction_->live != T) {
             throw std::logic_error("GDN compaction does not match the kept columns");
         }
         Tensor g_padded    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
         Tensor beta_padded = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, P});
-        if (compact_projection && Variant::gdn_norm_control_projection_scatter(
+#ifdef NINFER_VOLTA_BUILD
+        if (compact_projection) {
+            hidden_is_fp16 = [&]<class V>() -> bool {
+                if constexpr (requires {
+                                  V::gdn_norm_control_projection_fp16(
                                       x, *w.input_norm, kCfg.rms_eps, *w.projection,
-                                      *active_compaction_->live_columns, h, g_padded, beta_padded,
-                                      s)) {
+                                      active_compaction_->live_columns, h, g_padded, beta_padded,
+                                      s);
+                              }) {
+                    return V::gdn_norm_control_projection_fp16(
+                        x, *w.input_norm, kCfg.rms_eps, *w.projection,
+                        active_compaction_->live_columns, h, g_padded, beta_padded, s);
+                } else {
+                    return false;
+                }
+            }.template operator()<Variant>();
+            if (hidden_is_fp16) { control_scattered = true; }
+        }
+#endif
+        if (!hidden_is_fp16 && compact_projection &&
+            Variant::gdn_norm_control_projection_scatter(
+                x, *w.input_norm, kCfg.rms_eps, *w.projection, *active_compaction_->live_columns, h,
+                g_padded, beta_padded, s)) {
             control_scattered = true;
-        } else {
+        } else if (!hidden_is_fp16) {
             Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h,
                                                  g, beta, work_, ctx_.execution_view());
             g_kept_    = g.view({kCfg.gdn_v_heads, T});
@@ -1073,8 +1145,27 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         g    = g_padded;
         beta = beta_padded;
     } else {
-        Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
-                                             beta, work_, ctx_.execution_view());
+#ifdef NINFER_VOLTA_BUILD
+        if (record_verify) {
+            hidden_is_fp16 = [&]<class V>() -> bool {
+                if constexpr (requires {
+                                  V::gdn_norm_control_projection_fp16(
+                                      x, *w.input_norm, kCfg.rms_eps, *w.projection, nullptr, h, g,
+                                      beta, s);
+                              }) {
+                    return V::gdn_norm_control_projection_fp16(x, *w.input_norm, kCfg.rms_eps,
+                                                               *w.projection, nullptr, h, g, beta,
+                                                               s);
+                } else {
+                    return false;
+                }
+            }.template operator()<Variant>();
+        }
+#endif
+        if (!hidden_is_fp16) {
+            Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h,
+                                                 g, beta, work_, ctx_.execution_view());
+        }
     }
     const Tensor kept_hidden = h;
 
@@ -1121,9 +1212,29 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 // past it itself), so no reader reaches them.
                 // Where the variant has the route, the projection writes each kept column
                 // straight into its padded record column: no expansion of the 10240-row q/k/v.
-                const bool scattered = Variant::gdn_input_projection_scatter(
-                    kept_hidden, *w.projection, record_flat, gate_kept_,
-                    *active_compaction_->live_columns, s);
+                bool scattered = false;
+#ifdef NINFER_VOLTA_BUILD
+                if (hidden_is_fp16) {
+                    scattered = [&]<class V>() -> bool {
+                        if constexpr (requires {
+                                          V::gdn_input_projection_scatter_fp16(
+                                              kept_hidden, *w.projection, record_flat, gate_kept_,
+                                              *active_compaction_->live_columns, s);
+                                      }) {
+                            return V::gdn_input_projection_scatter_fp16(
+                                kept_hidden, *w.projection, record_flat, gate_kept_,
+                                *active_compaction_->live_columns, s);
+                        } else {
+                            return false;
+                        }
+                    }.template operator()<Variant>();
+                }
+#endif
+                if (!scattered) {
+                    scattered = Variant::gdn_input_projection_scatter(
+                        kept_hidden, *w.projection, record_flat, gate_kept_,
+                        *active_compaction_->live_columns, s);
+                }
                 if (scattered) {
                     if (!control_scattered) {
                         ops::gather_columns_group({&g_kept_, &beta_kept_, nullptr, nullptr},
@@ -1147,10 +1258,35 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                                *active_linear_state_source_slots_, query_output,
                                                key_output, value_output, s);
             } else {
-                Variant::gdn_input_projection_record(
-                    projection_input, *w.projection, *w.conv1d, conv_states, valid,
-                    *active_linear_state_source_slots_, records.conv, query_output, key_output,
-                    value_output, gate_output, ph, work_, s);
+                bool recorded_fp16 = false;
+#ifdef NINFER_VOLTA_BUILD
+                if (hidden_is_fp16) {
+                    recorded_fp16 = [&]<class V>() -> bool {
+                        if constexpr (requires {
+                                          V::gdn_input_projection_record_fp16(
+                                              projection_input, *w.projection, *w.conv1d,
+                                              conv_states, valid,
+                                              *active_linear_state_source_slots_, records.conv,
+                                              query_output, key_output, value_output, gate_output,
+                                              s);
+                                      }) {
+                            V::gdn_input_projection_record_fp16(
+                                projection_input, *w.projection, *w.conv1d, conv_states, valid,
+                                *active_linear_state_source_slots_, records.conv, query_output,
+                                key_output, value_output, gate_output, s);
+                            return true;
+                        } else {
+                            return false;
+                        }
+                    }.template operator()<Variant>();
+                }
+#endif
+                if (!recorded_fp16) {
+                    Variant::gdn_input_projection_record(
+                        projection_input, *w.projection, *w.conv1d, conv_states, valid,
+                        *active_linear_state_source_slots_, records.conv, query_output, key_output,
+                        value_output, gate_output, ph, work_, s);
+                }
             }
         } else {
             Variant::gdn_input_projection_snapshot(
@@ -1211,12 +1347,31 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    bool fused_gdn_out = false;
     if (compact && gate_kept_.data != nullptr) {
         // Gate already kept: the norm reads the recurrence output's kept columns in place.
         const Tensor z_kept = gate_kept_.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
         gate_kept_          = Tensor{};
-        ops::gated_rmsnorm_columns(o, *w.gdn_norm, z_kept, kCfg.rms_eps,
-                                   *active_compaction_->live_columns, on, s);
+#ifdef NINFER_VOLTA_BUILD
+        fused_gdn_out = [&]<class V>() -> bool {
+            if constexpr (requires {
+                              V::gdn_output_projection_from_gated_norm(
+                                  o, *w.gdn_norm, z_kept, kCfg.rms_eps,
+                                  active_compaction_->live_columns, on, *w.out_proj, x, ph, work_,
+                                  s);
+                          }) {
+                return V::gdn_output_projection_from_gated_norm(
+                    o, *w.gdn_norm, z_kept, kCfg.rms_eps, active_compaction_->live_columns, on,
+                    *w.out_proj, x, ph, work_, s);
+            } else {
+                return false;
+            }
+        }.template operator()<Variant>();
+#endif
+        if (!fused_gdn_out) {
+            ops::gated_rmsnorm_columns(o, *w.gdn_norm, z_kept, kCfg.rms_eps,
+                                       *active_compaction_->live_columns, on, s);
+        }
     } else {
         if (compact) {
             Tensor o_kept         = work_.alloc(DType::BF16, {kCfg.value_dim, T});
@@ -1229,10 +1384,26 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             o = o_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
             z = z_kept.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
         }
-        ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+#ifdef NINFER_VOLTA_BUILD
+        fused_gdn_out = [&]<class V>() -> bool {
+            if constexpr (requires {
+                              V::gdn_output_projection_from_gated_norm(
+                                  o, *w.gdn_norm, z, kCfg.rms_eps, nullptr, on, *w.out_proj, x, ph,
+                                  work_, s);
+                          }) {
+                return V::gdn_output_projection_from_gated_norm(
+                    o, *w.gdn_norm, z, kCfg.rms_eps, nullptr, on, *w.out_proj, x, ph, work_, s);
+            } else {
+                return false;
+            }
+        }.template operator()<Variant>();
+#endif
+        if (!fused_gdn_out) { ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s); }
     }
 
-    Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    if (!fused_gdn_out) {
+        Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1252,6 +1423,21 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
                            const ops::SparseMoeHints& hints) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+#ifdef NINFER_VOLTA_BUILD
+    if ([&]<class V>() -> bool {
+            if constexpr (requires {
+                              V::post_mixer_from_residual(x, *post_norm, kCfg.rms_eps, *m.payload,
+                                                          ph, hints, work_, s);
+                          }) {
+                return V::post_mixer_from_residual(x, *post_norm, kCfg.rms_eps, *m.payload, ph,
+                                                   hints, work_, s);
+            } else {
+                return false;
+            }
+        }.template operator()<Variant>()) {
+        return;
+    }
+#endif
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 

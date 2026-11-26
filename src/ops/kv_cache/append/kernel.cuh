@@ -382,6 +382,24 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
                                             padded_capacity);
 }
 
+template <int Capacity>
+__global__ void kv_cache_append_compact_cyclic_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ lanes,
+    __nv_bfloat16* __restrict__ cache_k, __half* __restrict__ cache_v, int padded_capacity) {
+    static_assert(Capacity == 2048 || Capacity == 4096);
+    static_assert((Capacity & (Capacity - 1)) == 0);
+    const int col           = static_cast<int>(blockIdx.x);
+    const int unit_in_token = static_cast<int>(threadIdx.x); // 0..127 (128 units per token)
+    constexpr std::int64_t ElementsPerToken =
+        kKVCacheAppendPrefixHeadDim * kKVCacheAppendPrefixHeads;
+    const std::int64_t cache_offset =
+        ElementsPerToken * static_cast<std::int64_t>(padded_capacity) * lanes[col];
+    const int slot = positions[col] & (Capacity - 1);
+    kv_cache_append_prefix_copy_cyclic_unit(k, v, cache_k + cache_offset, cache_v + cache_offset,
+                                            col, unit_in_token, slot, padded_capacity);
+}
+
 __global__ void kv_cache_append_prefix_paged_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,

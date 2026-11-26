@@ -708,4 +708,161 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
+// Single-pass penalized greedy argmax over BF16 logits [physical_rows, C] (compact when
+// padded_slots != nullptr, dense [physical_rows, width*batch] otherwise). Reads token_counts once
+// per vocabulary item across all live columns of a row, applies incremental round-local draft
+// overlay penalties, and finalizes via 64-bit atomicMax + last-tile writeback.
+template <int kMaxCols>
+__global__ __launch_bounds__(256) void speculative_penalized_argmax_kernel(
+    const __nv_bfloat16* __restrict__ logits, const std::int32_t* __restrict__ padded_slots,
+    const std::int32_t* __restrict__ drafts, const std::int32_t* __restrict__ current_extents,
+    const SamplingConfig* __restrict__ configs, std::int32_t token_domain,
+    std::int32_t physical_rows, std::int32_t width, unsigned long long* __restrict__ global_best,
+    std::int32_t* __restrict__ tile_done, std::int32_t* __restrict__ target_tokens) {
+    const int row  = static_cast<int>(blockIdx.y);
+    const int tile = static_cast<int>(blockIdx.x);
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int k    = width - 1;
+
+    int extent = current_extents[row];
+    extent     = extent < 0 ? 0 : (extent > k ? k : extent);
+    const int live_cols      = extent + 1;
+    const SamplingConfig cfg = configs[row];
+    const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+
+    __shared__ std::int32_t s_drafts[kMaxCols];
+    __shared__ std::int32_t s_col_idx[kMaxCols];
+    __shared__ unsigned long long s_warp_best[8];
+    __shared__ int s_is_last;
+
+    if (tid < live_cols) {
+        const int padded = row * width + tid;
+        s_col_idx[tid]   = padded_slots != nullptr ? padded_slots[padded] : padded;
+        if (tid < extent) { s_drafts[tid] = drafts[row * k + tid]; }
+    }
+    __syncthreads();
+
+    float best_val[kMaxCols];
+    int best_idx[kMaxCols];
+#pragma unroll
+    for (int c = 0; c < kMaxCols; ++c) {
+        best_val[c] = -CUDART_INF_F;
+        best_idx[c] = INT_MAX;
+    }
+
+    const int raw_begin = static_cast<int>(static_cast<std::int64_t>(token_domain) * tile /
+                                           static_cast<std::int64_t>(gridDim.x));
+    const int raw_end   = static_cast<int>(static_cast<std::int64_t>(token_domain) * (tile + 1) /
+                                         static_cast<std::int64_t>(gridDim.x));
+    const int v_begin = tile == 0 ? 0 : (raw_begin & ~3);
+    const int v_end   = tile == static_cast<int>(gridDim.x) - 1 ? token_domain : (raw_end & ~3);
+    const std::int32_t* counts_ptr = penalties ? cfg.token_counts : nullptr;
+
+    const auto update_best = [&](int c, float val, int idx) {
+        if (val > best_val[c] || best_idx[c] == INT_MAX) {
+            best_val[c] = val;
+            best_idx[c] = idx;
+        }
+    };
+
+    const bool vec_ok =
+        ((physical_rows & 3) == 0) &&
+        ((reinterpret_cast<std::uintptr_t>(logits) & 7u) == 0u) &&
+        (counts_ptr == nullptr || ((reinterpret_cast<std::uintptr_t>(counts_ptr) & 15u) == 0u));
+    const int v_vec_end = vec_ok ? (v_end & ~3) : v_begin;
+
+    if (vec_ok) {
+        const float pres = cfg.presence_penalty;
+        const float freq = cfg.frequency_penalty;
+        for (int v = v_begin + tid * 4; v < v_vec_end; v += 256 * 4) {
+            int4 c4 = counts_ptr != nullptr
+                          ? __ldg(reinterpret_cast<const int4*>(counts_ptr + v))
+                          : make_int4(0, 0, 0, 0);
+            bool has_draft = false;
+            if (penalties) {
+                for (int d = 0; d < extent; ++d) {
+                    if (static_cast<unsigned>(s_drafts[d] - v) < 4u) { has_draft = true; }
+                }
+            }
+            if (!has_draft) {
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                if (penalties) {
+                    a0 = (c4.x > 0 ? pres : 0.0f) + freq * static_cast<float>(c4.x);
+                    a1 = (c4.y > 0 ? pres : 0.0f) + freq * static_cast<float>(c4.y);
+                    a2 = (c4.z > 0 ? pres : 0.0f) + freq * static_cast<float>(c4.z);
+                    a3 = (c4.w > 0 ? pres : 0.0f) + freq * static_cast<float>(c4.w);
+                }
+                for (int c = 0; c < live_cols; ++c) {
+                    const uint2 raw = __ldg(reinterpret_cast<const uint2*>(
+                        logits + static_cast<std::int64_t>(s_col_idx[c]) * physical_rows + v));
+                    const float2 f0 =
+                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                    const float2 f1 =
+                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                    update_best(c, f0.x - a0, v);
+                    update_best(c, f0.y - a1, v + 1);
+                    update_best(c, f1.x - a2, v + 2);
+                    update_best(c, f1.y - a3, v + 3);
+                }
+            } else {
+                int cnts[4] = {c4.x, c4.y, c4.z, c4.w};
+                for (int c = 0; c < live_cols; ++c) {
+                    if (c > 0) {
+                        const unsigned off = static_cast<unsigned>(s_drafts[c - 1] - v);
+                        if (off < 4u) { ++cnts[off]; }
+                    }
+                    const uint2 raw = __ldg(reinterpret_cast<const uint2*>(
+                        logits + static_cast<std::int64_t>(s_col_idx[c]) * physical_rows + v));
+                    const float2 f0 =
+                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                    const float2 f1 =
+                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                    const float vals[4] = {f0.x, f0.y, f1.x, f1.y};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        float val = vals[j];
+                        if (cnts[j] > 0) { val -= pres; }
+                        if (freq != 0.0f) { val -= freq * static_cast<float>(cnts[j]); }
+                        update_best(c, val, v + j);
+                    }
+                }
+            }
+        }
+    }
+
+    for (int v = v_vec_end + tid; v < v_end; v += 256) {
+        int cnt = counts_ptr != nullptr ? __ldg(counts_ptr + v) : 0;
+        for (int c = 0; c < live_cols; ++c) {
+            if (penalties && c > 0 && s_drafts[c - 1] == v) { ++cnt; }
+            float val = __bfloat162float(
+                __ldg(logits + static_cast<std::int64_t>(s_col_idx[c]) * physical_rows + v));
+            if (penalties) {
+                if (cnt > 0) { val -= cfg.presence_penalty; }
+                if (cfg.frequency_penalty != 0.0f) {
+                    val -= cfg.frequency_penalty * static_cast<float>(cnt);
+                }
+            }
+            update_best(c, val, v);
+        }
+    }
+
+    for (int c = 0; c < live_cols; ++c) {
+        const unsigned long long local_key =
+            best_idx[c] == INT_MAX ? 0ull : sampling_sort_key(best_val[c], best_idx[c]);
+        const unsigned long long block_best = sampling_block_max_key(local_key, s_warp_best);
+        if (tid == 0) { atomicMax(&global_best[row * width + c], block_best); }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        __threadfence();
+        s_is_last = (atomicAdd(&tile_done[row], 1) + 1 == static_cast<int>(gridDim.x)) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (s_is_last && tid < live_cols) {
+        target_tokens[row * width + tid] = sampling_key_index(global_best[row * width + tid]);
+    }
+}
+
 } // namespace ninfer::ops
