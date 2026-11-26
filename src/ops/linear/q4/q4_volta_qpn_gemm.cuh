@@ -49,11 +49,12 @@
 #include "ops/common/volta_mma.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
-
-#include <cub/warp/warp_merge_sort.cuh>
+#include "ops/linear/volta_fp16_stage.h"
+#include "ops/linear/volta_tc_skinny.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 #include <cstdint>
 #include <type_traits>
@@ -61,6 +62,37 @@
 namespace ninfer::ops::detail {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+
+// Register-only 32-element descending warp bitonic sort (lane 0 = largest key).
+__device__ __forceinline__ std::uint64_t warp_bitonic_sort32_desc(std::uint64_t v, int lane) {
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1) {
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const std::uint64_t other = __shfl_xor_sync(0xffffffffu, v, j);
+            const bool want_max       = ((lane & k) == 0) == ((lane & j) == 0);
+            v                         = want_max ? (v > other ? v : other) : (v < other ? v : other);
+        }
+    }
+    return v;
+}
+
+// Register-only exact top-16 descending of 64 keys (2 per lane); lanes 0..15 hold the sorted top-16.
+__device__ __forceinline__ std::uint64_t
+warp_bitonic_top16_of_64(std::uint64_t v0, std::uint64_t v1, int lane) {
+    const std::uint64_t a     = warp_bitonic_sort32_desc(v0, lane);
+    const std::uint64_t b     = warp_bitonic_sort32_desc(v1, lane);
+    const std::uint64_t b_rev = __shfl_sync(0xffffffffu, b, 31 - lane);
+    // a[0..15] descending concatenated with b[15..0] ascending is a 32-element bitonic sequence.
+    std::uint64_t m = (lane < 16) ? a : b_rev;
+#pragma unroll
+    for (int j = 16; j > 0; j >>= 1) {
+        const std::uint64_t other = __shfl_xor_sync(0xffffffffu, m, j);
+        const bool want_max       = ((lane & j) == 0);
+        m                         = want_max ? (m > other ? m : other) : (m < other ? m : other);
+    }
+    return m;
+}
 
 struct Q4VoltaQpnSchedule {
     static constexpr int kWarps    = 4;  // warps per CTA; they split K, not N
@@ -93,8 +125,6 @@ q4_volta_qpn_gemm_kernel(
     constexpr int kCodeB  = Q4RowSplitStorage::kCodeBytesPerGroup;
 
     __shared__ float cs[S::kWarps][kTiles * S::kRowsPerTile * S::kColsPerCta];
-    using TopKSort = cub::WarpMergeSort<std::uint64_t, 1, 32>;
-    __shared__ typename TopKSort::TempStorage topk_sort[S::kWarps];
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -111,12 +141,12 @@ q4_volta_qpn_gemm_kernel(
     const int g0     = warp * gq;
     const int gend   = (warp == S::kWarps - 1) ? groups : g0 + gq;
 
-    // Per-group strides: one row's adjacent groups (row-major) or one tile's lane-interleaved
-    // groups (prepacked).
-    constexpr std::int64_t kGroupStride = kPrepacked ? 32 : 1;
+    // Per-group strides: one row's adjacent groups (row-major) or coalesced half-split prepacked
+    // [tile][group][half(0..1)][lane(0..31)][16B] (1024B/group, 512B between halves).
+    constexpr std::int64_t kScaleGroupStride = kPrepacked ? 32 : 1;
     const std::uint8_t* crow =
-        kPrepacked ? codes + (static_cast<std::int64_t>(blockIdx.x) * padded_groups * 32 + lane) *
-                                 kCodeB
+        kPrepacked ? codes + (static_cast<std::int64_t>(blockIdx.x) * padded_groups * 64 + lane) *
+                                 16
                    : codes + static_cast<std::int64_t>(good ? col : 0) * padded_groups * kCodeB;
     const std::uint16_t* srow =
         kPrepacked ? reinterpret_cast<const std::uint16_t*>(scales) +
@@ -160,11 +190,17 @@ q4_volta_qpn_gemm_kernel(
         const int last = gend - 1;
 #pragma unroll
         for (int e = 0; e < kBlk; ++e) {
-            const int g           = min(gb + e, last);
-            const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * kGroupStride * kCodeB;
-            cw[2 * e]             = __ldg(reinterpret_cast<const uint4*>(p));
-            cw[2 * e + 1]         = __ldg(reinterpret_cast<const uint4*>(p + 16));
-            scv[e] = good ? srow[static_cast<std::int64_t>(g) * kGroupStride]
+            const int g = min(gb + e, last);
+            if constexpr (kPrepacked) {
+                const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * 1024;
+                cw[2 * e]             = __ldg(reinterpret_cast<const uint4*>(p));
+                cw[2 * e + 1]         = __ldg(reinterpret_cast<const uint4*>(p + 512));
+            } else {
+                const std::uint8_t* p = crow + static_cast<std::int64_t>(g) * kCodeB;
+                cw[2 * e]             = __ldg(reinterpret_cast<const uint4*>(p));
+                cw[2 * e + 1]         = __ldg(reinterpret_cast<const uint4*>(p + 16));
+            }
+            scv[e] = good ? srow[static_cast<std::int64_t>(g) * kScaleGroupStride]
                           : static_cast<std::uint16_t>(0);
         }
 
@@ -195,7 +231,20 @@ q4_volta_qpn_gemm_kernel(
             for (int tile = 0; tile < kTiles; ++tile) {
                 const int row = tile * S::kRowsPerTile + r;
                 half2 a[4];
-                if (row < t) {
+                if constexpr (std::is_same_v<Activation, VoltaGroupMajorHalf>) {
+                    const int group16 = g * 4 + (w >> 1);
+                    const int k_half  = w & 1;
+                    const half* xrow =
+                        reinterpret_cast<const half*>(x) +
+                        (((static_cast<std::int64_t>(group16) * kTiles + tile) * 2 + k_half) * 8 +
+                         r) *
+                            8;
+                    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(xrow));
+                    a[0]            = *reinterpret_cast<const half2*>(&raw.x);
+                    a[1]            = *reinterpret_cast<const half2*>(&raw.y);
+                    a[2]            = *reinterpret_cast<const half2*>(&raw.z);
+                    a[3]            = *reinterpret_cast<const half2*>(&raw.w);
+                } else if (row < t) {
                     const Activation* xrow = x + static_cast<std::int64_t>(row) * k + kbase;
                     if constexpr (std::is_same_v<Activation, half>) {
                         const uint4 raw = __ldg(reinterpret_cast<const uint4*>(xrow));
@@ -262,24 +311,176 @@ q4_volta_qpn_gemm_kernel(
         // reproduce the materialized BF16-logit rounding boundary, sort the 32 order keys in a
         // warp, and emit the best 16 directly. The ordinary merge kernels combine CTA winners.
         const int producer = static_cast<int>(blockIdx.x);
+        const int ocol     = producer * S::kColsPerCta + lane;
+        const int gid      = ocol < n ? row_to_global_ids[ocol] : 0;
         for (int row = warp; row < t; row += S::kWarps) {
-            const int ocol = producer * S::kColsPerCta + lane;
             float v = 0.0f;
 #pragma unroll
             for (int w = 0; w < S::kWarps; ++w) {
                 v += cs[w][row * S::kColsPerCta + lane];
             }
-            std::uint64_t key[1] = {0};
+            std::uint64_t key = 0ull;
             if (ocol < n) {
                 const float rounded = __bfloat162float(__float2bfloat16(v));
-                key[0] = score_id_order_key(rounded, row_to_global_ids[ocol]);
+                key                 = score_id_order_key(rounded, gid);
             }
-            TopKSort(topk_sort[warp]).Sort(key, ScoreIdOrderGreater{});
+            const std::uint64_t sorted = warp_bitonic_sort32_desc(key, lane);
             if (lane < 16) {
                 const std::int64_t offset =
                     (static_cast<std::int64_t>(row) * producer_groups + producer) * 16 + lane;
-                partial_keys[offset] = key[0];
+                partial_keys[offset] = sorted;
             }
+        }
+    }
+}
+
+// Volta WMMA 16x16x16 fused top-16 kernel for the prepacked Q4 proposal head at T=9..64.
+// Each 128-thread CTA decodes 64 rows x 64 K once into double-buffered shared memory (2 register
+// prefetch stages), multiplies across all T<=16*TT columns in a single weight pass, and emits
+// exact top-16 keys via a register-only 64->16 warp bitonic network (halving producer groups from
+// 4,096 to 2,048).
+template <int TT, class Activation>
+__global__ __launch_bounds__(128, 2) void q4_volta_tc_topk_kernel(
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    const Activation* __restrict__ x, int n, int k, int t, int x_tiles, int padded_groups,
+    const std::int32_t* __restrict__ row_to_global_ids, std::uint64_t* __restrict__ partial_keys,
+    int producer_groups) {
+    using namespace nvcuda;
+    constexpr int ROWS    = 64;
+    constexpr int KC      = 64;
+    constexpr int LDS     = KC + 8; // 72 halves per row
+    constexpr int TCOLS   = 16 * TT;
+    constexpr int THREADS = 128;
+    constexpr int B_TOTAL = TCOLS * (KC / 8);
+    constexpr int B_VEC   = (B_TOTAL + THREADS - 1) / THREADS;
+
+    extern __shared__ __align__(32) unsigned char q4_tc_smem[];
+    half* a_s = reinterpret_cast<half*>(q4_tc_smem);
+    half* b_s = a_s + 2 * ROWS * LDS;
+
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int warp         = tid >> 5;
+    const int lane         = tid & 31;
+    const int local_tile   = tid >> 6;      // 0 or 1
+    const int half_idx     = (tid >> 5) & 1; // 0 or 1
+    const int lane_w       = tid & 31;
+    const int tile         = static_cast<int>(blockIdx.x) * 2 + local_tile;
+    const int w_row_in_cta = local_tile * 32 + volta_tc_lane_row(lane_w);
+    const int chunks       = k / KC;
+    const half2 bias       = __half2half2(__ushort_as_half(0x6408)); // 1032.0
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[TT];
+#pragma unroll
+    for (int j = 0; j < TT; ++j) { wmma::fill_fragment(acc[j], 0.0f); }
+
+    uint4 q0, q1;
+    std::uint16_t s0, s1;
+    uint4 bx0[B_VEC], bx1[B_VEC];
+
+    const auto load = [&](int chunk, uint4& q, std::uint16_t& s, uint4 (&bx)[B_VEC]) {
+        const std::int64_t tg = static_cast<std::int64_t>(tile) * padded_groups + chunk;
+        q = __ldg(reinterpret_cast<const uint4*>(codes) + tg * 64 + half_idx * 32 + lane_w);
+        s = __ldg(reinterpret_cast<const std::uint16_t*>(scales) + tg * 32 + lane_w);
+#pragma unroll
+        for (int v = 0; v < B_VEC; ++v) {
+            const int index = v * THREADS + tid;
+            const int col   = index / (KC / 8);
+            const int part  = index % (KC / 8);
+            bx[v]           = (index < B_TOTAL && col < t)
+                                  ? volta_tc_load_activation(x, k, col, chunk * KC + part * 8, x_tiles)
+                                  : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+
+    const auto store = [&](int buf, const uint4& q, std::uint16_t s, const uint4 (&bx)[B_VEC]) {
+        const half2 sc2            = __half2half2(__ushort_as_half(s));
+        const std::uint32_t w4[4]  = {q.x, q.y, q.z, q.w};
+        half* dst_row              = a_s + buf * ROWS * LDS + w_row_in_cta * LDS + half_idx * 32;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const std::uint32_t p4 = w4[w] ^ 0x88888888u;
+            half2 b[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const std::uint32_t byte = (p4 >> (8 * j)) & 0xffu;
+                std::uint32_t bits = ((byte & 0x0fu) | ((byte & 0xf0u) << 12)) | 0x64006400u;
+                b[j] = __hmul2(__hsub2(*reinterpret_cast<half2*>(&bits), bias), sc2);
+            }
+            *reinterpret_cast<uint4*>(dst_row + w * 8) = *reinterpret_cast<const uint4*>(b);
+        }
+#pragma unroll
+        for (int v = 0; v < B_VEC; ++v) {
+            const int index = v * THREADS + tid;
+            if (index < B_TOTAL) {
+                const int col  = index / (KC / 8);
+                const int part = index % (KC / 8);
+                *reinterpret_cast<uint4*>(b_s + buf * TCOLS * LDS + col * LDS + part * 8) = bx[v];
+            }
+        }
+    };
+
+    const auto compute = [&](int buf) {
+        const half* a_buf = a_s + buf * ROWS * LDS + warp * 16 * LDS;
+        const half* b_buf = b_s + buf * TCOLS * LDS;
+#pragma unroll
+        for (int kk = 0; kk < KC / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::load_matrix_sync(a, a_buf + kk * 16, LDS);
+#pragma unroll
+            for (int j = 0; j < TT; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+                wmma::load_matrix_sync(b, b_buf + j * 16 * LDS + kk * 16, LDS);
+                wmma::mma_sync(acc[j], a, b, acc[j]);
+            }
+        }
+    };
+
+    if (chunks > 0) {
+        load(0, q0, s0, bx0);
+        store(0, q0, s0, bx0);
+    }
+    if (chunks > 1) { load(1, q0, s0, bx0); }
+    if (chunks > 2) { load(2, q1, s1, bx1); }
+    __syncthreads();
+    for (int c = 0; c < chunks; c += 2) {
+        compute(0);
+        if (c + 1 < chunks) { store(1, q0, s0, bx0); }
+        if (c + 3 < chunks) { load(c + 3, q0, s0, bx0); }
+        __syncthreads();
+        if (c + 1 >= chunks) { break; }
+        compute(1);
+        if (c + 2 < chunks) { store(0, q1, s1, bx1); }
+        if (c + 4 < chunks) { load(c + 4, q1, s1, bx1); }
+        __syncthreads();
+    }
+
+    // Reuse smem as float c_s[TCOLS][64] so each column's 64 rows are contiguous.
+    float* c_s = reinterpret_cast<float*>(q4_tc_smem);
+#pragma unroll
+    for (int j = 0; j < TT; ++j) {
+        wmma::store_matrix_sync(c_s + j * 16 * ROWS + warp * 16, acc[j], ROWS, wmma::mem_col_major);
+    }
+    __syncthreads();
+
+    const int producer = static_cast<int>(blockIdx.x);
+    const int row0     = producer * ROWS;
+    const int gid0     = (row0 + lane < n) ? row_to_global_ids[row0 + lane] : 0;
+    const int gid1     = (row0 + lane + 32 < n) ? row_to_global_ids[row0 + lane + 32] : 0;
+    for (int col = warp; col < t; col += 4) {
+        const float v0       = c_s[col * ROWS + lane];
+        const float v1       = c_s[col * ROWS + lane + 32];
+        const std::uint64_t k0 = (row0 + lane < n)
+                                     ? score_id_order_key(__bfloat162float(__float2bfloat16(v0)), gid0)
+                                     : 0ull;
+        const std::uint64_t k1 =
+            (row0 + lane + 32 < n)
+                ? score_id_order_key(__bfloat162float(__float2bfloat16(v1)), gid1)
+                : 0ull;
+        const std::uint64_t top = warp_bitonic_top16_of_64(k0, k1, lane);
+        if (lane < 16) {
+            const std::int64_t offset =
+                (static_cast<std::int64_t>(col) * producer_groups + producer) * 16 + lane;
+            partial_keys[offset] = top;
         }
     }
 }

@@ -141,12 +141,20 @@ __device__ __forceinline__ void bf16x8_to_half2x4(uint4 raw, unsigned& h0, unsig
     h3 = *reinterpret_cast<const unsigned*>(&q3);
 }
 
+// Coalesced 8-warp Volta HMMA (mma.sync.m8n8k4) BF16 projection for DFlash2 control (N=1280,
+// K=5120) and candidate-selector hidden projection (N=256, K=5120). Each CTA owns 8 output rows
+// with 8 K-split warps (160 CTAs x 8 warps = 16 warps/SM on 80 SMs for N=1280). Every warp loads
+// 8 rows x 64 BF16 via 2 coalesced 128-byte cache-line uint4 loads per lane (read once, converted
+// BF16->FP16 once into per-warp smem, register-prefetched 1 tile ahead, zero CTA barriers in the
+// K-loop).
 template <int kColTiles>
-__global__ __launch_bounds__(128) void dflash2_bf16_hmma_kernel(
+__global__ __launch_bounds__(256, 2) void dflash2_bf16_hmma_kernel(
     const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ out, int n_rows, int k, int cols) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
-    constexpr int kWarps  = 4;
+    constexpr int kWarps  = 8;
+    constexpr int kTileK  = 64;
+    constexpr int kLdsW   = kTileK + 8; // padded half stride to eliminate smem bank conflicts
     constexpr int kMaxCol = kColTiles * 32;
     const int row0        = static_cast<int>(blockIdx.x) * 8;
     const int tid         = static_cast<int>(threadIdx.x);
@@ -156,6 +164,16 @@ __global__ __launch_bounds__(128) void dflash2_bf16_hmma_kernel(
     const int qp          = (lane >> 2) & 3;
     const int b_sel       = qp * 4 + (lane & 3) + ((lane & 16) ? 16 : 0);
 
+    // Coalesced weight loader mapping inside each warp: 8 lanes cover 64 BF16 (128B cache line).
+    const int w_r  = lane >> 3;      // 0..3
+    const int w_c8 = (lane & 7) * 8; // 0, 8, ..., 56
+
+    union Shared {
+        half w_tile[kWarps][8][kLdsW];
+        float c_red[kWarps][8][kMaxCol];
+    };
+    __shared__ Shared sh;
+
     float d[kColTiles][8];
 #pragma unroll
     for (int ct = 0; ct < kColTiles; ++ct) {
@@ -163,30 +181,60 @@ __global__ __launch_bounds__(128) void dflash2_bf16_hmma_kernel(
         for (int i = 0; i < 8; ++i) { d[ct][i] = 0.0f; }
     }
 
-    const int k_per_warp = (k / 8) / kWarps;
-    const int kk_begin   = warp * k_per_warp * 8;
-    const int kk_end     = (warp == kWarps - 1) ? k : (warp + 1) * k_per_warp * 8;
-    const __nv_bfloat16* w_row = w + static_cast<std::int64_t>(row0 + r) * k;
+    const int total_tiles = k / kTileK;
+    const int tile_begin  = (total_tiles * warp) / kWarps;
+    const int tile_end    = (total_tiles * (warp + 1)) / kWarps;
 
-    for (int kk = kk_begin; kk < kk_end; kk += 8) {
-        const uint4 a_raw = __ldg(reinterpret_cast<const uint4*>(w_row + kk));
-        unsigned a0, a1, a2, a3;
-        bf16x8_to_half2x4(a_raw, a0, a1, a2, a3);
-#pragma unroll
-        for (int ct = 0; ct < kColTiles; ++ct) {
-            const int col = ct * 32 + b_sel;
-            unsigned b0 = 0u, b1 = 0u, b2 = 0u, b3 = 0u;
-            if (col < cols) {
-                const uint4 b_raw =
-                    __ldg(reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(col) * k + kk));
-                bf16x8_to_half2x4(b_raw, b0, b1, b2, b3);
-            }
-            volta_mma_qp_n(d[ct], a0, a1, b0, b1);
-            volta_mma_qp_n(d[ct], a2, a3, b2, b3);
-        }
+    const __nv_bfloat16* w_lo_row = w + static_cast<std::int64_t>(row0 + w_r) * k + w_c8;
+    const __nv_bfloat16* w_hi_row = w + static_cast<std::int64_t>(row0 + w_r + 4) * k + w_c8;
+
+    uint4 cur_lo{};
+    uint4 cur_hi{};
+    if (tile_begin < tile_end) {
+        const std::int64_t off0 = static_cast<std::int64_t>(tile_begin) * kTileK;
+        cur_lo = __ldg(reinterpret_cast<const uint4*>(w_lo_row + off0));
+        cur_hi = __ldg(reinterpret_cast<const uint4*>(w_hi_row + off0));
     }
 
-    __shared__ float smem[kWarps][8][kMaxCol];
+    for (int tile = tile_begin; tile < tile_end; ++tile) {
+        // Convert current weight tile BF16->FP16 once per element into warp-private smem.
+        uint4 h_lo, h_hi;
+        bf16x8_to_half2x4(cur_lo, h_lo.x, h_lo.y, h_lo.z, h_lo.w);
+        bf16x8_to_half2x4(cur_hi, h_hi.x, h_hi.y, h_hi.z, h_hi.w);
+        *reinterpret_cast<uint4*>(&sh.w_tile[warp][w_r][w_c8])     = h_lo;
+        *reinterpret_cast<uint4*>(&sh.w_tile[warp][w_r + 4][w_c8]) = h_hi;
+        __syncwarp();
+
+        // Prefetch next K-tile's coalesced weight lines before executing 8 HMMA slices.
+        if (tile + 1 < tile_end) {
+            const std::int64_t next_off = static_cast<std::int64_t>(tile + 1) * kTileK;
+            cur_lo = __ldg(reinterpret_cast<const uint4*>(w_lo_row + next_off));
+            cur_hi = __ldg(reinterpret_cast<const uint4*>(w_hi_row + next_off));
+        }
+
+        const int k_tile_base = tile * kTileK;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const uint4 a_h = *reinterpret_cast<const uint4*>(&sh.w_tile[warp][r][ks * 8]);
+            const int kk    = k_tile_base + ks * 8;
+#pragma unroll
+            for (int ct = 0; ct < kColTiles; ++ct) {
+                const int col = ct * 32 + b_sel;
+                unsigned b0 = 0u, b1 = 0u, b2 = 0u, b3 = 0u;
+                if (col < cols) {
+                    const uint4 b_raw = __ldg(
+                        reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(col) * k + kk));
+                    bf16x8_to_half2x4(b_raw, b0, b1, b2, b3);
+                }
+                volta_mma_qp_n(d[ct], a_h.x, a_h.y, b0, b1);
+                volta_mma_qp_n(d[ct], a_h.z, a_h.w, b2, b3);
+            }
+        }
+        __syncwarp();
+    }
+
+    __syncthreads(); // ensure all warps finish reading sh.w_tile before reusing union as sh.c_red
+
     const int c_row_lo = ((lane & 16) ? 4 : 0) | (lane & 1);
     const int c_sel    = qp * 4 + (((lane >> 1) & 1) << 1);
 #pragma unroll
@@ -195,17 +243,18 @@ __global__ __launch_bounds__(128) void dflash2_bf16_hmma_kernel(
         for (int i = 0; i < 8; ++i) {
             const int rr = (i & 2) | c_row_lo;
             const int cc = ct * 32 + c_sel + (i & 1) + ((i >> 2) << 4);
-            smem[warp][rr][cc] = d[ct][i];
+            sh.c_red[warp][rr][cc] = d[ct][i];
         }
     }
     __syncthreads();
 
-    for (int e = tid; e < 8 * kMaxCol; e += 128) {
+    for (int e = tid; e < 8 * kMaxCol; e += 256) {
         const int rr = e & 7;
         const int cc = e >> 3;
         if (cc < cols) {
-            const float total =
-                (smem[0][rr][cc] + smem[2][rr][cc]) + (smem[1][rr][cc] + smem[3][rr][cc]);
+            float total = 0.0f;
+#pragma unroll
+            for (int ww = 0; ww < kWarps; ++ww) { total += sh.c_red[ww][rr][cc]; }
             out[row0 + rr + static_cast<std::int64_t>(cc) * n_rows] = __float2bfloat16_rn(total);
         }
     }
@@ -232,15 +281,15 @@ void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_b
     int first = 0;
     const bool aligned16 =
         ((reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(x)) & 15u) == 0;
-    if ((n_rows % 8) == 0 && (k % 32) == 0 && aligned16) {
+    if ((n_rows % 8) == 0 && (k % 64) == 0 && aligned16) {
         while (first < cols) {
             const int block = std::min(64, cols - first);
             if (block > 32) {
-                dflash2_bf16_hmma_kernel<2><<<n_rows / 8, 128, 0, stream>>>(
+                dflash2_bf16_hmma_kernel<2><<<n_rows / 8, 256, 0, stream>>>(
                     w, x + static_cast<std::int64_t>(first) * k,
                     out + static_cast<std::int64_t>(first) * n_rows, n_rows, k, block);
             } else {
-                dflash2_bf16_hmma_kernel<1><<<n_rows / 8, 128, 0, stream>>>(
+                dflash2_bf16_hmma_kernel<1><<<n_rows / 8, 256, 0, stream>>>(
                     w, x + static_cast<std::int64_t>(first) * k,
                     out + static_cast<std::int64_t>(first) * n_rows, n_rows, k, block);
             }

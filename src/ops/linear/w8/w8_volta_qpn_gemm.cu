@@ -145,10 +145,11 @@ void w8_qpn_launch_packed_typed(const dim3& grid, const Activation* x, const std
                                 const std::uint8_t* scales, __nv_bfloat16* out, int n, int k,
                                 int t, int out_ld, const __nv_bfloat16* finish_delta,
                                 const __nv_bfloat16* base, __nv_bfloat16* residual, int width,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, __nv_bfloat16* out1 = nullptr,
+                                __nv_bfloat16* out2 = nullptr) {
     w8_volta_qpn_gemm_kernel<TILES, 4, SPLITK, Activation, E, true>
         <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, out, n, k, t, k / 32, out_ld,
-                                           finish_delta, base, residual, width);
+                                           finish_delta, base, residual, width, out1, out2);
 }
 
 // One launch reads at most 64 token rows (eight row tiles). Larger batches, such as eight
@@ -466,7 +467,7 @@ bool w8_tc_prepacked(const Weight& w, std::int32_t k) {
            w.k == k && w.padded_shape[1] == k && k % 128 == 0 && w.n % 64 == 0;
 }
 
-// Every token count, in launches of at most 64 tokens, BF16 activations staged by the kernel.
+// Every token count, in launches of at most 64 tokens, staging activations to FP16 once per chunk.
 void w8_tc_launch_chunks(const Tensor& x, const Weight& w, W8TcRowSplitOutput output,
                          cudaStream_t stream) {
     const std::int32_t k = x.ne[0];
@@ -481,7 +482,14 @@ void w8_tc_launch_chunks(const Tensor& x, const Weight& w, W8TcRowSplitOutput ou
         if (chunk.third != nullptr) { chunk.third += first * output.third_ld; }
         const auto* activation =
             static_cast<const __nv_bfloat16*>(x.data) + static_cast<std::int64_t>(first) * k;
-        if (!launch_volta_tc_skinny(decoder, activation, w.n, k, count, 0, chunk, stream)) {
+        Tensor x_chunk(const_cast<__nv_bfloat16*>(activation), DType::BF16, {k, count});
+        const half* x_fp16 = volta_stage_fp16_activation(x_chunk, stream);
+        const bool ok      = x_fp16 != nullptr
+                                 ? launch_volta_tc_skinny(decoder, x_fp16, w.n, k, count, 0, chunk,
+                                                          stream)
+                                 : launch_volta_tc_skinny(decoder, activation, w.n, k, count, 0,
+                                                          chunk, stream);
+        if (!ok) {
             throw std::invalid_argument("W8 tensor-core route: unsupported prepacked shape");
         }
     }
@@ -496,6 +504,30 @@ std::int64_t leading(const Tensor& t) {
 bool launch_w8_volta_tc_split3(const Tensor& x, const Weight& w, Tensor& q, Tensor& k, Tensor& v,
                                cudaStream_t stream) {
     if (!w8_tc_prepacked(w, x.ne[0]) || w.n != q.ne[0] + k.ne[0] + v.ne[0]) { return false; }
+    const std::int32_t t = x.ne[1];
+    if (t <= 16 && q.ne[0] == 4096 && k.ne[0] == 1024 && v.ne[0] == 1024 &&
+        leading(q) == 4096 && leading(k) == 1024 && leading(v) == 1024) {
+        const half* x_fp16 = volta_stage_fp16_activation(x, stream);
+        const dim3 grid(static_cast<unsigned>(w.n / S::kColsPerCta));
+        const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
+        const auto* scales = static_cast<const std::uint8_t*>(w.scales);
+        auto* qp           = static_cast<__nv_bfloat16*>(q.data);
+        auto* kp           = static_cast<__nv_bfloat16*>(k.data);
+        auto* vp           = static_cast<__nv_bfloat16*>(v.data);
+        if (x_fp16 != nullptr) {
+            if (t <= 8) {
+                w8_qpn_launch_packed_typed<W8QpnEpilogue::Split3, 1, 8>(
+                    grid, x_fp16, codes, scales, qp, w.n, x.ne[0], t, 0, nullptr, nullptr, nullptr,
+                    0, stream, kp, vp);
+            } else {
+                w8_qpn_launch_packed_typed<W8QpnEpilogue::Split3, 2, 8>(
+                    grid, x_fp16, codes, scales, qp, w.n, x.ne[0], t, 0, nullptr, nullptr, nullptr,
+                    0, stream, kp, vp);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+    }
     w8_tc_launch_chunks(x, w,
                         {static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
                          static_cast<__nv_bfloat16*>(v.data), q.ne[0], k.ne[0], leading(q),
@@ -517,8 +549,29 @@ bool launch_w8_volta_tc_pair(const Tensor& x, const Weight& first, const Weight&
             first_scales + static_cast<std::int64_t>(first.n) * (k / 32) * 2;
     if (adjacent) {
         // Row views of one parent (the DFlash2 context key and value): one launch over both.
+        const std::int32_t n = first.n + second.n;
+        const std::int32_t t = x.ne[1];
+        if (t <= 16 && leading(first_out) == first.n && leading(second_out) == second.n) {
+            const half* x_fp16 = volta_stage_fp16_activation(x, stream);
+            if (x_fp16 != nullptr) {
+                const dim3 grid(static_cast<unsigned>(n / S::kColsPerCta));
+                auto* out0 = static_cast<__nv_bfloat16*>(first_out.data);
+                auto* out1 = static_cast<__nv_bfloat16*>(second_out.data);
+                if (t <= 8) {
+                    w8_qpn_launch_packed_typed<W8QpnEpilogue::Split2, 1, 8>(
+                        grid, x_fp16, first_codes, first_scales, out0, n, k, t, first.n, nullptr,
+                        nullptr, nullptr, second.n, stream, out1);
+                } else {
+                    w8_qpn_launch_packed_typed<W8QpnEpilogue::Split2, 2, 8>(
+                        grid, x_fp16, first_codes, first_scales, out0, n, k, t, first.n, nullptr,
+                        nullptr, nullptr, second.n, stream, out1);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                return true;
+            }
+        }
         Weight both          = first;
-        both.n               = first.n + second.n;
+        both.n               = n;
         both.shape[0]        = both.n;
         both.padded_shape[0] = both.n;
         w8_tc_launch_chunks(x, both,

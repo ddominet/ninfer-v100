@@ -245,15 +245,20 @@ struct VoltaTcSchedule {
 inline VoltaTcSchedule volta_tc_schedule(int n, int k, int t) {
     const VoltaTcControl& control = volta_tc_control();
     VoltaTcSchedule schedule;
-    // The 16384-row GDN input projection measured best at 128 rows up to 32 tokens (191 vs
-    // 221 us at 32).
-    schedule.rows = control.rows != 0 ? control.rows : (n >= 16384 && t <= 32 ? 128 : 64);
+    // 128-row CTAs halve activation L2 reads and wave count for wide outputs (16384/17408);
+    // smem is 45.0 KiB at TT=2 and 49.5 KiB at TT=3 (t <= 48), both well inside V100's 96 KiB cap.
+    schedule.rows = control.rows != 0 ? control.rows : (n >= 16384 && t <= 48 ? 128 : 64);
     const int blocks    = n / schedule.rows;
     const int chunks    = k / kVoltaTcChunkK;
+    const int warps_cta = schedule.rows / 16;
     int splits          = control.splits;
     if (splits == 0) {
         splits = 1;
-        while (splits < 8 && blocks * splits < 160 && chunks / (splits * 2) >= 8) { splits *= 2; }
+        // Target >= 640 warps across the 80 SMs (160 CTAs at 64 rows/4 warps, 80 CTAs at 128
+        // rows/8 warps), capping at 4 splits to avoid 8-way serial semaphore contention on small N.
+        while (splits < 4 && blocks * warps_cta * splits < 640 && chunks / (splits * 2) >= 8) {
+            splits *= 2;
+        }
     }
     schedule.splits = splits;
     return schedule;

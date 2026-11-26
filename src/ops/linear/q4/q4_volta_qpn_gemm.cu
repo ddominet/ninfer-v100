@@ -62,18 +62,63 @@ void launch_q4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStre
 void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
                               const Tensor& row_to_global_ids, std::uint64_t* partial_keys,
                               std::int32_t producer_groups, cudaStream_t stream) {
-    const std::int32_t n = w.n;
-    const std::int32_t k = x.ne[0];
-    const std::int32_t t = x.ne[1];
+    const std::int32_t n             = w.n;
+    const std::int32_t k             = x.ne[0];
+    const std::int32_t t             = x.ne[1];
     const std::int32_t padded_groups = w.padded_shape[1] / Q4RowSplitStorage::kGroupK;
+    const auto* ids                  = static_cast<const std::int32_t*>(row_to_global_ids.data);
+    const auto* codes                = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* scales               = static_cast<const std::uint8_t*>(w.scales);
+
+    if (w.layout == QuantLayout::VoltaQpnPrepacked && t > 32 && (n % 64) == 0 && t <= 64) {
+        const VoltaGroupMajorHalf* x_gm = volta_stage_fp16_group_major(x, stream);
+        const half* x_fp16 = x_gm == nullptr ? volta_stage_fp16_activation(x, stream) : nullptr;
+        const int x_tiles  = volta_group_major_tiles(t);
+        const dim3 tc_grid(static_cast<unsigned>(n / 64));
+        const auto dispatch_tc = [&]<int TT>() {
+            constexpr std::size_t kSmem =
+                (2 * 64 * 72 + 2 * 16 * TT * 72) * sizeof(half);
+            if (x_gm != nullptr) {
+                q4_volta_tc_topk_kernel<TT, VoltaGroupMajorHalf>
+                    <<<tc_grid, 128, kSmem, stream>>>(codes, scales, x_gm, n, k, t, x_tiles,
+                                                      padded_groups, ids, partial_keys,
+                                                      producer_groups);
+            } else if (x_fp16 != nullptr) {
+                q4_volta_tc_topk_kernel<TT, half><<<tc_grid, 128, kSmem, stream>>>(
+                    codes, scales, x_fp16, n, k, t, x_tiles, padded_groups, ids, partial_keys,
+                    producer_groups);
+            } else {
+                q4_volta_tc_topk_kernel<TT, __nv_bfloat16><<<tc_grid, 128, kSmem, stream>>>(
+                    codes, scales, static_cast<const __nv_bfloat16*>(x.data), n, k, t, x_tiles,
+                    padded_groups, ids, partial_keys, producer_groups);
+            }
+        };
+        if (t <= 16) {
+            dispatch_tc.template operator()<1>();
+        } else if (t <= 32) {
+            dispatch_tc.template operator()<2>();
+        } else if (t <= 48) {
+            dispatch_tc.template operator()<3>();
+        } else {
+            dispatch_tc.template operator()<4>();
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
-    const half* x_fp16 = volta_stage_fp16_activation(x, stream);
-    const auto* ids    = static_cast<const std::int32_t*>(row_to_global_ids.data);
-    const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
-    const auto* scales = static_cast<const std::uint8_t*>(w.scales);
+    const VoltaGroupMajorHalf* x_gm =
+        w.layout == QuantLayout::VoltaQpnPrepacked ? volta_stage_fp16_group_major(x, stream)
+                                                   : nullptr;
+    const half* x_fp16 = x_gm == nullptr ? volta_stage_fp16_activation(x, stream) : nullptr;
 
     const auto dispatch_tiles = [&]<int kTiles, int kBlk, bool kPrepacked>() {
-        if (x_fp16 != nullptr) {
+        if (x_gm != nullptr) {
+            q4_volta_qpn_gemm_kernel<kTiles, kBlk, true, kPrepacked, VoltaGroupMajorHalf>
+                <<<grid, S::kThreads, 0, stream>>>(codes, scales, x_gm, nullptr, n, k, t,
+                                                   padded_groups, 0, ids, partial_keys,
+                                                   producer_groups);
+        } else if (x_fp16 != nullptr) {
             q4_volta_qpn_gemm_kernel<kTiles, kBlk, true, kPrepacked, half>
                 <<<grid, S::kThreads, 0, stream>>>(codes, scales, x_fp16, nullptr, n, k, t,
                                                    padded_groups, 0, ids, partial_keys,
@@ -97,7 +142,7 @@ void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
         } else if (t <= 32) {
             dispatch_tiles.template operator()<4, 2, true>();
         } else {
-            throw std::invalid_argument("Q4 QPN top-K: prepacked launch supports T <= 32");
+            throw std::invalid_argument("Q4 QPN top-K: prepacked launch supports T <= 64");
         }
     } else {
         if (t <= 8) {

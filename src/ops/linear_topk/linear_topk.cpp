@@ -149,8 +149,12 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
             auto out_ids    = column_slice(ids, first, columns);
             auto out_scores = column_slice(scores, first, columns);
             auto scope = workspace.scope();
+            const std::int32_t rows_per_producer =
+                (prepacked && columns > 32 && (head.n % 64) == 0)
+                    ? detail::kVoltaTcRowsPerTopKProducer
+                    : detail::kVoltaQpnRowsPerTopKProducer;
             auto topk_workspace = detail::allocate_linear_topk_workspace(
-                workspace, head.n, columns, detail::kVoltaQpnRowsPerTopKProducer);
+                workspace, head.n, columns, rows_per_producer);
             detail::launch_q4_volta_qpn_topk(
                 x, head, *id_map, static_cast<std::uint64_t*>(topk_workspace.partial_keys.data),
                 topk_workspace.producer_groups, stream);
@@ -188,13 +192,20 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
     const std::int32_t chunk = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
     std::size_t capacity = static_cast<std::size_t>(head_rows) * chunk * sizeof(std::uint16_t);
 #ifdef NINFER_VOLTA_BUILD
-    // Fused chunks of up to 32 columns for the prepacked Q4 head.
+    // Fused chunks of up to 64 columns for the prepacked Q4 head (32 rows/producer for T<=32,
+    // 64 rows/producer for T=33..64).
     if (qtype == QType::Q4G64_F16S && head_rows == detail::kLinearTopKOptimizedRows) {
-        const int columns = std::min(max_columns, detail::kVoltaQpnTopKPrepackedMaxT);
-        WorkspaceLayoutBuilder layout;
+        const int small_cols = std::min(max_columns, 32);
+        WorkspaceLayoutBuilder layout_small;
         (void)detail::allocate_linear_topk_workspace(
-            layout, head_rows, columns, detail::kVoltaQpnRowsPerTopKProducer);
-        capacity = std::max(capacity, layout.peak_bytes());
+            layout_small, head_rows, small_cols, detail::kVoltaQpnRowsPerTopKProducer);
+        capacity = std::max(capacity, layout_small.peak_bytes());
+
+        const int wide_cols = std::min(max_columns, detail::kVoltaQpnTopKPrepackedMaxT);
+        WorkspaceLayoutBuilder layout_wide;
+        (void)detail::allocate_linear_topk_workspace(
+            layout_wide, head_rows, wide_cols, detail::kVoltaTcRowsPerTopKProducer);
+        capacity = std::max(capacity, layout_wide.peak_bytes());
     }
 #endif
     return capacity;

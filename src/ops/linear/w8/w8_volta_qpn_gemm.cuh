@@ -109,7 +109,7 @@ struct W8VoltaTcOptionalDecoder : W8VoltaTcDecoder {
     static constexpr bool kMandatory = false;
 };
 
-enum class W8QpnEpilogue { Store, DynamicConvAdd, SwiGluUp, Split3 };
+enum class W8QpnEpilogue { Store, DynamicConvAdd, SwiGluUp, Split3, Split2 };
 
 // `kTiles` is the number of 8-row A tiles (T <= 8 * kTiles); `kBlk` is how many W8 groups a lane
 // reads before consuming any, in units of kCodeBytesPerGroup. See the Q4 sibling: a lane streams
@@ -353,6 +353,13 @@ void w8_volta_qpn_gemm_kernel(
                     out1[static_cast<std::int64_t>(row) * kKv + ocol - kQ] = __float2bfloat16(v);
                 } else {
                     out2[static_cast<std::int64_t>(row) * kKv + ocol - kQ - kKv] =
+                        __float2bfloat16(v);
+                }
+            } else if constexpr (kEpilogue == W8QpnEpilogue::Split2) {
+                if (ocol < out_ld) {
+                    out[static_cast<std::int64_t>(row) * out_ld + ocol] = __float2bfloat16(v);
+                } else {
+                    out1[static_cast<std::int64_t>(row) * width + (ocol - out_ld)] =
                         __float2bfloat16(v);
                 }
             } else {

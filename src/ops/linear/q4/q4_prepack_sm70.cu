@@ -16,21 +16,26 @@ __device__ __forceinline__ int q4_prepack_row(std::int64_t tile, int lane) {
            ((lane & 16) ? 4 : 0);
 }
 
+// Coalesced half-split layout: [tile][group][half(0..1)][lane(0..31)][16 B].
+// Each warp's 16-byte uint4 load covers 512 contiguous bytes (4 full 128B sectors) with zero
+// inter-lane stride for both QPN (T<=8) and WMMA skinny top-K (T=9..64).
 __global__ void prepack_q4_codes_kernel(const std::uint8_t* __restrict__ input,
                                         std::uint8_t* __restrict__ output, int n,
                                         std::int64_t groups) {
-    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::int64_t count = static_cast<std::int64_t>(n / 32) * groups * 32;
-    if (index >= count) { return; }
-    const int lane           = static_cast<int>(index % 32);
-    const std::int64_t group = (index / 32) % groups;
-    const std::int64_t tile  = index / (32 * groups);
+    const std::int64_t idx   = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t count = static_cast<std::int64_t>(n / 32) * groups * 64;
+    if (idx >= count) { return; }
+    const int lane           = static_cast<int>(idx & 31);
+    const int half_idx       = static_cast<int>((idx >> 5) & 1);
+    const std::int64_t tg    = idx >> 6;
+    const std::int64_t group = tg % groups;
+    const std::int64_t tile  = tg / groups;
     const int row            = q4_prepack_row(tile, lane);
     const auto* source       = reinterpret_cast<const uint4*>(
-        input + (static_cast<std::int64_t>(row) * groups + group) * Q4RowSplitStorage::kCodeBytesPerGroup);
-    auto* destination = reinterpret_cast<uint4*>(output + index * Q4RowSplitStorage::kCodeBytesPerGroup);
-    destination[0]    = source[0];
-    destination[1]    = source[1];
+        input + (static_cast<std::int64_t>(row) * groups + group) *
+                    Q4RowSplitStorage::kCodeBytesPerGroup) +
+        half_idx;
+    reinterpret_cast<uint4*>(output)[idx] = *source;
 }
 
 __global__ void prepack_q4_scales_kernel(const std::uint16_t* __restrict__ input,
@@ -62,16 +67,17 @@ void q4_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
     const std::int64_t code_bytes  = items * Q4RowSplitStorage::kCodeBytesPerGroup;
     const std::int64_t scale_bytes = items * Q4RowSplitStorage::kScaleBytesPerGroup;
     DeviceBuffer scratch(static_cast<std::size_t>(code_bytes));
-    const int blocks = static_cast<int>((items + 255) / 256);
+    const int code_blocks  = static_cast<int>((items * 2 + 255) / 256);
+    const int scale_blocks = static_cast<int>((items + 255) / 256);
 
-    prepack_q4_codes_kernel<<<blocks, 256, 0, stream>>>(
+    prepack_q4_codes_kernel<<<code_blocks, 256, 0, stream>>>(
         static_cast<const std::uint8_t*>(weight.qdata), static_cast<std::uint8_t*>(scratch.p), n,
         groups);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(weight.qdata), scratch.p,
                                static_cast<std::size_t>(code_bytes), cudaMemcpyDeviceToDevice,
                                stream));
-    prepack_q4_scales_kernel<<<blocks, 256, 0, stream>>>(
+    prepack_q4_scales_kernel<<<scale_blocks, 256, 0, stream>>>(
         static_cast<const std::uint16_t*>(weight.scales), static_cast<std::uint16_t*>(scratch.p),
         n, groups);
     CUDA_CHECK(cudaGetLastError());

@@ -170,21 +170,16 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 #endif
 }
 
-template <bool Normalize>
-__device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
-                                                  const __nv_bfloat16* query, __nv_bfloat16* output,
-                                                  std::uint32_t dqk_base, std::uint32_t dv_base,
-                                                  int lane, float scale) {
-    RawQkLane q = load_raw_qk_lane(query, dqk_base);
-    normalize_qk_lane<Normalize>(q.value, lane);
-
+__device__ __forceinline__ void readout_normalized_and_store(
+    float (&state)[kDvPerWarp][kQkPerLane], const float (&q_norm)[kQkPerLane],
+    __nv_bfloat16* output, std::uint32_t dv_base, int lane, float scale) {
 #if NINFER_GDN_BATCH_REDUCE
     float partial[kDvPerWarp];
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         float p = 0.0f;
 #pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) { p += state[r][c] * q.value[c]; }
+        for (int c = 0; c < kQkPerLane; ++c) { p += state[r][c] * q_norm[c]; }
         partial[r] = p;
     }
 #pragma unroll
@@ -206,12 +201,22 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     for (int r = 0; r < kDvPerWarp; ++r) {
         float partial = 0.0f;
 #pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
+        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q_norm[c]; }
         partial = warp_sum<kWarpSize>(partial);
         if (lane == r) { attn_val = partial; }
     }
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 #endif
+}
+
+template <bool Normalize>
+__device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
+                                                  const __nv_bfloat16* query, __nv_bfloat16* output,
+                                                  std::uint32_t dqk_base, std::uint32_t dv_base,
+                                                  int lane, float scale) {
+    RawQkLane q = load_raw_qk_lane(query, dqk_base);
+    normalize_qk_lane<Normalize>(q.value, lane);
+    readout_normalized_and_store(state, q.value, output, dv_base, lane, scale);
 }
 
 struct RecurrentCoordinates {
@@ -1063,9 +1068,63 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, NINFER_GDN_DIRECT_MIN_BL
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
-    __align__(16) float state[kDvPerWarp][kQkPerLane];
-    load_state_tile(state, access.state_read_base(coord), coord);
-    run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
+    if (valid > 0) {
+        // Overlap token-0 input loads with state-tile HBM reads and prefetch query alongside
+        // key/value/gate so readout never stalls on query DRAM latency (bit-exact).
+        Bf16x4Pack cur_key_bits = load_vec<Bf16x4Pack>(access.key_ptr(coord, 0) + coord.dqk_base);
+        Bf16x4Pack cur_q_bits   = load_vec<Bf16x4Pack>(access.query_ptr(coord, 0) + coord.dqk_base);
+        RawGatePair gate        = access.load_gate(coord, 0);
+        RawValueLane value      = load_value_lane(access.value_ptr(coord, 0), coord.lane,
+                                                  coord.dv_base);
+
+        __align__(16) float state[kDvPerWarp][kQkPerLane];
+        load_state_tile(state, access.state_read_base(coord), coord);
+
+        RawQkLane key;
+        key.bits = cur_key_bits;
+        unpack_qk_lane(key.value, cur_key_bits);
+        access.store_key(coord, 0, key);
+        access.store_value(coord, 0, value);
+        access.store_gate(coord, 0, gate);
+        normalize_qk_lane<true>(key.value, coord.lane);
+
+        float query[kQkPerLane];
+        unpack_qk_lane(query, cur_q_bits);
+        normalize_qk_lane<true>(query, coord.lane);
+
+        for (std::int32_t token = 0; token < valid; ++token) {
+            Bf16x4Pack next_key_bits{};
+            Bf16x4Pack next_q_bits{};
+            RawGatePair next_gate{};
+            RawValueLane next_value{};
+            if (token + 1 < valid) {
+                next_key_bits =
+                    load_vec<Bf16x4Pack>(access.key_ptr(coord, token + 1) + coord.dqk_base);
+                next_q_bits =
+                    load_vec<Bf16x4Pack>(access.query_ptr(coord, token + 1) + coord.dqk_base);
+                next_gate  = access.load_gate(coord, token + 1);
+                next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane,
+                                             coord.dv_base);
+            }
+
+            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+            readout_normalized_and_store(state, query, access.output_ptr(coord, token),
+                                         coord.dv_base, coord.lane, access.scale);
+
+            if (token + 1 < valid) {
+                key.bits = next_key_bits;
+                unpack_qk_lane(key.value, next_key_bits);
+                gate  = next_gate;
+                value = next_value;
+                access.store_key(coord, token + 1, key);
+                access.store_value(coord, token + 1, value);
+                access.store_gate(coord, token + 1, gate);
+                normalize_qk_lane<true>(key.value, coord.lane);
+                unpack_qk_lane(query, next_q_bits);
+                normalize_qk_lane<true>(query, coord.lane);
+            }
+        }
+    }
     zero_output_suffix(access, coord, valid, access.width);
 }
 
