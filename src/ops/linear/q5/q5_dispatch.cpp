@@ -1,4 +1,8 @@
 #include "ops/linear/q5/q5_dispatch.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/common/volta_qpn_groupwise.h"
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
+#endif
 
 #include <stdexcept>
 
@@ -124,11 +128,25 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+            volta_qpn_groupwise_supported(w)) {
+            launch_q5_prepacked_volta(x, w, out, stream);
+            return;
+        }
+        throw std::invalid_argument("Q5 linear: unsupported prepacked shape or policy");
+    }
     const std::int32_t t = x.ne[1];
+    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+        t <= kVoltaStreamHmmaMaxTokens &&
+        volta_rowsplit_stream_hmma_supported(out.ne[0], x.ne[0], w.padded_shape[1], t)) {
+        launch_q5_volta_stream_hmma(x, w, out, stream);
+        return;
+    }
     // Basic Linear historically had no Q5 Volta-MMA route because split-K needs caller-owned
     // accumulation storage. Large vision matrices provide enough CTAs to select one split, which
     // stores directly to BF16 output, so admit exactly that zero-workspace case here.
-    if (workspace != nullptr && t >= 9 &&
+    if (workspace != nullptr && t >= 17 &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
         q5_volta_mma_supported(out.ne[0], x.ne[0], t)) {
         const std::size_t need = q5_volta_mma_workspace_bytes(out.ne[0], x.ne[0], t);

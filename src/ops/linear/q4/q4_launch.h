@@ -18,7 +18,7 @@ using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // `splits_override` is for the tuning bench only; 0 means "use the measured table".
 void launch_q4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                          cudaStream_t stream, std::int32_t weight_row_offset = 0,
-                         int splits_override = 0);
+                         int splits_override = 0, bool add_residual = false);
 // Zero when the shape resolves to a single split: that path stores BF16 straight to `out` and
 // allocates no fp32 accumulator at all.
 [[nodiscard]] std::size_t q4_volta_mma_workspace_bytes(std::int32_t n, std::int32_t k,

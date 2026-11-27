@@ -33,6 +33,11 @@
 #include "ninfer/ops/speculative_round.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/common/dflash2_rmsnorm_rope_volta.h"
+#include "ops/linear/common/volta_qpn_groupwise.h"
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
+#include "ops/linear/fp8/fp8_launch.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
+#include "ops/linear/volta_fp16_stage.h"
 #endif
 
 #include <cuda_runtime.h>
@@ -172,8 +177,8 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
     }
     if (batch_features != nullptr) {
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
-        Tensor target =
-            batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
+        Tensor target = batch_features->slice(1, 0, batch_width)
+                            .slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
         ops::scatter_bf16_batch(source, *batch_lanes, *batch_valid_columns, target, stream);
         captured_mask |= 1U << index;
         return;
@@ -701,7 +706,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap, const VerifyCompaction* compaction,
-                                           const GreedyVerifyArgmax* greedy_argmax) {
+                                           const GreedyVerifyArgmax* greedy_argmax,
+                                           bool skip_logits_output) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -749,14 +755,121 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
                 tap.capture_positions(cache_positions, stream);
             }
-            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-            if (greedy_argmax != nullptr) {
-                ops::speculative_penalized_argmax(
-                    flat_logits, nullptr, *greedy_argmax->drafts, *greedy_argmax->extents,
-                    greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_, stream);
-            } else {
-                ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+            bool fused_fp8_head = false;
+#ifdef NINFER_VOLTA_BUILD
+            if (lm_head_->qtype == QType::FP8_E4M3FN_ROW_BF16S && kCfg.hidden == 5120 &&
+                ops::detail::volta_stage_fp16_enabled() &&
+                ops::detail::fp8_volta_qpn_supported(lm_head_->n, lm_head_->k, columns)) {
+                auto head_scope = work_.scope();
+                DeviceSpan staged = work_.alloc_bytes(
+                    static_cast<std::size_t>(kCfg.hidden) * columns * sizeof(std::uint16_t), 256);
+                ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                    x, *final_norm_, kCfg.rms_eps, flat_hidden,
+                    static_cast<half*>(staged.data), stream);
+                if (skip_logits_output && greedy_argmax == nullptr) {
+                    DeviceSpan argmax_scratch = work_.alloc_bytes(
+                        static_cast<std::size_t>(columns) * sizeof(unsigned long long), 256);
+                    ops::detail::launch_fp8_volta_qpn_argmax_fp16(
+                        flat_hidden, *lm_head_, staged.data, flat_tokens, kCfg.token_domain,
+                        argmax_scratch.data, stream);
+                } else {
+                    ops::detail::launch_fp8_volta_qpn_fp16(flat_hidden, *lm_head_, staged.data,
+                                                           flat_logits, stream);
+                    if (greedy_argmax != nullptr) {
+                        ops::speculative_penalized_argmax(
+                            flat_logits, nullptr, *greedy_argmax->drafts, *greedy_argmax->extents,
+                            greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_,
+                            stream);
+                    } else {
+                        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+                    }
+                }
+                fused_fp8_head = true;
+            } else if (lm_head_->qtype == QType::Q6G64_F16S && kCfg.hidden == 5120 &&
+                       columns <= 64 && ops::detail::volta_stage_fp16_enabled() &&
+                       (ops::detail::volta_qpn_groupwise_supported(*lm_head_) ||
+                        (columns <= 32 &&
+                         ops::detail::volta_rowsplit_stream_hmma_supported(
+                             lm_head_->n, lm_head_->k, lm_head_->padded_shape[1], columns)))) {
+                auto head_scope = work_.scope();
+                DeviceSpan staged = work_.alloc_bytes(
+                    static_cast<std::size_t>(kCfg.hidden) * columns * sizeof(std::uint16_t), 256);
+                ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                    x, *final_norm_, kCfg.rms_eps, flat_hidden,
+                    static_cast<half*>(staged.data), stream);
+                const bool prepacked = lm_head_->layout == QuantLayout::VoltaQpnPrepacked;
+                if (skip_logits_output && greedy_argmax == nullptr) {
+                    DeviceSpan argmax_scratch = work_.alloc_bytes(
+                        static_cast<std::size_t>(columns) * sizeof(unsigned long long), 256);
+                    if (prepacked) {
+                        ops::detail::launch_q6_prepacked_volta_argmax_fp16(
+                            flat_hidden, static_cast<const half*>(staged.data), *lm_head_,
+                            flat_tokens, kCfg.token_domain, argmax_scratch.data, stream);
+                    } else {
+                        ops::detail::launch_q6_volta_stream_hmma_argmax_fp16(
+                            flat_hidden, *lm_head_, staged.data, flat_tokens, kCfg.token_domain,
+                            argmax_scratch.data, stream);
+                    }
+                } else {
+                    if (prepacked) {
+                        ops::detail::launch_q6_prepacked_volta_fp16(
+                            flat_hidden, static_cast<const half*>(staged.data), *lm_head_,
+                            flat_logits, stream);
+                    } else {
+                        ops::detail::launch_q6_volta_stream_hmma_fp16(
+                            flat_hidden, *lm_head_, staged.data, flat_logits, stream);
+                    }
+                    if (greedy_argmax != nullptr) {
+                        ops::speculative_penalized_argmax(
+                            flat_logits, nullptr, *greedy_argmax->drafts, *greedy_argmax->extents,
+                            greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_,
+                            stream);
+                    } else {
+                        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+                    }
+                }
+                fused_fp8_head = true;
+            } else if (lm_head_->qtype == QType::NVFP4 && kCfg.hidden == 5120 &&
+                       ops::detail::volta_stage_fp16_enabled() &&
+                       ops::detail::nvfp4_volta_qpn_supported(lm_head_->n, lm_head_->k, columns)) {
+                auto head_scope = work_.scope();
+                DeviceSpan staged = work_.alloc_bytes(
+                    static_cast<std::size_t>(kCfg.hidden) * columns * sizeof(std::uint16_t), 256);
+                ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                    x, *final_norm_, kCfg.rms_eps, flat_hidden,
+                    static_cast<half*>(staged.data), stream);
+                if (skip_logits_output && greedy_argmax == nullptr) {
+                    DeviceSpan argmax_scratch = work_.alloc_bytes(
+                        static_cast<std::size_t>(columns) * sizeof(unsigned long long), 256);
+                    ops::detail::launch_nvfp4_volta_qpn_argmax_fp16(
+                        flat_hidden, *lm_head_, staged.data, flat_tokens, kCfg.token_domain,
+                        argmax_scratch.data, stream);
+                } else {
+                    ops::detail::launch_nvfp4_volta_qpn_fp16(flat_hidden, *lm_head_, staged.data,
+                                                             flat_logits, stream);
+                    if (greedy_argmax != nullptr) {
+                        ops::speculative_penalized_argmax(
+                            flat_logits, nullptr, *greedy_argmax->drafts, *greedy_argmax->extents,
+                            greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_,
+                            stream);
+                    } else {
+                        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+                    }
+                }
+                fused_fp8_head = true;
+            }
+#endif
+            if (!fused_fp8_head) {
+                ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+                ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+                if (greedy_argmax != nullptr) {
+                    ops::speculative_penalized_argmax(
+                        flat_logits, nullptr, *greedy_argmax->drafts, *greedy_argmax->extents,
+                        greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_,
+                        stream);
+                } else {
+                    ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+                }
             }
         } else {
             const std::int32_t live = compaction->live;
@@ -811,35 +924,171 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                 tap.capture_positions(cache_positions, stream);
             }
             Tensor hidden_c = work_.alloc(DType::BF16, {kCfg.hidden, live});
-            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden_c, stream);
-            Tensor logits_c = work_.alloc(DType::BF16, {kCfg.vocab, live});
-            ops::linear(hidden_c, *lm_head_, logits_c, stream);
-            if (greedy_argmax != nullptr) {
-                ops::speculative_penalized_argmax(
-                    logits_c, &padded_slots, *greedy_argmax->drafts, *greedy_argmax->extents,
-                    greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_, stream);
+            bool fused_fp8_argmax = false;
+#ifdef NINFER_VOLTA_BUILD
+            if (skip_logits_output && greedy_argmax == nullptr &&
+                lm_head_->qtype == QType::FP8_E4M3FN_ROW_BF16S && kCfg.hidden == 5120 &&
+                ops::detail::volta_stage_fp16_enabled() &&
+                ops::detail::fp8_volta_qpn_supported(lm_head_->n, lm_head_->k, live)) {
+                auto head_scope = work_.scope();
+                DeviceSpan staged = work_.alloc_bytes(
+                    static_cast<std::size_t>(kCfg.hidden) * live * sizeof(std::uint16_t), 256);
+                ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                    x, *final_norm_, kCfg.rms_eps, hidden_c, static_cast<half*>(staged.data),
+                    stream);
+                Tensor tokens_c = work_.alloc(DType::I32, {live});
+                DeviceSpan argmax_scratch = work_.alloc_bytes(
+                    static_cast<std::size_t>(live) * sizeof(unsigned long long), 256);
+                ops::detail::launch_fp8_volta_qpn_argmax_fp16(
+                    hidden_c, *lm_head_, staged.data, tokens_c, kCfg.token_domain,
+                    argmax_scratch.data, stream);
+                Tensor flat_tokens_row    = flat_tokens.view({1, columns});
+                const Tensor tokens_c_row = tokens_c.view({1, live});
                 ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
                                           {&flat_hidden, nullptr, nullptr, nullptr}, padded_slots,
                                           stream, false);
-            } else {
+                ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
+                fused_fp8_argmax = true;
+            } else if (skip_logits_output && greedy_argmax == nullptr &&
+                       lm_head_->qtype == QType::Q6G64_F16S && kCfg.hidden == 5120 && live <= 64 &&
+                       ops::detail::volta_stage_fp16_enabled() &&
+                       (ops::detail::volta_qpn_groupwise_supported(*lm_head_) ||
+                        (live <= 32 &&
+                         ops::detail::volta_rowsplit_stream_hmma_supported(
+                             lm_head_->n, lm_head_->k, lm_head_->padded_shape[1], live)))) {
+                auto head_scope = work_.scope();
+                DeviceSpan staged = work_.alloc_bytes(
+                    static_cast<std::size_t>(kCfg.hidden) * live * sizeof(std::uint16_t), 256);
+                ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                    x, *final_norm_, kCfg.rms_eps, hidden_c, static_cast<half*>(staged.data),
+                    stream);
                 Tensor tokens_c = work_.alloc(DType::I32, {live});
-                ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
+                DeviceSpan argmax_scratch = work_.alloc_bytes(
+                    static_cast<std::size_t>(live) * sizeof(unsigned long long), 256);
+                if (lm_head_->layout == QuantLayout::VoltaQpnPrepacked) {
+                    ops::detail::launch_q6_prepacked_volta_argmax_fp16(
+                        hidden_c, static_cast<const half*>(staged.data), *lm_head_, tokens_c,
+                        kCfg.token_domain, argmax_scratch.data, stream);
+                } else {
+                    ops::detail::launch_q6_volta_stream_hmma_argmax_fp16(
+                        hidden_c, *lm_head_, staged.data, tokens_c, kCfg.token_domain,
+                        argmax_scratch.data, stream);
+                }
                 Tensor flat_tokens_row    = flat_tokens.view({1, columns});
                 const Tensor tokens_c_row = tokens_c.view({1, live});
-                // Acceptance reads each request's verified extent, which is its kept columns: the
-                // dropped columns of the padded hidden and logits are never read, so they are not
-                // zeroed. The 4-byte token row goes separately: in the group it held the
-                // vocabulary-wide logits to 4-byte copies (192 us a round, the costliest gather).
-                if (compaction->skip_logits_expand) {
+                ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
+                                          {&flat_hidden, nullptr, nullptr, nullptr}, padded_slots,
+                                          stream, false);
+                ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
+                fused_fp8_argmax = true;
+            } else if (skip_logits_output && greedy_argmax == nullptr &&
+                       lm_head_->qtype == QType::NVFP4 && kCfg.hidden == 5120 &&
+                       ops::detail::volta_stage_fp16_enabled() &&
+                       ops::detail::nvfp4_volta_qpn_supported(lm_head_->n, lm_head_->k, live)) {
+                auto head_scope = work_.scope();
+                DeviceSpan staged = work_.alloc_bytes(
+                    static_cast<std::size_t>(kCfg.hidden) * live * sizeof(std::uint16_t), 256);
+                ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                    x, *final_norm_, kCfg.rms_eps, hidden_c, static_cast<half*>(staged.data),
+                    stream);
+                Tensor tokens_c = work_.alloc(DType::I32, {live});
+                DeviceSpan argmax_scratch = work_.alloc_bytes(
+                    static_cast<std::size_t>(live) * sizeof(unsigned long long), 256);
+                ops::detail::launch_nvfp4_volta_qpn_argmax_fp16(
+                    hidden_c, *lm_head_, staged.data, tokens_c, kCfg.token_domain,
+                    argmax_scratch.data, stream);
+                Tensor flat_tokens_row    = flat_tokens.view({1, columns});
+                const Tensor tokens_c_row = tokens_c.view({1, live});
+                ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
+                                          {&flat_hidden, nullptr, nullptr, nullptr}, padded_slots,
+                                          stream, false);
+                ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
+                fused_fp8_argmax = true;
+            }
+#endif
+            if (!fused_fp8_argmax) {
+                Tensor logits_c = work_.alloc(DType::BF16, {kCfg.vocab, live});
+                bool fused_fp8_linear = false;
+#ifdef NINFER_VOLTA_BUILD
+                if (lm_head_->qtype == QType::FP8_E4M3FN_ROW_BF16S && kCfg.hidden == 5120 &&
+                    ops::detail::volta_stage_fp16_enabled() &&
+                    ops::detail::fp8_volta_qpn_supported(lm_head_->n, lm_head_->k, live)) {
+                    auto head_scope = work_.scope();
+                    DeviceSpan staged = work_.alloc_bytes(
+                        static_cast<std::size_t>(kCfg.hidden) * live * sizeof(std::uint16_t), 256);
+                    ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                        x, *final_norm_, kCfg.rms_eps, hidden_c, static_cast<half*>(staged.data),
+                        stream);
+                    ops::detail::launch_fp8_volta_qpn_fp16(hidden_c, *lm_head_, staged.data,
+                                                           logits_c, stream);
+                    fused_fp8_linear = true;
+                } else if (lm_head_->qtype == QType::Q6G64_F16S && kCfg.hidden == 5120 &&
+                           live <= 64 && ops::detail::volta_stage_fp16_enabled() &&
+                           (ops::detail::volta_qpn_groupwise_supported(*lm_head_) ||
+                            (live <= 32 &&
+                             ops::detail::volta_rowsplit_stream_hmma_supported(
+                                 lm_head_->n, lm_head_->k, lm_head_->padded_shape[1], live)))) {
+                    auto head_scope = work_.scope();
+                    DeviceSpan staged = work_.alloc_bytes(
+                        static_cast<std::size_t>(kCfg.hidden) * live * sizeof(std::uint16_t), 256);
+                    ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                        x, *final_norm_, kCfg.rms_eps, hidden_c, static_cast<half*>(staged.data),
+                        stream);
+                    if (lm_head_->layout == QuantLayout::VoltaQpnPrepacked) {
+                        ops::detail::launch_q6_prepacked_volta_fp16(
+                            hidden_c, static_cast<const half*>(staged.data), *lm_head_, logits_c,
+                            stream);
+                    } else {
+                        ops::detail::launch_q6_volta_stream_hmma_fp16(
+                            hidden_c, *lm_head_, staged.data, logits_c, stream);
+                    }
+                    fused_fp8_linear = true;
+                } else if (lm_head_->qtype == QType::NVFP4 && kCfg.hidden == 5120 &&
+                           ops::detail::volta_stage_fp16_enabled() &&
+                           ops::detail::nvfp4_volta_qpn_supported(lm_head_->n, lm_head_->k, live)) {
+                    auto head_scope = work_.scope();
+                    DeviceSpan staged = work_.alloc_bytes(
+                        static_cast<std::size_t>(kCfg.hidden) * live * sizeof(std::uint16_t), 256);
+                    ops::detail::volta_rmsnorm_offset_d5120_to_bf16_and_fp16(
+                        x, *final_norm_, kCfg.rms_eps, hidden_c, static_cast<half*>(staged.data),
+                        stream);
+                    ops::detail::launch_nvfp4_volta_qpn_fp16(hidden_c, *lm_head_, staged.data,
+                                                             logits_c, stream);
+                    fused_fp8_linear = true;
+                }
+#endif
+                if (!fused_fp8_linear) {
+                    ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden_c, stream);
+                    ops::linear(hidden_c, *lm_head_, logits_c, stream);
+                }
+                if (greedy_argmax != nullptr) {
+                    ops::speculative_penalized_argmax(
+                        logits_c, &padded_slots, *greedy_argmax->drafts, *greedy_argmax->extents,
+                        greedy_argmax->configs, kCfg.token_domain, width, target_tokens, work_,
+                        stream);
                     ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
                                               {&flat_hidden, nullptr, nullptr, nullptr},
                                               padded_slots, stream, false);
                 } else {
-                    ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
-                                              {&flat_hidden, &flat_logits, nullptr, nullptr},
-                                              padded_slots, stream, false);
+                    Tensor tokens_c = work_.alloc(DType::I32, {live});
+                    ops::argmax(logits_c, tokens_c, kCfg.token_domain, stream);
+                    Tensor flat_tokens_row    = flat_tokens.view({1, columns});
+                    const Tensor tokens_c_row = tokens_c.view({1, live});
+                    // Acceptance reads each request's verified extent, which is its kept columns: the
+                    // dropped columns of the padded hidden and logits are never read, so they are not
+                    // zeroed. The 4-byte token row goes separately: in the group it held the
+                    // vocabulary-wide logits to 4-byte copies (192 us a round, the costliest gather).
+                    if (compaction->skip_logits_expand) {
+                        ops::gather_columns_group({&hidden_c, nullptr, nullptr, nullptr},
+                                                  {&flat_hidden, nullptr, nullptr, nullptr},
+                                                  padded_slots, stream, false);
+                    } else {
+                        ops::gather_columns_group({&hidden_c, &logits_c, nullptr, nullptr},
+                                                  {&flat_hidden, &flat_logits, nullptr, nullptr},
+                                                  padded_slots, stream, false);
+                    }
+                    ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
                 }
-                ops::gather_columns(tokens_c_row, padded_slots, flat_tokens_row, stream);
             }
             active_tap_scratch_ = Tensor{};
         }
@@ -880,11 +1129,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       const VerifyCompaction* compaction,
-                                      const GreedyVerifyArgmax* greedy_argmax) {
+                                      const GreedyVerifyArgmax* greedy_argmax,
+                                      bool skip_logits_output) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap, compaction, greedy_argmax);
+                             tap, compaction, greedy_argmax, skip_logits_output);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -895,10 +1145,11 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink,
                                       const VerifyCompaction* compaction,
-                                      const GreedyVerifyArgmax* greedy_argmax) {
+                                      const GreedyVerifyArgmax* greedy_argmax,
+                                      bool skip_logits_output) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink, compaction, greedy_argmax);
+                             sink, compaction, greedy_argmax, skip_logits_output);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,

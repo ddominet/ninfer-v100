@@ -48,6 +48,11 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+#ifdef NINFER_VOLTA_BUILD
+    bool gdn_state_fp16     = true;
+#else
+    bool gdn_state_fp16     = false;
+#endif
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

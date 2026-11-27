@@ -1,4 +1,8 @@
 #include "ops/linear/q6/q6_dispatch.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/common/volta_qpn_groupwise.h"
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
+#endif
 
 #include <stdexcept>
 
@@ -88,6 +92,22 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 
 void q6_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+            volta_qpn_groupwise_supported(w)) {
+            launch_q6_prepacked_volta(x, w, out, stream);
+            return;
+        }
+        throw std::invalid_argument("Q6 linear: unsupported prepacked shape or policy");
+    }
+    const std::int32_t t = x.ne[1];
+    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) && t <= 256 &&
+        volta_rowsplit_stream_hmma_supported(out.ne[0], x.ne[0], w.padded_shape[1], t)) {
+        launch_q6_volta_stream_hmma(x, w, out, stream);
+        return;
+    }
+#endif
     const Q6Launch launch = select_q6_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }

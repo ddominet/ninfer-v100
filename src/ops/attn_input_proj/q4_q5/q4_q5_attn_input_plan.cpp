@@ -3,6 +3,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.h"
+#include "ops/linear/common/volta_qpn_groupwise.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q5/q5_launch.h"
 #endif
@@ -79,7 +80,7 @@ struct RouteSpec {
 // once per 32-column A tile, so cost steps at T=33/65/97. Three tiles still beats CUTLASS's fixed
 // dequant comfortably (1.40x at T=96); four does not (1287 against 1304 at T=112, and losing from
 // 128). So the band ends at the last tile boundary that wins outright.
-constexpr std::int32_t kVoltaMmaMinCols = 9;
+constexpr std::int32_t kVoltaMmaMinCols = 17;
 constexpr std::int32_t kVoltaMmaMaxCols = 96;
 
 [[nodiscard]] inline bool attn_uses_volta_mma(const Q4Q5AttnInputProblem& p) noexcept {
@@ -221,11 +222,12 @@ std::size_t q4_q5_attn_input_capacity_workspace_bytes(std::int32_t min_cols,
         maximum = std::max(maximum, at(std::min(route.cols.last, max_cols)));
     }
 #ifdef NINFER_VOLTA_BUILD
-    // The fused route displaces the table inside [kVoltaMmaMinCols, kVoltaMmaMaxCols], which cuts
-    // across kRoutes' second span. Probing only the table's own endpoints therefore misses the
-    // fused band's right edge whenever the interval runs past it into CutlassSm70TensorCore.
-    if (min_cols <= kVoltaMmaMaxCols && max_cols >= kVoltaMmaMinCols) {
-        maximum = std::max(maximum, at(std::min(kVoltaMmaMaxCols, max_cols)));
+    // The fused route's split-K count is non-monotonic across 32-column tile boundaries, so check
+    // every column count in the overlapped Volta MMA band.
+    const std::int32_t mma_lo = std::max(min_cols, kVoltaMmaMinCols);
+    const std::int32_t mma_hi = std::min(max_cols, kVoltaMmaMaxCols);
+    for (std::int32_t c = mma_lo; c <= mma_hi; ++c) {
+        maximum = std::max(maximum, at(c));
     }
 #endif
     return maximum;
@@ -241,6 +243,36 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 attention input: plan does not match exact problem");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (query_key_weight.layout == QuantLayout::VoltaQpnPrepacked &&
+        gate_value_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        if (problem.cols <= 64) {
+            launch_q4_prepacked_volta_split(x, query_key_weight, q, k, problem.query_rows, stream);
+            launch_q5_prepacked_volta_split(x, gate_value_weight, gate, v, problem.query_rows,
+                                            stream);
+            return;
+        }
+        const std::size_t cutlass_ws = q4_q5_attn_input_cutlass_workspace_bytes(problem.cols);
+        if (workspace.capacity() - workspace.used() >= cutlass_ws) {
+            q4_q5_attn_input_cutlass_sm70_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                                 v, workspace, stream);
+            return;
+        }
+        for (std::int32_t first = 0; first < problem.cols; first += 64) {
+            const std::int32_t count = std::min<std::int32_t>(64, problem.cols - first);
+            Tensor x_c               = x.slice(1, first, count);
+            Tensor q_c               = q.slice(1, first, count);
+            Tensor gate_c            = gate.slice(1, first, count);
+            Tensor k_c               = k.slice(1, first, count);
+            Tensor v_c               = v.slice(1, first, count);
+            launch_q4_prepacked_volta_split(x_c, query_key_weight, q_c, k_c, problem.query_rows,
+                                            stream);
+            launch_q5_prepacked_volta_split(x_c, gate_value_weight, gate_c, v_c, problem.query_rows,
+                                            stream);
+        }
+        return;
+    }
+#endif
 
     switch (plan.schedule) {
     case Q4Q5AttnInputScheduleId::VoltaMmaFused:

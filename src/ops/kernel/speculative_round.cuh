@@ -226,6 +226,7 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+template <bool UpdateCounts = true>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
@@ -250,8 +251,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
             const int t_star = row_targets[a];
-            speculative_store_accept_result<true>(row_drafts, k, row, a, t_star, lengths, anchors,
-                                                  row_tokens, licensed_counts, accepted, &cfg);
+            speculative_store_accept_result<UpdateCounts>(
+                row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
+                accepted, &cfg);
         }
         return;
     }
@@ -322,8 +324,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         if (tid == 0) {
             const int a     = a_sh;
             const int tstar = tstar_sh;
-            speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
-                                                  row_tokens, licensed_counts, accepted, &cfg);
+            speculative_store_accept_result<UpdateCounts>(row_drafts, k, row, a, tstar, lengths,
+                                                          anchors, row_tokens, licensed_counts,
+                                                          accepted, &cfg);
         }
         return;
     }
@@ -376,8 +379,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     if (tid == 0) {
         const int a     = a_sh;
         const int tstar = tstar_sh;
-        speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
-                                              row_tokens, licensed_counts, accepted, &cfg);
+        speculative_store_accept_result<UpdateCounts>(row_drafts, k, row, a, tstar, lengths,
+                                                      anchors, row_tokens, licensed_counts,
+                                                      accepted, &cfg);
     }
 }
 
@@ -454,7 +458,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
-template <bool SparseProposal>
+template <bool SparseProposal, bool UpdateCounts = !SparseProposal>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
     const std::int32_t* target_tokens, const std::int32_t* drafts,
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
@@ -490,7 +494,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 int a = 0;
                 while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
                 const int t_star = row_targets[a];
-                speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, t_star,
+                speculative_store_accept_result<UpdateCounts>(row_drafts, k, row, a, t_star,
                                                                  lengths, anchors, row_tokens,
                                                                  licensed_counts, accepted, &cfg);
             }
@@ -621,7 +625,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                         tstar = selected;
                         break;
                     }
-                    speculative_store_accept_result<!SparseProposal>(
+                    speculative_store_accept_result<UpdateCounts>(
                         row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                         accepted, &cfg);
                     *workspace.speculative_finalize_count = 0;
@@ -677,7 +681,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                                                      kSamplePurposeSpeculativeBonus, 0u);
                     tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
                 }
-                speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, tstar,
+                speculative_store_accept_result<UpdateCounts>(row_drafts, k, row, a, tstar,
                                                                  lengths, anchors, row_tokens,
                                                                  licensed_counts, accepted, &cfg);
                 *workspace.speculative_finalize_count = 0;

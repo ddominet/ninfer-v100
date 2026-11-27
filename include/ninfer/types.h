@@ -77,9 +77,12 @@ enum class SpeculativeBackend : std::uint8_t {
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: MTP 1..7; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Prompt/ledger n-gram copy speculation window (0 disables; 1..15 enables copy rounds up to K).
+    std::uint32_t ngram_draft_tokens = 0;
+    std::uint32_t ngram_min_match    = 12;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -169,6 +172,7 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    bool gdn_state_fp16                    = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

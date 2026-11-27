@@ -18,21 +18,24 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         .extents = &frame.current_extents,
         .configs = frame.sampling,
     };
+    const bool is_dflash_mode = frame.proposal_q.data != nullptr || frame.dflash_copy_round;
     const GreedyVerifyArgmax* greedy_argmax =
-        (frame.proposal_q.data != nullptr && frame.all_greedy && frame.any_penalties)
+        (is_dflash_mode && frame.all_greedy && frame.any_penalties)
             ? &greedy_argmax_cfg
             : nullptr;
+    const bool skip_logits_output = is_dflash_mode && frame.all_greedy && !frame.any_penalties;
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens, *frame.feature_sink, frame.compaction,
-                                 greedy_argmax);
+                                 greedy_argmax, skip_logits_output);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens, frame.compaction, greedy_argmax);
+                                 frame.target_tokens, frame.compaction, greedy_argmax,
+                                 skip_logits_output);
     }
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
@@ -41,6 +44,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
             TextConfig::token_domain, frame.sampling, {frame.all_greedy}, execution.work,
             execution.device.stream);
+    } else if (frame.dflash_copy_round) {
+        ops::speculative_accept_greedy_drafts(
+            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
+            frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
+            execution.device.stream, /*update_token_counts=*/false, /*raw_greedy=*/frame.all_greedy);
     } else {
         ops::speculative_accept_greedy_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,

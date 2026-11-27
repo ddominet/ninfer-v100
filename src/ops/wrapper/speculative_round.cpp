@@ -140,7 +140,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      bool update_token_counts, bool raw_greedy) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -170,11 +171,15 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
-        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
+        (raw_greedy && !update_token_counts)
+            ? 0
+            : speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
+                                                                        batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, update_token_counts,
+        raw_greedy);
 }
 
 void speculative_accept_sparse_drafts(

@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/linear/common/volta_qpn_groupwise_dequant.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include "cutlass/cutlass.h"
@@ -143,7 +144,9 @@ void q4_linear_swiglu_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tens
     auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
     auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
 
-    {
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        launch_dequant_q4_prepacked_to_fp16(w.qdata, w.scales, n, k, w_fp16, stream);
+    } else {
         const int groups_per_row     = k / Q4RowSplitStorage::kGroupK;
         const int code_bytes_per_row = groups_per_row * Q4RowSplitStorage::kCodeBytesPerGroup;
         const dim3 block(256);

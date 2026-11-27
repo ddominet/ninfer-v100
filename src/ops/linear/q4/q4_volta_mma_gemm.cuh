@@ -68,7 +68,7 @@ struct Q4VoltaMmaSchedule {
 // frequent shape (gate/up, n=34816) actually runs. With a single split each CTA owns its output
 // tile outright, so the whole fp32 apparatus -- workspace, zeroing memset, atomicAdd, narrowing
 // pass -- is pure overhead against a plain BF16 store. Same structure the W8 kernel is built on.
-template <bool kDirect>
+template <bool kDirect, bool kAddResidual = false>
 __global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void q4_volta_mma_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, float* __restrict__ partial,
@@ -206,8 +206,11 @@ __global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void q4_volta_mma_
         const int col_n = n0 + volta_d_get_j(l);
         if (row_t < tcnt && col_n < n) {
             if constexpr (kDirect) {
-                out[static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n] =
-                    __float2bfloat16(d[l]);
+                const std::int64_t o =
+                    static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n;
+                float v = d[l];
+                if constexpr (kAddResidual) { v += __bfloat162float(out[o]); }
+                out[o] = __float2bfloat16(v);
             } else {
                 atomicAdd(&partial[static_cast<std::int64_t>(t0 + row_t) * n + col_n], d[l]);
             }

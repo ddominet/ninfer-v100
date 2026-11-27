@@ -137,8 +137,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .value_heads    = TextConfig::gdn_value_heads,
                 .value_head_dim = TextConfig::gdn_value_head_dim,
                 .key_head_dim   = TextConfig::gdn_key_head_dim,
-                .slot_count     = state_image_slots,
-                .conv_dtype     = DType::BF16,
+                .slot_count      = state_image_slots,
+                .conv_dtype      = DType::BF16,
+                .recurrent_dtype = plan.features.gdn_state_fp16 ? DType::FP16 : DType::FP32,
             },
         .hidden = TextConfig::hidden,
     };
@@ -153,6 +154,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
     out.state_images = qwen3_6::plan_state_image_device_pool(builder, state_image_spec);
+    const std::uint32_t dflash_copy_draft_window =
+        (plan.features.dflash2() && !plan.use_cuda_graph && plan.ngram_draft_tokens > plan.draft_window)
+            ? plan.ngram_draft_tokens
+            : 0U;
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
@@ -177,6 +182,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .key_dim       = TextConfig::gdn_key_head_dim,
                              .value_dim     = TextConfig::gdn_value_head_dim,
                          });
+        }
+        if (dflash_copy_draft_window > plan.draft_window) {
+            out.dflash_copy_replay_records = plan_gdn_replay_records(
+                builder,
+                GdnReplayRecordSpec{
+                    .layers          = TextConfig::gdn_layers(),
+                    .record_capacity = static_cast<std::int32_t>(
+                        std::min<std::uint32_t>(plan.max_concurrency, 2U)),
+                    .width           = static_cast<std::int32_t>(dflash_copy_draft_window + 1U),
+                    .conv_channels   = TextConfig::convolution_dim,
+                    .qk_heads        = TextConfig::gdn_key_heads,
+                    .value_heads     = TextConfig::gdn_value_heads,
+                    .key_dim         = TextConfig::gdn_key_head_dim,
+                    .value_dim       = TextConfig::gdn_value_head_dim,
+                });
         }
     }
     if constexpr (Variant::supports_dflash) {
@@ -217,20 +237,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 "DFlash prefill target features");
             dflash.prefill_positions = add_tensor(builder, DType::I32, {effective_prefill_chunk},
                                                   "DFlash prefill target positions");
-            dflash.pending_features  = add_tensor(builder, DType::BF16,
-                                                  {DFlashConfig::feature_rows,
-                                                   static_cast<std::int32_t>(plan.draft_window + 1U),
-                                                   static_cast<std::int32_t>(plan.max_concurrency)},
-                                                  "DFlash pending target features");
+            const std::uint32_t pending_width =
+                std::max(plan.draft_window, dflash_copy_draft_window) + 1U;
+            dflash.pending_features =
+                add_tensor(builder, DType::BF16,
+                           {DFlashConfig::feature_rows, static_cast<std::int32_t>(pending_width),
+                            static_cast<std::int32_t>(plan.max_concurrency)},
+                           "DFlash pending target features");
         }
     }
 
     out.round = qwen3_6::begin_round_state_layout(
-        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
-                                         .output_rows    = TextConfig::output_rows,
-                                         .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
-                                         .backend        = plan.speculative_backend});
+        builder, qwen3_6::RoundStateSpec{.hidden            = TextConfig::hidden,
+                                         .output_rows       = TextConfig::output_rows,
+                                         .batch_capacity    = plan.max_concurrency,
+                                         .draft_window      = plan.draft_window,
+                                         .copy_draft_window = dflash_copy_draft_window,
+                                         .backend           = plan.speculative_backend});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     if (plan.causal_scoring) {
@@ -666,9 +689,44 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                               TextConfig::token_domain, drafts, drafts, batch, batch);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
+                const std::int32_t pending_w =
+                    (plan.features.dflash2() && !plan.use_cuda_graph)
+                        ? static_cast<std::int32_t>(
+                              std::max(plan.draft_window, plan.ngram_draft_tokens) + 1U)
+                        : verify;
                 out.dflash_round =
                     std::max({out.dflash_round, finish(target), accept,
-                              dflash_context_capacity(verify, batch, true), proposal});
+                              dflash_context_capacity(pending_w, batch, true), proposal});
+            }
+            if (plan.features.dflash2() && !plan.use_cuda_graph &&
+                plan.ngram_draft_tokens > plan.draft_window) {
+                const auto copy_drafts = static_cast<std::int32_t>(plan.ngram_draft_tokens);
+                const auto copy_verify = copy_drafts + 1;
+                const auto copy_max_b =
+                    static_cast<std::int32_t>(std::min<std::uint32_t>(plan.max_concurrency, 2U));
+                for (std::int32_t batch = 1; batch <= copy_max_b; ++batch) {
+                    const std::int32_t aggregate = copy_verify * batch;
+                    WorkspaceLayoutBuilder target;
+                    matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                    matrix(target, DType::I32, 2, aggregate);
+                    matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                    matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                    matrix(target, DType::BF16, TextConfig::output_rows, aggregate);
+                    matrix(target, DType::BF16,
+                           2 * TextConfig::query_size + 2 * TextConfig::kv_size, aggregate);
+                    matrix(target, DType::BF16, TextConfig::hidden + 2 * TextConfig::value_dim,
+                           aggregate);
+                    matrix(target, DType::FP32, 2 * TextConfig::gdn_value_heads, aggregate);
+                    target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
+                                GdnWorkspacePath::ReplayRecord, batch, copy_verify, copy_verify,
+                                text_envelope);
+                    const std::size_t copy_accept =
+                        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                            TextConfig::token_domain, copy_drafts, copy_drafts, batch, batch);
+                    out.dflash_round =
+                        std::max({out.dflash_round, finish(target), copy_accept,
+                                  dflash_context_capacity(copy_verify, batch, true)});
+                }
             }
         }
     }
@@ -719,6 +777,12 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         break;
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
+    }
+    if (options.speculative.ngram_draft_tokens > 15) {
+        throw std::invalid_argument("ngram_draft_tokens must be in [0,15]");
+    }
+    if (options.speculative.ngram_min_match < 4 || options.speculative.ngram_min_match > 64) {
+        throw std::invalid_argument("ngram_min_match must be in [4,64]");
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -775,6 +839,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->ngram_draft_tokens  = inputs.ngram_draft_tokens;
+    impl->ngram_min_match     = inputs.ngram_min_match;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -873,6 +939,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .ngram_draft_tokens  = options.speculative.ngram_draft_tokens,
+        .ngram_min_match     = options.speculative.ngram_min_match,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,

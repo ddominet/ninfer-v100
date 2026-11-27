@@ -6,6 +6,9 @@
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
+#endif
 
 #include <cuda_bf16.h>
 
@@ -204,6 +207,18 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t t = x.ne[1];
+    if (t <= kVoltaStreamHmmaMaxTokens &&
+        volta_rowsplit_stream_hmma_supported(query_key_weight.n, query_key_weight.k,
+                                             query_key_weight.padded_shape[1], t) &&
+        volta_rowsplit_stream_hmma_supported(gate_value_weight.n, gate_value_weight.k,
+                                             gate_value_weight.padded_shape[1], t)) {
+        launch_q4_volta_stream_hmma_split(x, query_key_weight, q, k, kSplitRow, stream);
+        launch_q5_volta_stream_hmma_split(x, gate_value_weight, gate, v, kSplitRow, stream);
+        return;
+    }
+#endif
     launch_q4(x, query_key_weight, q, k, stream);
     launch_q5(x, gate_value_weight, gate, v, stream);
 }

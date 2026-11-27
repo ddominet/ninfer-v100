@@ -207,17 +207,31 @@ __global__ __launch_bounds__(ROWS / 16 * 32) void volta_tc_skinny_kernel(
         for (int e = lane; e < 256; e += 32) {
             const int row   = row0 + (e & 15);
             const int token = j * 16 + (e >> 4);
-            if (row < n && token < t) {
-                float value = c_s[e];
-                if (splits > 1) {
-                    float* slot = partial + static_cast<std::int64_t>(token) * n + row;
-                    if (!first) { value += __ldcg(slot); }
-                    if (!last) {
-                        __stcg(slot, value);
-                        continue;
+            if constexpr (requires { output.make_argmax_key(0, 0.0f); }) {
+                unsigned long long key = 0ULL;
+                if (row < n && token < t) {
+                    float value = c_s[e];
+                    if (splits > 1) {
+                        float* slot = partial + static_cast<std::int64_t>(token) * n + row;
+                        if (!first) { value += __ldcg(slot); }
+                        if (!last) { __stcg(slot, value); }
                     }
+                    if (last) { key = output.make_argmax_key(row, decoder.finish(row, value)); }
                 }
-                output.store(row, token, decoder.finish(row, value));
+                if (last) { output.commit_halfwarp(token, key, lane, token < t); }
+            } else {
+                if (row < n && token < t) {
+                    float value = c_s[e];
+                    if (splits > 1) {
+                        float* slot = partial + static_cast<std::int64_t>(token) * n + row;
+                        if (!first) { value += __ldcg(slot); }
+                        if (!last) {
+                            __stcg(slot, value);
+                            continue;
+                        }
+                    }
+                    output.store(row, token, decoder.finish(row, value));
+                }
             }
         }
         __syncwarp();

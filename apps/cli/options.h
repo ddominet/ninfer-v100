@@ -28,6 +28,11 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+#ifdef NINFER_VOLTA_BUILD
+    bool gdn_state_fp16 = true;
+#else
+    bool gdn_state_fp16 = false;
+#endif
 
     bool raw_output      = false;
     bool print_token_ids = false;

@@ -7,6 +7,9 @@
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
+#endif
 
 #include <cuda_bf16.h>
 
@@ -222,6 +225,18 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t t = x.ne[1];
+    if (t <= kVoltaStreamHmmaMaxTokens &&
+        volta_rowsplit_stream_hmma_supported(qk_weight.n, qk_weight.k, qk_weight.padded_shape[1],
+                                             t) &&
+        volta_rowsplit_stream_hmma_supported(value_z_weight.n, value_z_weight.k,
+                                             value_z_weight.padded_shape[1], t)) {
+        launch_q4_volta_stream_hmma(x, qk_weight, qk, stream);
+        launch_q5_volta_stream_hmma_split(x, value_z_weight, value, z, kValueRows, stream);
+        return;
+    }
+#endif
     if (x.ne[1] == 4) {
         launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;

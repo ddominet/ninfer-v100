@@ -95,8 +95,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     // (w8_prepack_sm70.cu); the W8 plan reads it only through the QPN split kernels.
     const bool w8_prepacked = large_shape && gate_up_weight.qtype == QType::W8G32_F16S &&
                               gate_up_weight.layout == QuantLayout::VoltaQpnPrepacked;
+    const bool q4_prepacked =
+#ifdef NINFER_VOLTA_BUILD
+        large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
+        gate_up_weight.layout == QuantLayout::VoltaQpnPrepacked;
+#else
+        false;
+#endif
     const bool common_row_split =
-        (gate_up_weight.layout == QuantLayout::RowSplit || w8_prepacked) &&
+        (gate_up_weight.layout == QuantLayout::RowSplit || w8_prepacked || q4_prepacked) &&
         gate_up_weight.scale_dtype == DType::FP16 && gate_up_weight.ndim == 2 &&
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&

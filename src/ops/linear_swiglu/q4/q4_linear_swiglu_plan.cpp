@@ -6,6 +6,8 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear/q4/q4_launch.h"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/common/volta_qpn_groupwise.h"
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.h"
 #endif
@@ -37,29 +39,13 @@ struct RouteSpec {
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
 #ifdef NINFER_VOLTA_BUILD
-// Lower edge of the fused tensor-core route. At exactly 16 it is a wash (that is q4_simt_r8_c8's
-// best point -- two exact eight-column tiles); it wins from 17 up, and SmallTExact's own ceiling
-// of 32 bounds the split-K buffer.
-constexpr std::int32_t kVoltaMmaMinCols = 16;
+constexpr std::int32_t kVoltaMmaMinCols = 17;
 #endif
 
 #ifdef NINFER_VOLTA_BUILD
-// MmaSplitHalfPairR32C*/Materialized-via-linear() route through Ampere+ mma/ldmatrix kernels
-// (q4_rowsplit_gemm_mma.cuh and friends), trap-stubbed on sm_70. SmallTExact's Volta compose
-// (a tuned q4 SIMT launch + silu_mul) is fully general over T via for_each_token_slice, and stays
-// the route for small T -- decode and small prefill chunks, where this GEMM is bandwidth-bound
-// and CUTLASS's fixed (T-independent) dequant cost wouldn't pay for itself.
-//
-// For wide T (real prefill), CutlassSm70TensorCore instead dequantizes to a scratch FP16
-// buffer and runs NVIDIA CUTLASS's Sm70 (real mma.sync.m8n8k4 tensor-core) GEMM template --
-// independently verified (correctness against this exact SIMT kernel, L2 relative error
-// ~0.17%, well within expected fp16-storage precision differences; 6.6x measured speedup at
-// the real N=34816/K=5120/T=256 gate_up shape on this V100). Cold-cache measurement places
-// the exact crossover after T=32: the C8 SIMT route re-reads the weights for a fifth tile at
-// T=33, while CUTLASS keeps one dequant pass and one partially occupied 128-row M tile.
 constexpr std::array<RouteSpec, 3> kRoutes{{
-    {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
+    {{1, 16}, Q4LinearSwiGluScheduleId::VoltaStreamHmmaSwiGlu},
+    {{17, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
     {{33, kAnyCols}, Q4LinearSwiGluScheduleId::CutlassSm70TensorCore},
 }};
 #else
@@ -124,6 +110,8 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q4.mma.split_half_pair.r32.c128";
     case Q4LinearSwiGluScheduleId::CutlassSm70TensorCore:
         return "linear_swiglu.q4.cutlass_sm70.tensor_core";
+    case Q4LinearSwiGluScheduleId::VoltaStreamHmmaSwiGlu:
+        return "linear_swiglu.q4.volta_stream_hmma.swiglu";
     }
     return "linear_swiglu.q4.unknown";
 }
@@ -163,6 +151,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
 #endif
             return plan;
         case Q4LinearSwiGluScheduleId::GemvPair:
+        case Q4LinearSwiGluScheduleId::VoltaStreamHmmaSwiGlu:
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
             return plan;
@@ -217,11 +206,24 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q4 linear_swiglu: plan does not match the exact problem");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (w.layout == QuantLayout::VoltaQpnPrepacked && problem.cols <= 64) {
+        launch_q4_prepacked_volta_swiglu(x, w, out, stream);
+        return;
+    }
+#endif
 
     switch (plan.schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
         return;
+    case Q4LinearSwiGluScheduleId::VoltaStreamHmmaSwiGlu:
+#ifdef NINFER_VOLTA_BUILD
+        launch_q4_volta_stream_hmma_swiglu(x, w, out, stream);
+        return;
+#else
+        throw std::logic_error("q4 linear_swiglu: VoltaStreamHmmaSwiGlu is Volta-only");
+#endif
     case Q4LinearSwiGluScheduleId::SmallTExact:
 #ifdef NINFER_VOLTA_BUILD
         {

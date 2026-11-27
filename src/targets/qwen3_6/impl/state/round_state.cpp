@@ -39,6 +39,10 @@ void validate_spec(const RoundStateSpec& spec) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
     }
+    if (spec.copy_draft_window > kDFlashDecodeMaximumDrafts) {
+        throw std::invalid_argument(
+            "RoundState DFlash copy draft window exceeds the decode frame domain");
+    }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
         throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
     }
@@ -210,6 +214,46 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+
+        if (layout.spec.copy_draft_window > layout.spec.draft_window) {
+            DFlashDecodeStateLayout& copy_decode = layout.dflash_copy_decode.emplace();
+            const auto copy_columns = checked_i32(
+                static_cast<std::uint64_t>(layout.spec.copy_draft_window) + 1ULL,
+                "RoundState copy columns exceed int32");
+            const auto copy_batch = checked_i32(
+                std::min<std::uint32_t>(layout.spec.batch_capacity, 2U),
+                "RoundState DFlash copy batch capacity exceeds int32");
+            copy_decode.ingress =
+                builder.add(sizeof(DFlashDecodeIngress), kArenaAlign, "DFlash copy decode ingress");
+            copy_decode.egress =
+                builder.add(sizeof(DFlashDecodeEgress), kArenaAlign, "DFlash copy decode egress");
+            copy_decode.proposal_ids = add_tensor(builder, DType::I32, {copy_columns, copy_batch},
+                                                  "DFlash copy proposal ids");
+            copy_decode.proposal_positions = add_tensor(
+                builder, DType::I32, {copy_columns, copy_batch}, "DFlash copy proposal positions");
+            copy_decode.verify_positions = add_tensor(
+                builder, DType::I32, {copy_columns, copy_batch}, "DFlash copy verify positions");
+            copy_decode.append_positions = add_tensor(
+                builder, DType::I32, {copy_columns, copy_batch}, "DFlash copy append positions");
+            copy_decode.append_counts =
+                add_tensor(builder, DType::I32, {copy_batch}, "DFlash copy append counts");
+            copy_decode.draft_tokens = add_tensor(
+                builder, DType::I32, {copy_columns - 1, copy_batch}, "DFlash copy draft tokens");
+            copy_decode.verify_ids = add_tensor(builder, DType::I32, {copy_columns, copy_batch},
+                                                "DFlash copy target verify ids");
+            copy_decode.target_argmax = add_tensor(builder, DType::I32, {copy_columns, copy_batch},
+                                                   "DFlash copy target argmax");
+            copy_decode.target_logits =
+                add_tensor(builder, DType::BF16,
+                           {layout.spec.output_rows, copy_columns, copy_batch},
+                           "DFlash copy target logits");
+            copy_decode.target_hidden =
+                add_tensor(builder, DType::BF16, {layout.spec.hidden, copy_columns, copy_batch},
+                           "DFlash copy target hidden");
+            copy_decode.target_continuation_hidden =
+                add_tensor(builder, DType::BF16, {layout.spec.hidden, copy_batch},
+                           "DFlash copy target continuation hidden");
+        }
     }
     layout.complete = true;
 }
@@ -395,6 +439,11 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,
                               layout.spec.draft_window);
+    }
+    if (layout.dflash_copy_decode) {
+        dflash_copy_decode.emplace(backing, *layout.dflash_copy_decode,
+                                   std::min<std::uint32_t>(layout.spec.batch_capacity, 2U),
+                                   layout.spec.copy_draft_window);
     }
 }
 

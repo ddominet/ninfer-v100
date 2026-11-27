@@ -118,6 +118,9 @@ target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
 ninfer_add_test(ninfer_qwen3_6_state_image_test
   SOURCES targets/qwen3_6/test_state_image.cpp
   LIBRARIES ninfer_engine ninfer_core)
+ninfer_add_test(ninfer_qwen3_6_ngram_proposer_test
+  SOURCES targets/qwen3_6/test_ngram_proposer.cpp
+  LIBRARIES ninfer_core)
 target_include_directories(ninfer_qwen3_6_state_image_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_state_image_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -315,6 +318,7 @@ ninfer_add_op_test(ninfer_speculative_round_test
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
+ninfer_add_linear_test(ninfer_volta_qpn_prepacked_test ops/linear/test_volta_qpn_prepacked.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")

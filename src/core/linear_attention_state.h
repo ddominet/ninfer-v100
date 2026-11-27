@@ -20,6 +20,7 @@ struct LinearAttentionStatePoolSpec {
     std::int32_t key_head_dim   = 0;
     std::int32_t slot_count     = 1;
     DType conv_dtype            = DType::BF16;
+    DType recurrent_dtype       = DType::FP32;
 };
 
 struct LinearAttentionStatePoolLayout {

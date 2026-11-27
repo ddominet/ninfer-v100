@@ -98,7 +98,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      bool update_token_counts = true, bool raw_greedy = false);
 
 // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
 // The raw-greedy execution envelope requires no workspace.

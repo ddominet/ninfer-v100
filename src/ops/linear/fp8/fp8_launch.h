@@ -22,6 +22,9 @@ void launch_fp8_volta_qpn(const Tensor& x, const Weight& weight, Tensor& out,
                           cudaStream_t stream);
 void launch_fp8_volta_qpn_fp16(const Tensor& x, const Weight& weight, const void* x_fp16,
                                Tensor& out, cudaStream_t stream);
+void launch_fp8_volta_qpn_argmax_fp16(const Tensor& x, const Weight& weight, const void* x_fp16,
+                                      Tensor& out_tokens, std::int32_t valid_rows,
+                                      void* scratch_u64, cudaStream_t stream);
 [[nodiscard]] bool fp8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                            std::int32_t t) noexcept;
 #endif

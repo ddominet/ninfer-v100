@@ -117,12 +117,32 @@ __global__ void volta_stage_group_major_kernel(const __nv_bfloat16* __restrict__
     reinterpret_cast<uint4*>(output)[vec] = packed;
 }
 
-template <bool kGroupMajor>
+__global__ void volta_repack_fp16_group_major_kernel(const half* __restrict__ input,
+                                                     half* __restrict__ output, int k, int t,
+                                                     int tiles, std::int64_t vec_count) {
+    const std::int64_t vec = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (vec >= vec_count) { return; }
+    const int r           = static_cast<int>(vec & 7);
+    const int h           = static_cast<int>((vec >> 3) & 1);
+    const std::int64_t gt = vec >> 4;
+    const int tile        = static_cast<int>(gt % tiles);
+    const int group       = static_cast<int>(gt / tiles);
+    const int row         = tile * 8 + r;
+    const uint4 packed    = (row < t)
+                                ? __ldg(reinterpret_cast<const uint4*>(
+                                      input + static_cast<std::int64_t>(row) * k + group * 16 +
+                                      h * 8))
+                                : make_uint4(0u, 0u, 0u, 0u);
+    reinterpret_cast<uint4*>(output)[vec] = packed;
+}
+
+template <bool kGroupMajor, bool kWriteBf16 = false>
 __launch_bounds__(640, 2) __global__
     void volta_rmsnorm_offset_d5120_staged_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const __nv_bfloat16* __restrict__ weight,
-                                                  half* __restrict__ out, int t, int tiles,
-                                                  float eps) {
+                                                  half* __restrict__ out,
+                                                  __nv_bfloat16* __restrict__ out_bf16, int t,
+                                                  int tiles, float eps) {
     constexpr int kBlock = 640; // 20 warps, 1 uint4 (8 elements) per thread -> 5120 exact
     constexpr int kWarps = kBlock / 32;
     const int row        = static_cast<int>(blockIdx.x);
@@ -171,14 +191,21 @@ __launch_bounds__(640, 2) __global__
 
     const auto* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
     uint4 packed;
-    auto* dst = reinterpret_cast<half2*>(&packed);
+    uint4 packed_bf16;
+    auto* dst    = reinterpret_cast<half2*>(&packed);
+    auto* dst_bf = reinterpret_cast<__nv_bfloat162*>(&packed_bf16);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const float2 xf         = __bfloat1622float2(xp[j]);
         const float2 wf         = __bfloat1622float2(wp[j]);
         const __nv_bfloat162 bf = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
                                                         xf.y * inv * (wf.y + 1.0f));
-        dst[j]                  = __float22half2_rn(__bfloat1622float2(bf));
+        if constexpr (kWriteBf16) { dst_bf[j] = bf; }
+        dst[j] = __float22half2_rn(__bfloat1622float2(bf));
+    }
+    if constexpr (kWriteBf16) {
+        reinterpret_cast<uint4*>(out_bf16)[static_cast<std::int64_t>(row) * 640 + tid] =
+            packed_bf16;
     }
     if constexpr (kGroupMajor) {
         const int tile         = row >> 3;
@@ -190,6 +217,16 @@ __launch_bounds__(640, 2) __global__
         reinterpret_cast<uint4*>(out)[vec] = packed;
     } else {
         reinterpret_cast<uint4*>(out)[static_cast<std::int64_t>(row) * 640 + tid] = packed;
+    }
+}
+
+__global__ void fp8_argmax_unpack_kernel(const unsigned long long* __restrict__ packed_max,
+                                         std::int32_t* __restrict__ out_tokens, int t) {
+    const int i = static_cast<int>(threadIdx.x);
+    if (i < t) {
+        const unsigned long long packed = packed_max[i];
+        out_tokens[i] =
+            packed == 0ULL ? 0 : static_cast<std::int32_t>(~static_cast<std::uint32_t>(packed));
     }
 }
 } // namespace
@@ -209,9 +246,19 @@ bool volta_group_major_enabled() noexcept {
 void volta_rmsnorm_offset_d5120_to_fp16(const Tensor& x, const Tensor& weight, float eps,
                                         half* out_fp16, cudaStream_t stream) {
     const int t = x.ne[1];
-    volta_rmsnorm_offset_d5120_staged_kernel<false><<<static_cast<unsigned>(t), 640, 0, stream>>>(
+    volta_rmsnorm_offset_d5120_staged_kernel<false, false><<<static_cast<unsigned>(t), 640, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        out_fp16, t, 0, eps);
+        out_fp16, nullptr, t, 0, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void volta_rmsnorm_offset_d5120_to_bf16_and_fp16(const Tensor& x, const Tensor& weight, float eps,
+                                                 Tensor& out_bf16, half* out_fp16,
+                                                 cudaStream_t stream) {
+    const int t = x.ne[1];
+    volta_rmsnorm_offset_d5120_staged_kernel<false, true><<<static_cast<unsigned>(t), 640, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        out_fp16, static_cast<__nv_bfloat16*>(out_bf16.data), t, 0, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -219,11 +266,11 @@ void volta_rmsnorm_offset_d5120_to_group_major(const Tensor& x, const Tensor& we
                                                VoltaGroupMajorHalf* out_gm, cudaStream_t stream) {
     const int t     = x.ne[1];
     const int tiles = volta_group_major_tiles(t);
-    volta_rmsnorm_offset_d5120_staged_kernel<true>
+    volta_rmsnorm_offset_d5120_staged_kernel<true, false>
         <<<static_cast<unsigned>(tiles * 8), 640, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(weight.data), reinterpret_cast<half*>(out_gm), t,
-            tiles, eps);
+            static_cast<const __nv_bfloat16*>(weight.data), reinterpret_cast<half*>(out_gm),
+            nullptr, t, tiles, eps);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -312,6 +359,24 @@ const VoltaGroupMajorHalf* volta_stage_fp16_group_major(const Tensor& x, cudaStr
     return static_cast<const VoltaGroupMajorHalf*>(data);
 }
 
+const VoltaGroupMajorHalf* volta_stage_fp16_to_group_major(const half* x_fp16, std::int32_t k,
+                                                           std::int32_t t, cudaStream_t stream) {
+    static const bool enabled = volta_stage_enabled("NINFER_VOLTA_STAGE_FP16") &&
+                                volta_stage_enabled("NINFER_VOLTA_GROUP_MAJOR");
+    if (!enabled || x_fp16 == nullptr || k % 16 != 0 || t <= 0 || t > kVoltaQpnMaxTokens) {
+        return nullptr;
+    }
+    const int tiles          = volta_group_major_tiles(t);
+    const std::int64_t count = static_cast<std::int64_t>(k / 16) * tiles * 128;
+    const std::int64_t vecs  = count / 8;
+    void* data = volta_stage_scratch(stream, static_cast<std::size_t>(count) * sizeof(half));
+    if (data == nullptr) { return nullptr; }
+    volta_repack_fp16_group_major_kernel<<<static_cast<int>((vecs + 255) / 256), 256, 0, stream>>>(
+        x_fp16, static_cast<half*>(data), k, t, tiles, vecs);
+    CUDA_CHECK(cudaGetLastError());
+    return static_cast<const VoltaGroupMajorHalf*>(data);
+}
+
 bool fp8_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
     if (n <= 0 || t <= 0) { return false; }
     // A lane consumes whole 128-byte lines, and the CTA's SPLITK warps split K by whole lines.
@@ -342,6 +407,22 @@ void launch_fp8_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_f
     launch_fp8_volta_qpn_with_fp16_activation(
         x, w, static_cast<const half*>(x_fp16),
         Fp8ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n, stream);
+}
+
+void launch_fp8_volta_qpn_argmax_fp16(const Tensor& x, const Weight& w, const void* x_fp16,
+                                      Tensor& out_tokens, std::int32_t valid_rows,
+                                      void* scratch_u64, cudaStream_t stream) {
+    const std::int32_t t = x.ne[1];
+    const std::int32_t n = w.n;
+    auto* packed_max     = static_cast<unsigned long long*>(scratch_u64);
+    CUDA_CHECK(cudaMemsetAsync(packed_max, 0, static_cast<std::size_t>(t) * sizeof(unsigned long long),
+                               stream));
+    launch_fp8_volta_qpn_with_fp16_activation(
+        x, w, static_cast<const half*>(x_fp16),
+        Fp8ArgmaxOutput{packed_max, std::min(valid_rows, n)}, n, stream);
+    fp8_argmax_unpack_kernel<<<1, static_cast<unsigned>(t), 0, stream>>>(
+        packed_max, static_cast<std::int32_t*>(out_tokens.data), t);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 #endif // NINFER_VOLTA_BUILD

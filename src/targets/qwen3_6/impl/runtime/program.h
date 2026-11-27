@@ -11,6 +11,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/ngram_proposer.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -341,6 +342,7 @@ struct PendingCandidate {
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
     std::uint32_t row_stride    = 1;
+    bool is_copy_round          = false;
 };
 
 enum class Lifecycle : std::uint8_t {
@@ -471,6 +473,9 @@ struct RequestControl {
     std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_hits{};
     std::array<float, qwen3_6::kDFlashDecodeMaximumDrafts> dflash_tries{};
     bool dflash_accept_ready = false;
+    std::optional<qwen3_6::detail::NgramRequestIndex> ngram;
+    qwen3_6::detail::NgramCopyBackoff ngram_backoff;
+    qwen3_6::detail::NgramPartnerBalance ngram_partner;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -734,6 +739,8 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const std::uint32_t ngram_draft_tokens;
+    const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
     // Verify only the DFlash drafts whose expected acceptance pays for their target rows (eager
     // rounds only; NINFER_DFLASH_KEEP_ALL=1 verifies every draft as before).
@@ -779,6 +786,8 @@ public:
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<GdnReplayRecords> mtp_lookup_replay_records;
     std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
+    std::optional<GdnReplayRecords> dflash_copy_replay_records;
+    std::optional<ops::GdnReplayFoldPlan> dflash_copy_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;

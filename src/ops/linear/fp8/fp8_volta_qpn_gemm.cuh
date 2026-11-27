@@ -245,16 +245,28 @@ __global__ __launch_bounds__(SPLITK * 32, volta_qpn_min_blocks(kTiles, SPLITK)) 
         const int row  = e / S::kColsPerCta;
         const int cl   = e % S::kColsPerCta;
         const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + cl;
-        if (row < t && ocol < n) {
-            float v = 0.0f;
+        if constexpr (requires { output.make_argmax_key(0, 0.0f); }) {
+            unsigned long long key = 0ULL;
+            if (row < t && ocol < n) {
+                float v = 0.0f;
 #pragma unroll
-            for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
-            // Row scale and the decode's 2^-8, together, once per output element. The store goes
-            // through the caller's policy so the fused attention projections can scatter straight
-            // into their q/gate/k/v (or qkv/z) planes instead of a contiguous buffer they would
-            // then have to split.
-            const float scale = __bfloat162float(scales[ocol]) * 256.0f;
-            output.store(ocol, row, v * scale);
+                for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
+                const float scale = __bfloat162float(scales[ocol]) * 256.0f;
+                key               = output.make_argmax_key(ocol, v * scale);
+            }
+            output.commit_warp(row, key, cl, row < t);
+        } else {
+            if (row < t && ocol < n) {
+                float v = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
+                // Row scale and the decode's 2^-8, together, once per output element. The store goes
+                // through the caller's policy so the fused attention projections can scatter straight
+                // into their q/gate/k/v (or qkv/z) planes instead of a contiguous buffer they would
+                // then have to split.
+                const float scale = __bfloat162float(scales[ocol]) * 256.0f;
+                output.store(ocol, row, v * scale);
+            }
         }
     }
 }

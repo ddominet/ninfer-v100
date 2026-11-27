@@ -30,11 +30,20 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.ngram_draft_tokens > 15) {
+        throw std::invalid_argument("--ngram-draft-tokens must be in [0,15]");
+    }
+    if (options.ngram_min_match < 4 || options.ngram_min_match > 64) {
+        throw std::invalid_argument("--ngram-min-match must be in [4,64]");
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
             throw std::invalid_argument(
                 "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
+        }
+        if (options.ngram_draft_tokens != 0) {
+            throw std::invalid_argument("--ngram-draft-tokens requires --spec dflash2");
         }
         return;
     case SpeculativeBackend::Mtp:

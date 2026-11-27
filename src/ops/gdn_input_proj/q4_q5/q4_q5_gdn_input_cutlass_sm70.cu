@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/linear/common/volta_qpn_groupwise_dequant.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 
@@ -218,7 +219,10 @@ void q4_q5_gdn_input_cutlass_sm70_launch(const Tensor& x, const Weight& qk_weigh
     auto* w5_fp16 = static_cast<cutlass::half_t*>(scratch.w5_fp16.data);
     auto* x_fp16  = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
 
-    {
+    if (qk_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        launch_dequant_q4_prepacked_to_fp16(qk_weight.qdata, qk_weight.scales, kQkRows, kHidden,
+                                            w4_fp16, stream);
+    } else {
         const int groups_per_row     = kHidden / Q4RowSplitStorage::kGroupK;
         const int code_bytes_per_row = groups_per_row * Q4RowSplitStorage::kCodeBytesPerGroup;
         const dim3 block(256);
@@ -229,7 +233,11 @@ void q4_q5_gdn_input_cutlass_sm70_launch(const Tensor& x, const Weight& qk_weigh
             static_cast<const std::uint8_t*>(qk_weight.scales), kQkRows, kHidden, w4_fp16);
         CUDA_CHECK(cudaGetLastError());
     }
-    {
+    if (value_z_weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        launch_dequant_q5_prepacked_to_fp16(value_z_weight.qdata, value_z_weight.qhigh,
+                                            value_z_weight.scales, kParentRows, kHidden, w5_fp16,
+                                            stream);
+    } else {
         const int groups_per_row     = kHidden / Q5RowSplitStorage::kGroupK;
         const int code_bytes_per_row = groups_per_row * Q5RowSplitStorage::kCodeBytesPerGroup;
         const dim3 block(256);

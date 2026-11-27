@@ -38,6 +38,7 @@ struct PersistentLayout {
     qwen3_6::StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<GdnReplayRecordLayout> mtp_lookup_replay_records;
+    std::optional<GdnReplayRecordLayout> dflash_copy_replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
@@ -76,6 +77,8 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
+    std::uint32_t ngram_draft_tokens       = 0;
+    std::uint32_t ngram_min_match          = 12;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
@@ -99,6 +102,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
+    std::uint32_t ngram_draft_tokens       = 0;
+    std::uint32_t ngram_min_match          = 12;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;

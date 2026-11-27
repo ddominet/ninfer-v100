@@ -3,6 +3,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.h"
+#include "ops/linear/common/volta_qpn_groupwise.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q5/q5_launch.h"
 #endif
@@ -56,7 +57,7 @@ struct RouteSpec {
 // of the 64 layers, ~32% of a C8 round, because it materialises both dequantised parents into
 // global FP16 every call (52 MB read, 168 MB written, 168 MB read back). The fused kernels read
 // each parent once at Q4/Q5 density.
-constexpr std::int32_t kVoltaMmaMinCols = 12;
+constexpr std::int32_t kVoltaMmaMinCols = 17;
 constexpr std::int32_t kVoltaMmaMaxCols = 64;
 
 [[nodiscard]] inline bool gdn_uses_volta_mma(const Q4Q5GdnInputProblem& p) noexcept {
@@ -191,6 +192,16 @@ std::size_t q4_q5_gdn_input_capacity_workspace_bytes(std::int32_t min_cols,
                                                          kQkvRows, kZRows, kInputRows, endpoint})
                                .workspace_bytes);
     }
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t mma_lo = std::max(min_cols, kVoltaMmaMinCols);
+    const std::int32_t mma_hi = std::min(max_cols, kVoltaMmaMaxCols);
+    for (std::int32_t c = mma_lo; c <= mma_hi; ++c) {
+        maximum = std::max(maximum,
+                           q4_q5_gdn_input_resolve_plan(
+                               {kInputRows, kQkRows, kValueZRows, kQkvRows, kZRows, kInputRows, c})
+                               .workspace_bytes);
+    }
+#endif
     return maximum;
 }
 
@@ -200,6 +211,9 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
         throw std::invalid_argument(
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }
+#ifdef NINFER_VOLTA_BUILD
+    return {Q4Q5GdnInputConvScheduleId::Materialized};
+#else
     if (batch_size > 1) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
     switch (problem.cols) {
     case 1:
@@ -211,6 +225,7 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
     default:
         return {Q4Q5GdnInputConvScheduleId::Materialized};
     }
+#endif
 }
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
@@ -224,6 +239,16 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (qk_weight.layout == QuantLayout::VoltaQpnPrepacked &&
+        value_z_weight.layout == QuantLayout::VoltaQpnPrepacked && problem.cols <= 64) {
+        Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        launch_q4_prepacked_volta(x, qk_weight, qk, stream);
+        launch_q5_prepacked_volta_split(x, value_z_weight, value, z, problem.z_rows, stream);
+        return;
+    }
+#endif
 
     switch (plan.schedule) {
     case Q4Q5GdnInputScheduleId::VoltaMmaFused: {

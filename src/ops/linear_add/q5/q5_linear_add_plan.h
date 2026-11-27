@@ -20,6 +20,7 @@ enum class Q5LinearAddScheduleId {
     SimtWideTResidual,
     CutlassSm70TensorCoreResidual,
     VoltaMmaFusedResidual,
+    VoltaStreamHmmaResidual,
 };
 
 struct Q5LinearAddProblem {

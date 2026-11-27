@@ -2068,6 +2068,15 @@ private:
                         spent <= kShortPrefillThreshold &&
                         ((!active_prefill_lane.has_value() && has_pending_requests()) ||
                          short_capture_pause);
+                    const bool prefill_finished_prompt =
+                        !active_prefill_lane.has_value() ||
+                        (slots_[*active_prefill_lane] != nullptr &&
+                         slots_[*active_prefill_lane]->capture_pending);
+                    const bool batch_fill_done =
+                        decode_share_percent_ != 0 &&
+                        prefill_finished_prompt &&
+                        has_pending_requests() &&
+                        membership.size + 1U < max_concurrency_;
                     if (!had_decode) {
                         short_prefill_burst_     = std::chrono::nanoseconds{0};
                         previous_unit_was_decode = short_done;
@@ -2077,7 +2086,7 @@ private:
                         previous_unit_was_decode = true;
                     } else {
                         short_prefill_burst_ = std::chrono::nanoseconds{0};
-                        if (decode_share_percent_ != 0) {
+                        if (decode_share_percent_ != 0 && !batch_fill_done) {
                             // Bounded so a long prefill cannot bank unbounded decode priority.
                             constexpr std::chrono::nanoseconds kMaxDecodeCredit =
                                 std::chrono::seconds(8);

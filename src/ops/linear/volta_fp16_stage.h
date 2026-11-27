@@ -33,6 +33,11 @@ inline constexpr int volta_group_major_tiles(int tokens) { return volta_qpn_tile
 // volta_stage_fp16_activation: the result is valid until the next staging call on the stream.
 const VoltaGroupMajorHalf* volta_stage_fp16_group_major(const Tensor& x, cudaStream_t stream);
 
+// Repacks row-major FP16 {K, T} into group-major FP16 staging layout using the same per-stream
+// scratch. Returns nullptr when group-major staging is disabled or scratch is unavailable.
+const VoltaGroupMajorHalf* volta_stage_fp16_to_group_major(const half* x_fp16, std::int32_t k,
+                                                           std::int32_t t, cudaStream_t stream);
+
 // A second, 1 MiB per-stream block for the attention query plane, independent of the activation
 // staging above. Returns nullptr when the request does not fit or the block is unavailable;
 // callers keep their unstaged route.
@@ -46,6 +51,9 @@ void* volta_stream_scratch(cudaStream_t stream, std::size_t bytes);
 // and the subsequent BF16->FP16 staging kernel launch.
 void volta_rmsnorm_offset_d5120_to_fp16(const Tensor& x, const Tensor& weight, float eps,
                                         half* out_fp16, cudaStream_t stream);
+void volta_rmsnorm_offset_d5120_to_bf16_and_fp16(const Tensor& x, const Tensor& weight, float eps,
+                                                 Tensor& out_bf16, half* out_fp16,
+                                                 cudaStream_t stream);
 void volta_rmsnorm_offset_d5120_to_group_major(const Tensor& x, const Tensor& weight, float eps,
                                                VoltaGroupMajorHalf* out_gm, cudaStream_t stream);
 

@@ -135,6 +135,7 @@ struct TargetVerifyFrameView {
     const VerifyCompaction* compaction     = nullptr;
     bool all_greedy                        = false;
     bool any_penalties                     = false;
+    bool dflash_copy_round                 = false;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -216,5 +217,8 @@ void dflash_propose_stage(DFlashBatchContext& state, std::int32_t batch_size, st
 void dflash_verify_stage(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          bool upload_ingress);
+void dflash_copy_verify_stage(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                              DFlashEnvelopes envelopes,
+                              ops::CausalAttentionExecutionEnvelope target_envelope);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -79,8 +79,10 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--ngram-draft-tokens N] [--ngram-min-match N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--no-cuda-graph] [--gdn-state-fp16|--no-gdn-state-fp16] "
+           "[--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -131,6 +133,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    bool ngram_draft_explicit        = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -272,6 +275,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+            ngram_draft_explicit = true;
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -287,6 +297,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--gdn-state-fp16") {
+            options.gdn_state_fp16 = true;
+        } else if (arg == "--no-gdn-state-fp16") {
+            options.gdn_state_fp16 = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
@@ -360,6 +374,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (!ngram_draft_explicit && options.speculative.backend == SpeculativeBackend::DFlash2) {
+        options.speculative.ngram_draft_tokens = 15;
     }
     product::validate_speculative_cli_options(options.speculative);
     if (default_max_tokens_explicit) {

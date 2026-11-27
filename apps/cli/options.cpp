@@ -82,13 +82,13 @@ std::string usage_text(const char* argv0) {
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
-           "       [--lm-head-draft]\n"
+           "       [--ngram-draft-tokens N] [--ngram-min-match N] [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--no-cuda-graph] [--gdn-state-fp16|--no-gdn-state-fp16]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -113,6 +113,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool ngram_draft_explicit = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -142,6 +143,12 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens =
+                parse_u32(value(arg), "ngram-draft-tokens", true);
+            ngram_draft_explicit = true;
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
@@ -158,6 +165,10 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--gdn-state-fp16") {
+            options.gdn_state_fp16 = true;
+        } else if (arg == "--no-gdn-state-fp16") {
+            options.gdn_state_fp16 = false;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -215,6 +226,9 @@ Options parse_options(int argc, char** argv) {
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
+    if (!ngram_draft_explicit && options.speculative.backend == SpeculativeBackend::DFlash2) {
+        options.speculative.ngram_draft_tokens = 15;
     }
     product::validate_speculative_cli_options(options.speculative);
     if (!options.enable_thinking && options.reasoning_effort) {

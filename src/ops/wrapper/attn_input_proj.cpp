@@ -32,11 +32,16 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
 }
 
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
+    const bool valid_layout = weight.layout == QuantLayout::RowSplit
+#ifdef NINFER_VOLTA_BUILD
+                              || weight.layout == QuantLayout::VoltaQpnPrepacked
+#endif
+        ;
     const bool q4_planes =
         qtype != QType::Q4G64_F16S || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
     const bool q5_planes =
         qtype != QType::Q5G64_F16S || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
+    if (weight.qtype != qtype || !valid_layout ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
         weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
         weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||

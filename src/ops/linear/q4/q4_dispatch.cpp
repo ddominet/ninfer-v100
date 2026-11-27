@@ -1,4 +1,8 @@
 #include "ops/linear/q4/q4_dispatch.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/common/volta_qpn_groupwise.h"
+#include "ops/linear/common/volta_rowsplit_stream_hmma.h"
+#endif
 
 #include <stdexcept>
 
@@ -122,7 +126,7 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 // tile while the fused route is nearly flat in T.
 // Split-K is retained only through T=64, keeping its fp32 buffer bounded. Wider problems may use
 // this route only once their output grid is large enough to require one split and no workspace.
-constexpr std::int32_t kVoltaMmaMinT = 9;
+constexpr std::int32_t kVoltaMmaMinT = 17;
 constexpr std::int32_t kVoltaMmaSplitKMaxT = 64;
 
 #endif
@@ -130,16 +134,21 @@ constexpr std::int32_t kVoltaMmaSplitKMaxT = 64;
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        throw std::invalid_argument("Q4 linear: a prepacked weight is readable only by fused top-K");
-    }
 #ifdef NINFER_VOLTA_BUILD
-    // Quadpair-split-N maps T to the 8-row axis instead of the 32-row one, so it is the right
-    // geometry exactly where the companion kernel pads its A rows away. Needs no workspace at
-    // all, so unlike that route there is nothing to fall back from.
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+            volta_qpn_groupwise_supported(w)) {
+            launch_q4_prepacked_volta(x, w, out, stream);
+            return;
+        }
+        throw std::invalid_argument("Q4 linear: unsupported prepacked shape or policy");
+    }
+    // Coalesced RowSplit Volta Tensor-Core streaming path for T=1..16 (zero prepack, zero
+    // workspace, 100% coalesced 64B/128B sector loads).
     if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        q4_uses_volta_qpn(out.ne[0], x.ne[0], t)) {
-        launch_q4_volta_qpn(x, w, out, stream);
+        t <= kVoltaStreamHmmaMaxTokens &&
+        volta_rowsplit_stream_hmma_supported(out.ne[0], x.ne[0], w.padded_shape[1], t)) {
+        launch_q4_volta_stream_hmma(x, w, out, stream);
         return;
     }
     if (workspace != nullptr && t >= kVoltaMmaMinT &&

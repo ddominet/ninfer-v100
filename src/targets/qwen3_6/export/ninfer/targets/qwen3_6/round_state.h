@@ -20,11 +20,12 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
 struct RoundStateSpec {
-    std::int32_t hidden          = 0;
-    std::int32_t output_rows     = 0;
-    std::uint32_t batch_capacity = 1;
-    std::uint32_t draft_window   = 0;
-    SpeculativeBackend backend   = SpeculativeBackend::None;
+    std::int32_t hidden             = 0;
+    std::int32_t output_rows        = 0;
+    std::uint32_t batch_capacity    = 1;
+    std::uint32_t draft_window      = 0;
+    std::uint32_t copy_draft_window = 0;
+    SpeculativeBackend backend      = SpeculativeBackend::None;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -203,6 +204,7 @@ struct RoundStateLayout {
     std::optional<MtpDecodeStateLayout> mtp_decode;
     std::optional<MtpDecodeStateLayout> mtp_lookup_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
+    std::optional<DFlashDecodeStateLayout> dflash_copy_decode;
     bool complete = false;
 };
 
@@ -345,6 +347,7 @@ struct RoundState {
     std::optional<MtpDecodeState> mtp_decode;
     std::optional<MtpDecodeState> mtp_lookup_decode;
     std::optional<DFlashDecodeState> dflash_decode;
+    std::optional<DFlashDecodeState> dflash_copy_decode;
 
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);

@@ -219,6 +219,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/fp8/fp8_linear_add_small_t.cu
   ops/linear_add/fp8/fp8_linear_add_a8.cu
   ops/linear_add/fp8/fp8_linear_add_plan.cpp
+  ops/linear_add/q4/q4_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
@@ -319,24 +320,31 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_volta_qpn.cu
+    ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
     ops/linear/fp8/fp8_volta_qpn_gemm.cu
     ops/linear/fp8/fp8_prepack_sm70.cu
     ops/linear/w8/w8_prepack_sm70.cu
     ops/linear/q4/q4_prepack_sm70.cu
+    ops/linear/q5/q5_prepack_sm70.cu
+    ops/linear/q6/q6_prepack_sm70.cu
     ops/linear/fp8/fp8_cutlass_sm70.cu
     ops/linear/bf16/bf16_cutlass_sm70.cu
     ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
     ops/linear/nvfp4/nvfp4_volta_mma_gemm.cu
     ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
     ops/linear/nvfp4/nvfp4_prepack_sm70.cu
+    ops/linear/common/volta_qpn_groupwise.cu
+    ops/linear/common/volta_rowsplit_stream_hmma.cu
     ops/linear/q4/q4_volta_mma_gemm.cu
     ops/linear/q4/q4_volta_qpn_gemm.cu
     ops/linear/q5/q5_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_qpn_gemm.cu
     ops/linear/w8/w8_cutlass_sm70.cu
+    ops/linear_add/q4/q4_linear_add_cutlass_sm70.cu
     ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu

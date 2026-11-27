@@ -17,14 +17,18 @@ namespace {
 using S = Q4VoltaMmaSchedule;
 
 // Narrowing writes through out's real column stride, which need not equal n.
+template <bool kAddResidual>
 __global__ void q4_volta_mma_narrow_strided_kernel(const float* __restrict__ partial,
                                                    __nv_bfloat16* __restrict__ out, int n, int t,
                                                    int out_ld) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<std::int64_t>(n) * t) { return; }
-    const int col = static_cast<int>(i / n);
-    const int row = static_cast<int>(i % n);
-    out[static_cast<std::int64_t>(col) * out_ld + row] = __float2bfloat16(partial[i]);
+    const int col        = static_cast<int>(i / n);
+    const int row        = static_cast<int>(i % n);
+    const std::int64_t o = static_cast<std::int64_t>(col) * out_ld + row;
+    float v              = partial[i];
+    if constexpr (kAddResidual) { v += __bfloat162float(out[o]); }
+    out[o] = __float2bfloat16(v);
 }
 
 } // namespace
@@ -56,8 +60,8 @@ bool q4_volta_mma_supported(std::int32_t n, std::int32_t k, std::int32_t t) noex
 // going to q and 6144..7167 to k. Row-major with a fixed per-row stride, so this is pointer
 // arithmetic and the kernel itself is untouched. Mirrors the Q5 sibling.
 void launch_q4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                         cudaStream_t stream, std::int32_t weight_row_offset,
-                         int splits_override) {
+                         cudaStream_t stream, std::int32_t weight_row_offset, int splits_override,
+                         bool add_residual) {
     const std::int32_t n = out.ne[0];
     const std::int32_t k = x.ne[0];
     const std::int32_t t = x.ne[1];
@@ -79,9 +83,15 @@ void launch_q4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Workspac
     // One split means each CTA owns its output tile outright, so it can store BF16 straight out
     // and the fp32 workspace, its memset, the atomics and the narrowing pass all disappear.
     if (splits == 1) {
-        q4_volta_mma_gemm_kernel<true><<<grid, S::kThreads, 0, stream>>>(
-            codes, scales, static_cast<const __nv_bfloat16*>(x.data), nullptr, out_data, out_ld, n,
-            k, t, padded_groups, splits);
+        if (add_residual) {
+            q4_volta_mma_gemm_kernel<true, true><<<grid, S::kThreads, 0, stream>>>(
+                codes, scales, static_cast<const __nv_bfloat16*>(x.data), nullptr, out_data, out_ld,
+                n, k, t, padded_groups, splits);
+        } else {
+            q4_volta_mma_gemm_kernel<true, false><<<grid, S::kThreads, 0, stream>>>(
+                codes, scales, static_cast<const __nv_bfloat16*>(x.data), nullptr, out_data, out_ld,
+                n, k, t, padded_groups, splits);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -93,16 +103,22 @@ void launch_q4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Workspac
     // Partials are accumulated with atomicAdd, so the buffer has to start at zero.
     CUDA_CHECK(cudaMemsetAsync(partial, 0, q4_volta_mma_workspace_bytes(n, k, t), stream));
 
-    q4_volta_mma_gemm_kernel<false><<<grid, S::kThreads, 0, stream>>>(
+    q4_volta_mma_gemm_kernel<false, false><<<grid, S::kThreads, 0, stream>>>(
         codes, scales, static_cast<const __nv_bfloat16*>(x.data), partial, out_data, out_ld, n, k,
         t, padded_groups, splits);
     CUDA_CHECK(cudaGetLastError());
 
-    const std::int64_t count = static_cast<std::int64_t>(n) * t;
+    const std::int64_t count     = static_cast<std::int64_t>(n) * t;
     constexpr int kNarrowThreads = 256;
-    q4_volta_mma_narrow_strided_kernel<<<
-        static_cast<unsigned>((count + kNarrowThreads - 1) / kNarrowThreads), kNarrowThreads, 0,
-        stream>>>(partial, out_data, n, t, out_ld);
+    const unsigned narrow_blocks =
+        static_cast<unsigned>((count + kNarrowThreads - 1) / kNarrowThreads);
+    if (add_residual) {
+        q4_volta_mma_narrow_strided_kernel<true>
+            <<<narrow_blocks, kNarrowThreads, 0, stream>>>(partial, out_data, n, t, out_ld);
+    } else {
+        q4_volta_mma_narrow_strided_kernel<false>
+            <<<narrow_blocks, kNarrowThreads, 0, stream>>>(partial, out_data, n, t, out_ld);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
