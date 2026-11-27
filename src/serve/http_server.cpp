@@ -431,6 +431,19 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
+    server_.Get("/status", [this](const httplib::Request&, httplib::Response& res) {
+        const bool available = service_ != nullptr && service_->is_available();
+        const ninfer::RuntimeStats stats =
+            service_ != nullptr ? service_->runtime_stats() : ninfer::RuntimeStats{};
+        const LiveStatusRates rates =
+            status_rates_.observe(LiveStatusRateWindow::Clock::now(), stats);
+        res.status = available ? 200 : 503;
+        res.set_content(render_live_status(available, public_model_id_,
+                                           static_cast<std::uint32_t>(options_.max_concurrency),
+                                           stats, rates)
+                            .dump(),
+                        "application/json");
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });

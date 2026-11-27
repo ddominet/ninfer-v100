@@ -54,6 +54,7 @@ omitted at startup.
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | Engine readiness |
+| `GET /status` | live scheduler state and recent token rates |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
 | `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -68,6 +69,23 @@ omitted at startup.
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
+
+`GET /status` reports what the scheduler is doing now, for dashboards and monitoring. It uses the
+same authentication as the `/v1` endpoints and returns HTTP 503 with `"status":"unavailable"` under
+the same condition as `/health`:
+
+```json
+{"status":"ok","model":"qwen3.8-27b","state":"reading","running":2,"prefilling":1,
+ "decoding":1,"waiting":0,"max_concurrency":4,"prefill_tok_s":1186.2,"decode_tok_s":0.0}
+```
+
+`state` is `reading` while a lane prefills, `generating` while an admitted request is past its
+prefill, `waiting` while requests are only queued for admission, and otherwise `idle`. `running`,
+`prefilling`, `decoding` and `waiting` are the Engine's admitted, prefilling, decode-ready and
+queued request counts. The token rates are taken over the samples of the last 10 seconds of
+`/status` polls and stay 0 until those span 3 seconds, because the underlying counters advance only
+at prefill-chunk and decode-round boundaries. The rates are therefore per server, shared by all
+pollers, and describe the recent past rather than the current instant.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
