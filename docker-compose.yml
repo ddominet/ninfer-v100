@@ -1,10 +1,11 @@
-# Single-GPU NInfer server on a Tesla V100.
+# Single-GPU NInfer server on a Tesla V100 (v3.0).
 #
 #   mkdir -p models
-#   hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer \
-#     --revision 11dbbbbbc33db198afe2f02c9232c771ff7031be --local-dir models
+#   hf download WarlaxZ/Qwen3.8-27B-NVFP4-QAD-NInfer-V100 qwen3_8_27b_nvfp4_qad.ninfer \
+#     --local-dir models
 #   docker compose up -d
 #
+# Both NInfer v3 (NVFP4-QAD) and v2 (qwen3_8_27b_nvfp4.ninfer) artifacts are supported.
 # Requires the NVIDIA Container Toolkit. Override any variable below in a .env file.
 services:
   ninfer:
@@ -25,7 +26,7 @@ services:
               capabilities: [gpu]
     command:
       - ninfer-serve
-      - /models/${NINFER_MODEL:-qwen3_8_27b_nvfp4.ninfer}
+      - /models/${NINFER_MODEL:-qwen3_8_27b_nvfp4_qad.ninfer}
       - --host
       - 0.0.0.0
       - --port
@@ -39,7 +40,7 @@ services:
       - --max-concurrency
       - "${NINFER_MAX_CONCURRENCY:-8}"
       - --device-state-slots
-      - "0"
+      - "${NINFER_DEVICE_STATE_SLOTS:-16}"
       - --host-state-slots
       - "16"
       - --host-kv-mib

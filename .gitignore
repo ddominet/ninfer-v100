@@ -40,7 +40,6 @@ out/
 /temp-*/
 /tmp/
 /tmp-*/
-/AGENTS.override.md
 /logs/
 *.log
 *.tmp

@@ -116,13 +116,12 @@ Run the focused checks needed to establish the changed behavior and its material
 exact commands and summarize the results. If a relevant check could not be run, state that
 limitation and its consequence. Do not claim validation that was not performed.
 
-## Contributor responsibility and AI assistance
+## Contributor responsibility
 
-The contributor is responsible for every submitted change, regardless of which tools were used to
-produce it. Tool choice neither qualifies nor disqualifies a contribution.
+The contributor is responsible for every submitted change.
 
 The contributor must understand the complete diff, explain the design and its boundary conditions,
-review generated output, perform the stated verification, and respond to technical review. Code
+review every change, perform the stated verification, and respond to technical review. Code
 that the contributor cannot explain, validate, or maintain is not ready for submission. Maintainer
 review is not a substitute for contributor debugging or engineering supervision.
 
