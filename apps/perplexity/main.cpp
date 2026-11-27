@@ -49,6 +49,7 @@ struct Options {
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
+    bool gdn_state_fp16                 = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
@@ -57,6 +58,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--gdn-state-fp16]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -116,6 +118,8 @@ Options parse_options(int argc, char** argv) {
             } else {
                 usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
             }
+        } else if (option == "--gdn-state-fp16") {
+            out.gdn_state_fp16 = true;
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--log-level") {
@@ -215,6 +219,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
+    engine_options.gdn_state_fp16   = options.gdn_state_fp16;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();

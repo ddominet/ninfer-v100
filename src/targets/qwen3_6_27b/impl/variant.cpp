@@ -676,8 +676,23 @@ bool Variant::gdn_output_projection_from_gated_norm(
                 flat, static_cast<const half*>(on_scratch.data), weight, residual, stream);
         }
     } else if (is_nvfp4) {
-        ops::detail::nvfp4_linear_add_qpn_fp16_launch(
-            flat, static_cast<const half*>(on_scratch.data), weight, residual, stream);
+        // Past one 8-row tile the prepacked kernel reads a group-major plane in one cache line
+        // per load where the row-major one costs eight; on_scratch is this op's own workspace, so
+        // the repack into the per-stream staging block cannot alias it.
+        const ops::detail::VoltaGroupMajorHalf* staged =
+            t > 8 && weight.layout == QuantLayout::VoltaQpnPrepacked &&
+                    !ops::detail::volta_tc_applies(weight.n, weight.k, t,
+                                                   ops::detail::kVoltaTcNvfp4MinTokens)
+                ? ops::detail::volta_stage_fp16_to_group_major(
+                      static_cast<const half*>(on_scratch.data), weight.k, t, stream)
+                : nullptr;
+        if (staged != nullptr) {
+            ops::detail::nvfp4_linear_add_qpn_group_major_launch(flat, staged, weight, residual,
+                                                                 stream);
+        } else {
+            ops::detail::nvfp4_linear_add_qpn_fp16_launch(
+                flat, static_cast<const half*>(on_scratch.data), weight, residual, stream);
+        }
     } else {
         ops::detail::fp8_linear_add_qpn_fp16_launch(flat, static_cast<const half*>(on_scratch.data),
                                                     weight, residual, stream);

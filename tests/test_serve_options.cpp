@@ -33,6 +33,14 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures +=
+        check(!defaults.gdn_state_fp16, "serve enabled FP16 GDN recurrent state by default");
+    const ServeOptions gdn_fp16 = parse({"ninfer-serve", "model.ninfer", "--gdn-state-fp16"});
+    failures += check(gdn_fp16.gdn_state_fp16, "--gdn-state-fp16 did not enable FP16 GDN state");
+    const ServeOptions gdn_fp32 =
+        parse({"ninfer-serve", "model.ninfer", "--gdn-state-fp16", "--no-gdn-state-fp16"});
+    failures +=
+        check(!gdn_fp32.gdn_state_fp16, "--no-gdn-state-fp16 did not restore FP32 GDN state");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.context_cost_presets.empty(),

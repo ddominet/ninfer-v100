@@ -48,14 +48,35 @@ void launch_nvfp4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaS
         inverse_weight_divisor, stream);
 }
 
+namespace {
+
+// The output head's FP16 hidden plane arrives row-major in the caller's workspace (never in the
+// per-stream staging block, so the repack cannot alias it). Past one 8-row tile the prepacked
+// kernel reads a group-major plane in one cache line per load instead of eight.
+const VoltaGroupMajorHalf* head_group_major(const Tensor& x, const Weight& w, const void* x_fp16,
+                                            cudaStream_t stream) {
+    if (x.ne[1] <= 8 || w.layout != QuantLayout::VoltaQpnPrepacked ||
+        volta_tc_applies(w.n, x.ne[0], x.ne[1], kVoltaTcNvfp4MinTokens)) {
+        return nullptr;
+    }
+    return volta_stage_fp16_to_group_major(static_cast<const half*>(x_fp16), x.ne[0], x.ne[1],
+                                           stream);
+}
+
+} // namespace
+
 void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_fp16, Tensor& out,
                                  cudaStream_t stream) {
     const std::int32_t n               = out.ne[0];
     const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, w, static_cast<const half*>(x_fp16),
-        Nvfp4ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n, inverse_weight_divisor,
-        stream);
+    const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), n};
+    if (const VoltaGroupMajorHalf* staged = head_group_major(x, w, x_fp16, stream)) {
+        launch_nvfp4_volta_qpn_with_group_major_activation(x, w, staged, output, n,
+                                                           inverse_weight_divisor, stream);
+        return;
+    }
+    launch_nvfp4_volta_qpn_with_fp16_activation(x, w, static_cast<const half*>(x_fp16), output, n,
+                                                inverse_weight_divisor, stream);
 }
 
 void launch_nvfp4_volta_qpn_argmax_fp16(const Tensor& x, const Weight& w, const void* x_fp16,
@@ -67,9 +88,14 @@ void launch_nvfp4_volta_qpn_argmax_fp16(const Tensor& x, const Weight& w, const 
     auto* packed_max                   = static_cast<unsigned long long*>(scratch_u64);
     CUDA_CHECK(cudaMemsetAsync(packed_max, 0,
                                static_cast<std::size_t>(t) * sizeof(unsigned long long), stream));
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, w, static_cast<const half*>(x_fp16),
-        Nvfp4ArgmaxOutput{packed_max, std::min(valid_rows, n)}, n, inverse_weight_divisor, stream);
+    const Nvfp4ArgmaxOutput output{packed_max, std::min(valid_rows, n)};
+    if (const VoltaGroupMajorHalf* staged = head_group_major(x, w, x_fp16, stream)) {
+        launch_nvfp4_volta_qpn_with_group_major_activation(x, w, staged, output, n,
+                                                           inverse_weight_divisor, stream);
+    } else {
+        launch_nvfp4_volta_qpn_with_fp16_activation(x, w, static_cast<const half*>(x_fp16), output,
+                                                    n, inverse_weight_divisor, stream);
+    }
     nvfp4_argmax_unpack_kernel<<<1, static_cast<unsigned>(t), 0, stream>>>(
         packed_max, static_cast<std::int32_t*>(out_tokens.data), t);
     CUDA_CHECK(cudaGetLastError());

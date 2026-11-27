@@ -104,5 +104,15 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    failures += check(!configured.gdn_state_fp16,
+                      "CLI enabled FP16 GDN recurrent state by default");
+    const ninfer::cli::Options gdn_fp16 =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--gdn-state-fp16"});
+    failures += check(gdn_fp16.gdn_state_fp16, "--gdn-state-fp16 did not enable FP16 GDN state");
+    const ninfer::cli::Options gdn_fp32 =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--gdn-state-fp16",
+               "--no-gdn-state-fp16"});
+    failures +=
+        check(!gdn_fp32.gdn_state_fp16, "--no-gdn-state-fp16 did not restore FP32 GDN state");
     return failures == 0 ? 0 : 1;
 }

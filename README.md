@@ -4,7 +4,7 @@ A C++/CUDA inference engine for **Qwen3.8-27B** tuned specifically for a single 
 
 > **Scope note:** While the underlying engine retains support for the other NInfer Qwen artifacts, all v1.0, v2.0, and v3.0 kernel, scheduler, and speculative-decoding optimizations in this repository are **specifically built and tuned for `Qwen3.8-27B` NVFP4 / NVFP4-QAD on Tesla V100**. Other models are not tuned or benchmarked here.
 
-This repository is the **v3.0** release of [ddominet/ninfer-v100](https://github.com/ddominet/ninfer-v100), originally forked from [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Version 1.0 rebuilt the V100 attention, prefill, and long-context paths; version 2.0 accelerated DFlash2 across 1–8 streams. **Version 3.0 adds native NVIDIA NVFP4 QAD and NInfer v3 artifact support (cutting weight VRAM by 3.2 GiB while accelerating decode by 9–19%), eliminates the `~150K` long-context prefix-cache miss stall, enables FP16 GDN recurrent states by default on Volta, adds n-gram copy speculation and fused zero-logit-traffic greedy argmax output heads, and adds Volta QPN prepacking for Q4/Q5/Q6 groupwise weights.**
+This repository is the **v3.0** release of [ddominet/ninfer-v100](https://github.com/ddominet/ninfer-v100), originally forked from [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Version 1.0 rebuilt the V100 attention, prefill, and long-context paths; version 2.0 accelerated DFlash2 across 1–8 streams. **Version 3.0 adds native NVIDIA NVFP4 QAD and NInfer v3 artifact support (cutting weight VRAM by 3.2 GiB while accelerating decode by 9–19%), eliminates the `~150K` long-context prefix-cache miss stall, adds opt-in FP16 GDN recurrent state storage (`--gdn-state-fp16`, keeping FP32 by default for long-context accuracy), adds n-gram copy speculation and fused zero-logit-traffic greedy argmax output heads, and adds Volta QPN prepacking for Q4/Q5/Q6 groupwise weights.**
 
 > **Recommended v3.0 setup:** Use the NVIDIA NVFP4 QAD v3 artifact (`qwen3_8_27b_nvfp4_qad.ninfer`) with `--spec dflash2 --draft-tokens 7 --lm-head-draft --kv-dtype int8 --max-context 262144 --kv-capacity 262144 --device-state-slots 16 --host-kv-mib 6144 --host-state-slots 16 --decode-share 50 --no-cuda-graph` (see [Serve](#serve-recommended-v30-production-flags) below). Existing NInfer v2 artifacts (`qwen3_8_27b_nvfp4.ninfer`) remain fully supported.
 
@@ -21,7 +21,7 @@ Measured on the same **Tesla V100-PCIe-32GB** (CUDA 12.8) over HTTP with identic
 | **Model Weights VRAM** (`--spec dflash2`) | `20.0 GiB` | **`16.8 GiB`** | **-3.2 GiB (-16%)** |
 | **Free VRAM (`64K` KV, `C=4`)** | `7.63 GiB` | **`10.8 GiB`** | **+3.17 GiB** |
 | **Free VRAM (`262K` KV, `C=8`, `0` dev states)** | `1.37 GiB` | **`4.55 GiB`** | **+3.18 GiB** |
-| **Free VRAM (`262K` KV, `C=8`, `16` dev states)** | does not fit | **`2.75 GiB`** | **16 GPU states fit** |
+| **Free VRAM (`262K` KV, `C=8`, `16` dev states, FP32 GDN)** | does not fit | **`1.06 GiB`** (`2.75 GiB` w/ FP16 GDN) | **16 FP32 GPU states fit** |
 | **Code Greedy Decode (`56.7%` DFlash2 accept)** | `140.2 tok/s` | **`152.5 tok/s`** | **+8.8%** |
 | **Prose Sampled Decode (`temp=0.7`)** | `67.8 tok/s` | **`80.4 tok/s`** | **+18.6%** |
 | **17.5K Prefill + Needle Recall** | `1.18k tok/s` (`14.9s`) | **`1.19k tok/s` (`14.8s`)** | **Exact recall** |
@@ -136,8 +136,8 @@ End-to-end wall time (cold prefill + 256 decoded tokens per stream) across 14 co
   - Warp-reduced fused greedy argmax epilogues directly inside Volta QPN and stream-HMMA output-head kernels for **NVFP4**, **FP8**, and **Q6** heads (`launch_*_argmax_fp16`), eliminating full-vocabulary `[248320]` logit round-trips during greedy decode and target verification, paired with a `raw_greedy` speculative verification fast path.
 - **N-gram copy speculation (`--ngram-draft-tokens`, `--ngram-min-match`):**
   - Zero-model-overhead prompt and tool-output n-gram copy proposer (`ngram_proposer.h`, `ngram_sources.h`) integrated with DFlash2 (defaults to up to 15 draft tokens when `--spec dflash2` is active), including automatic de-numbering of line-numbered tool outputs (`cat -n`, `nl`, `L12:`), adaptive backoff/partner balancing, and unit tests (`test_ngram_proposer.cpp`).
-- **FP16 GDN recurrent state (`--gdn-state-fp16`, default ON on Volta):**
-  - Stores Gated Delta Net recurrent states in FP16 with FP32 accumulation (`recurrent.cuh`, `recurrent.cu`, `linear_attention_state.cpp`), halving GDN state memory (~114 MiB/slot) and doubling recurrent memory bandwidth—unlocking `--device-state-slots 16` alongside full 262K INT8 KV on a 32 GB V100.
+- **Opt-in FP16 GDN recurrent state (`--gdn-state-fp16`, default OFF / FP32):**
+  - Supports storing Gated Delta Net recurrent states in FP16 with FP32 accumulation (`recurrent.cuh`, `recurrent.cu`, `linear_attention_state.cpp`), halving GDN state memory (~114 MiB/slot) for tighter VRAM budgets. Full FP32 recurrent state remains the default on Volta to preserve slow-decay long-context GDN memory across 50K–256K multi-turn sessions (with `--device-state-slots 16` still fitting alongside full 262K INT8 KV on a 32 GB V100 with `1.06 GiB` free VRAM).
 - **Volta QPN prepacking & stream-HMMA for groupwise Q4 / Q5 / Q6 weights:**
   - Load-time in-place QPN prepacking (`q5_prepack_qpn_sm70`, `q6_prepack_qpn_sm70`), unified multi-tile groupwise QPN (`volta_qpn_groupwise.cu`) and streaming HMMA (`volta_rowsplit_stream_hmma.cu`) kernels, Q4 `linear_add` CUTLASS/QPN dispatch (`src/ops/linear_add/q4/`), Q4 embedding gather (`embed_gather_q4_launch`), and unit tests (`test_volta_qpn_prepacked.cpp`).
 
@@ -241,7 +241,7 @@ Why these options matter:
 - `qwen3_8_27b_nvfp4_qad.ninfer`: uses `16.8 GiB` VRAM (`-3.2 GiB` vs v2) and decodes `9–19%` faster on V100 via Volta QPN prepacked NVFP4 GDN and output-head kernels.
 - `--spec dflash2 --draft-tokens 7 --lm-head-draft`: enables DFlash2 + automatic n-gram copy speculation (`--ngram-draft-tokens 15` default).
 - `--kv-dtype int8 --max-context 262144 --kv-capacity 262144`: full 256K INT8 paged KV pool inside 32 GB VRAM.
-- `--device-state-slots 16`: keeps all 16 private continuation GDN states (FP16 by default on Volta) directly in GPU VRAM for zero-copy warm-turn reuse while leaving `2.75 GiB` VRAM headroom. (Use `--device-state-slots 0` if serving the larger `20.0 GiB` v2 artifact at 262K KV.)
+- `--device-state-slots 16`: keeps all 16 private continuation GDN states (full FP32 precision by default) directly in GPU VRAM for zero-copy warm-turn reuse while leaving `1.06 GiB` VRAM headroom. (Pass `--gdn-state-fp16` if you need extra VRAM headroom on short-context workloads, or use `--device-state-slots 0` if serving the larger `20.0 GiB` v2 artifact at 262K KV.)
 - `--host-kv-mib 6144 --host-state-slots 16`: pinned host RAM overflow tier so alternating `150K–256K` sessions restore in `~1–2 s` over PCIe instead of cold-prefilling; set `--host-kv-mib 0 --host-state-slots 0` if you prefer to save host RAM on single-session workloads.
 - `--max-concurrency 8 --decode-share 50 --no-cuda-graph`: supports up to 8 concurrent sessions with responsive decode/prefill interleaving without spending `~2 GiB` VRAM on CUDA graph capture.
 
