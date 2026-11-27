@@ -4,7 +4,7 @@ A C++/CUDA inference engine for **Qwen3.8-27B** tuned specifically for a single 
 
 > **Scope note:** While the underlying engine retains support for the other NInfer Qwen artifacts, all v1.0, v2.0, and v3.0 kernel, scheduler, and speculative-decoding optimizations in this repository are **specifically built and tuned for `Qwen3.8-27B` NVFP4 / NVFP4-QAD on Tesla V100**. Other models are not tuned or benchmarked here.
 
-This repository is the **v3.0** release of [ddominet/ninfer-v100](https://github.com/ddominet/ninfer-v100), originally forked from [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Version 1.0 rebuilt the V100 attention, prefill, and long-context paths; version 2.0 accelerated DFlash2 across 1–8 streams. **Version 3.0 adds native NVIDIA NVFP4 QAD and NInfer v3 artifact support (cutting weight VRAM by 3.2 GiB while accelerating decode by 9–19%), eliminates the `~150K` long-context prefix-cache miss stall, adds opt-in FP16 GDN recurrent state storage (`--gdn-state-fp16`, keeping FP32 by default for long-context accuracy), adds n-gram copy speculation and fused zero-logit-traffic greedy argmax output heads, and adds Volta QPN prepacking for Q4/Q5/Q6 groupwise weights.**
+This repository is the **v3.0** release of [ddominet/ninfer-v100](https://github.com/ddominet/ninfer-v100), originally forked from [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). Version 1.0 rebuilt the V100 attention, prefill, and long-context paths; version 2.0 accelerated DFlash2 across 1–8 streams. **Version 3.0 adds native NVIDIA NVFP4 QAD and NInfer v3 artifact support (cutting weight VRAM by 3.2 GiB while raising single-stream decode by 5–12% and 1–8 stream aggregate decode by 10–36% over v2.0), eliminates the `~150K` long-context prefix-cache miss stall, adds opt-in FP16 GDN recurrent state storage (`--gdn-state-fp16`, keeping FP32 by default for long-context accuracy), adds n-gram copy speculation and fused zero-logit-traffic greedy argmax output heads, and adds Volta QPN prepacking for Q4/Q5/Q6 groupwise weights.**
 
 > **Recommended v3.0 setup:** Use the NVIDIA NVFP4 QAD v3 artifact (`qwen3_8_27b_nvfp4_qad.ninfer`) with `--spec dflash2 --draft-tokens 7 --lm-head-draft --kv-dtype int8 --max-context 262144 --kv-capacity 262144 --device-state-slots 16 --host-kv-mib 6144 --host-state-slots 16 --decode-share 50 --no-cuda-graph` (see [Serve](#serve-recommended-v30-production-flags) below). Existing NInfer v2 artifacts (`qwen3_8_27b_nvfp4.ninfer`) remain fully supported.
 
@@ -12,31 +12,83 @@ This repository is the **v3.0** release of [ddominet/ninfer-v100](https://github
 
 ## Benchmarks (Tesla V100-PCIe-32GB)
 
-### v3.0 NVFP4 QAD vs v2 NVFP4 (same v3.0 binary, DFlash2 `K=7`, INT8 KV, `--no-cuda-graph`)
+### v3.0 (NVFP4 QAD artifact) vs v2.0 (v2 NVFP4 artifact)
 
-Measured on the same **Tesla V100-PCIe-32GB** (CUDA 12.8) over HTTP with identical prompts and flags:
+Same **Tesla V100-PCIe-32GB** (CUDA 12.8), same harness and prompts as the v2.0 sweep further down: cold natural-text prompts over HTTP, greedy decoding, thinking off, 256 output tokens per request. Both columns use the recommended flags of their release (`--spec dflash2 --draft-tokens 7 --lm-head-draft --kv-dtype int8 --decode-share 50 --no-cuda-graph`, `262,144` context and KV, 8 lanes).
 
-| Metric | `qwen3_8_27b_nvfp4.ninfer` (v2) | **`qwen3_8_27b_nvfp4_qad.ninfer` (v3 QAD)** | Delta |
-|---|---:|---:|---:|
-| **Model Weights VRAM** (`--spec dflash2`) | `20.0 GiB` | **`16.8 GiB`** | **-3.2 GiB (-16%)** |
-| **Free VRAM (`64K` KV, `C=4`)** | `7.63 GiB` | **`10.8 GiB`** | **+3.17 GiB** |
-| **Free VRAM (`262K` KV, `C=8`, `0` dev states)** | `1.37 GiB` | **`4.55 GiB`** | **+3.18 GiB** |
-| **Free VRAM (`262K` KV, `C=8`, `16` dev states, FP32 GDN)** | does not fit | **`1.06 GiB`** (`2.75 GiB` w/ FP16 GDN) | **16 FP32 GPU states fit** |
-| **Code Greedy Decode (`56.7%` DFlash2 accept)** | `140.2 tok/s` | **`152.5 tok/s`** | **+8.8%** |
-| **Prose Sampled Decode (`temp=0.7`)** | `67.8 tok/s` | **`80.4 tok/s`** | **+18.6%** |
-| **17.5K Prefill + Needle Recall** | `1.18k tok/s` (`14.9s`) | **`1.19k tok/s` (`14.8s`)** | **Exact recall** |
-| **Warm Multi-turn Code (`6.7K–17K` ctx, `99.7%` cache)** | — | **`211–254 tok/s`** | `181–200 ms` TTFT |
-| **4-Stream / 8-Stream Concurrent (`262K` prod config)** | — | **`188.8` / `203.3 tok/s`** | Peak `365.4 tok/s` |
+#### Memory
 
-### NVFP4 QAD across decoding modes (V100-PCIe-32GB, `64K` INT8 KV)
+| | v2.0 (`qwen3_8_27b_nvfp4.ninfer`) | **v3.0 (`qwen3_8_27b_nvfp4_qad.ninfer`)** |
+|---|---:|---:|
+| Model weights in VRAM (with DFlash2 draft) | `20.0 GiB` | **`16.8 GiB`** |
+| Free VRAM at `262K` INT8 KV, 8 lanes, 16 FP32 GPU state slots | does not fit | **`1.06 GiB`** |
 
-Greedy outputs are bit-identical across all three modes:
+#### Multi-stream aggregate decode (tok/s, mean of 3 runs)
 
-| Mode | Weights VRAM | Code Greedy | Sampled Prose | Thinking Math |
+| Streams | v2.0 | **v3.0** | Delta |
+|---:|---:|---:|---:|
+| 1 | 82.2 | **111.5** | +36% |
+| 2 | 137.0 | **175.0** | +28% |
+| 4 | 176.0 | **193.3** | +10% |
+| 8 | 252.1 | **277.7** | +10% |
+
+Run-to-run variation on this test is about ±3%.
+
+#### Single-stream decode (tok/s)
+
+| Prompt context | v2.0 | **v3.0** | Delta |
+|---:|---:|---:|---:|
+| ~60 | 91.6 | **101.5** | +11% |
+| 1K | 100.8 | **112.1** | +11% |
+| 6K | 90.8 | **95.9** | +6% |
+| 24K | 81.0 | **85.1** | +5% |
+| 90K | 65.3 | **72.8** | +11% |
+| 180K | 54.3 | **58.2** | +7% |
+
+#### Prompt processing / prefill (tok/s)
+
+| Prompt context | v2.0 | **v3.0** |
+|---:|---:|---:|
+| ~60 | **415.6** | 370.3 |
+| 1K | 1046.1 | 1032.0 |
+| 6K | 1211.5 | **1222.1** |
+| 24K | 1118.2 | **1125.3** |
+| 90K | 834.5 | **837.9** |
+| 180K | 627.0 | **630.7** |
+
+Prefill is unchanged within noise from 1K upward. Very short prompts are about 11% slower to prefill in v3.0, which costs roughly 20 ms of time-to-first-token on a 60-token prompt.
+
+#### Speculation settings on the QAD artifact (aggregate decode tok/s at 1 / 2 / 4 / 8 streams)
+
+| Configuration | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| **No-spec (`--no-cuda-graph`)** | `14.6 GiB` | `39.7 tok/s` | `39.6 tok/s` | `39.7 tok/s` |
-| **MTP (`--spec mtp --draft-tokens 4`)** | `15.0 GiB` | `98.6 tok/s` | `78.8 tok/s` | `123.9 tok/s` |
-| **DFlash2 (`--spec dflash2 --draft-tokens 7`) + CUDA Graph** | `16.8 GiB` | **`153.1 tok/s`** | `77.6 tok/s` | **`199.1 tok/s`** |
+| **DFlash2 `K=7`, `--no-cuda-graph` (recommended)** | **109.8** | 163.1 | 178.3 | 266.0 |
+| DFlash2 `K=5`, `--no-cuda-graph` | 103.4 | 160.8 | 179.7 | 270.1 |
+| DFlash2 `K=3`, `--no-cuda-graph` | 87.7 | 165.3 | **189.5** | **273.5** |
+| MTP `K=3`, `--no-cuda-graph` | 84.1 | 150.8 | 174.0 | 246.1 |
+| DFlash2 `K=7` with CUDA graphs | 103.6 | 164.7 | 154.5 | 184.5 |
+
+This sweep was taken one build before the final NVFP4 activation-staging change, so its `K=7` row is slightly below the release numbers above. `K=7` without CUDA graphs is the best single-stream setting and within noise of the best at 2–8 streams; CUDA graphs disable the adaptive verify budget and lose badly under concurrency.
+
+### Accuracy
+
+Perplexity on the bundled `eval/corpora/perplexity-1m` quick corpus (lower is better):
+
+| Artifact / setting | 4K context | 64K context |
+|---|---:|---:|
+| v2 NVFP4, INT8 KV | 4.2917 | 4.0370 |
+| **NVFP4 QAD, INT8 KV (recommended)** | **4.2876** | **4.0550** |
+| NVFP4 QAD, BF16 KV | 4.2877 | 4.0540 |
+| NVFP4 QAD, INT8 KV, `--gdn-state-fp16` | 4.2876 | 4.0552 |
+
+- The INT8 KV cache is lossless in this metric against BF16 KV.
+- The QAD artifact matches the v2 artifact at 4K and is 0.4% behind at 64K, with 3.2 GiB less VRAM.
+- On the held-out corpus published with the QAD artifact (4K context, BF16 KV) this engine scores `5.521 / 8.964 / 6.401` (English Wikipedia / Chinese Wikipedia / arXiv) against the published `5.520 / 8.961 / 6.401`, so the V100 kernels reproduce the reference evaluation to three significant figures.
+
+Reproducibility notes:
+- Single-stream greedy decoding without speculation is reproducible run to run.
+- Speculative decoding (DFlash2, MTP) and `--gdn-state-fp16` each perturb the residual stream at the rounding level. Short outputs are unaffected, but long greedy outputs can diverge from the no-speculation text after a few hundred characters; perplexity is unaffected.
+- Under concurrency the exact greedy text of a request can depend on what it is batched with.
 
 ### Long-context `150K–203K` prefix-cache replay & Host-KV swap (v3.0, V100-PCIe-32GB)
 
@@ -136,6 +188,8 @@ End-to-end wall time (cold prefill + 256 decoded tokens per stream) across 14 co
   - Warp-reduced fused greedy argmax epilogues directly inside Volta QPN and stream-HMMA output-head kernels for **NVFP4**, **FP8**, and **Q6** heads (`launch_*_argmax_fp16`), eliminating full-vocabulary `[248320]` logit round-trips during greedy decode and target verification, paired with a `raw_greedy` speculative verification fast path.
 - **N-gram copy speculation (`--ngram-draft-tokens`, `--ngram-min-match`):**
   - Zero-model-overhead prompt and tool-output n-gram copy proposer (`ngram_proposer.h`, `ngram_sources.h`) integrated with DFlash2 (defaults to up to 15 draft tokens when `--spec dflash2` is active), including automatic de-numbering of line-numbered tool outputs (`cat -n`, `nl`, `L12:`), adaptive backoff/partner balancing, and unit tests (`test_ngram_proposer.cpp`).
+- **Group-major FP16 activation staging for the NVFP4 GDN and output-head kernels:**
+  - The prepacked NVFP4 GDN-input, GDN-output, and output-head QPN kernels now repack their FP16 activations group-major past one tile, as the MLP kernels already did (`nvfp4_gdn_input_volta_qpn.cu`, `nvfp4_volta_qpn_gemm.cu`, `variant.cpp`). The GDN-input kernel drops from `181 µs` to `110 µs` per call at 8 streams, worth 2–8% aggregate decode under concurrency.
 - **Opt-in FP16 GDN recurrent state (`--gdn-state-fp16`, default OFF / FP32):**
   - Supports storing Gated Delta Net recurrent states in FP16 with FP32 accumulation (`recurrent.cuh`, `recurrent.cu`, `linear_attention_state.cpp`), halving GDN state memory (~114 MiB/slot) for tighter VRAM budgets. Full FP32 recurrent state remains the default on Volta to preserve slow-decay long-context GDN memory across 50K–256K multi-turn sessions (with `--device-state-slots 16` still fitting alongside full 262K INT8 KV on a 32 GB V100 with `1.06 GiB` free VRAM).
 - **Volta QPN prepacking & stream-HMMA for groupwise Q4 / Q5 / Q6 weights:**
@@ -154,6 +208,7 @@ End-to-end wall time (cold prefill + 256 decoded tokens per stream) across 14 co
 
 #### Changed
 - Updated recommended Qwen3.8-27B artifact and deployment defaults (`README.md`, `docker-compose.yml`, `deploy/kubernetes/ninfer.yaml`) to `qwen3_8_27b_nvfp4_qad.ninfer` with `--device-state-slots 16` (keeping `--max-context 262144 --kv-capacity 262144 --host-kv-mib 6144 --host-state-slots 16`).
+- FP32 is the default GDN recurrent state precision in `ninfer-serve`, `ninfer`, and the perplexity evaluator; `--gdn-state-fp16` opts in on all three.
 - Cleaned up repository `.gitignore` and documentation references.
 
 ### In v2.0 (from `ddominet/ninfer-v100` v1.0)
@@ -238,7 +293,7 @@ For the best all-around performance on a V100-32GB (single-stream decode, full 2
 ```
 
 Why these options matter:
-- `qwen3_8_27b_nvfp4_qad.ninfer`: uses `16.8 GiB` VRAM (`-3.2 GiB` vs v2) and decodes `9–19%` faster on V100 via Volta QPN prepacked NVFP4 GDN and output-head kernels.
+- `qwen3_8_27b_nvfp4_qad.ninfer`: uses `16.8 GiB` VRAM (`-3.2 GiB` vs v2) and decodes `5–12%` faster single-stream (`10–36%` faster in aggregate at 1–8 streams) on V100 via Volta QPN prepacked NVFP4 GDN and output-head kernels.
 - `--spec dflash2 --draft-tokens 7 --lm-head-draft`: enables DFlash2 + automatic n-gram copy speculation (`--ngram-draft-tokens 15` default).
 - `--kv-dtype int8 --max-context 262144 --kv-capacity 262144`: full 256K INT8 paged KV pool inside 32 GB VRAM.
 - `--device-state-slots 16`: keeps all 16 private continuation GDN states (full FP32 precision by default) directly in GPU VRAM for zero-copy warm-turn reuse while leaving `1.06 GiB` VRAM headroom. (Pass `--gdn-state-fp16` if you need extra VRAM headroom on short-context workloads, or use `--device-state-slots 0` if serving the larger `20.0 GiB` v2 artifact at 262K KV.)
