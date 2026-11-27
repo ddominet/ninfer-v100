@@ -250,11 +250,16 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
 }
 
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
+    const bool valid_layout = weight.layout == QuantLayout::RowSplit
+#ifdef NINFER_VOLTA_BUILD
+                              || weight.layout == QuantLayout::VoltaQpnPrepacked
+#endif
+        ;
     const bool q4_planes =
         qtype != QType::Q4G64_F16S || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
     const bool q5_planes =
         qtype != QType::Q5G64_F16S || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
+    if (weight.qtype != qtype || !valid_layout ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
         weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
         weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
@@ -832,11 +837,15 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, 1);
         (void)resolve_q4_q5_conv_plan(max_width, 1);
+#ifdef NINFER_VOLTA_BUILD
+        largest_materialized_width = max_width;
+#else
         if (max_width >= 7) {
             largest_materialized_width = max_width;
         } else if (min_width <= 4 && max_width >= 4) {
             largest_materialized_width = 4;
         }
+#endif
     } else {
         (void)resolve_w8_conv_plan(min_width, 1);
         (void)resolve_w8_conv_plan(max_width, 1);
@@ -943,7 +952,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
         return detail::nvfp4_gdn_input_workspace_capacity_bytes(detail::kNvfp4InternalPolicy,
-                                                                std::max(min_width, 4), max_width);
+                                                                min_width, max_width);
     }
     return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
                                                             batch_size * max_width);
@@ -1118,8 +1127,8 @@ bool gdn_input_proj_scatter_qkv(const Tensor& x, const Weight& query_key_value_z
     constexpr std::int32_t kZRows   = 6144;
     const Weight& weight            = query_key_value_z_weight;
     const std::int32_t cols         = x.ne[1];
-    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16S || cols <= 0 ||
-        weight.n != kQkvRows + kZRows || weight.k != kHidden) {
+    if ((weight.qtype != QType::FP8_E4M3FN_ROW_BF16S && weight.qtype != QType::NVFP4) ||
+        cols <= 0 || weight.n != kQkvRows + kZRows || weight.k != kHidden) {
         return false;
     }
     require_matrix(x, kHidden, cols, "x");
@@ -1129,6 +1138,11 @@ bool gdn_input_proj_scatter_qkv(const Tensor& x, const Weight& query_key_value_z
         qkv_columns.dtype != DType::I32 || qkv_columns.ne[0] != cols ||
         !qkv_columns.is_contiguous()) {
         throw std::invalid_argument("gdn_input_proj_scatter_qkv: invalid operands");
+    }
+    if (weight.qtype == QType::NVFP4) {
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_scatter_qkv");
+        return detail::launch_nvfp4_gdn_input_volta_qpn_scatter(x, weight, qkv_padded, z,
+                                                                qkv_columns, stream);
     }
     detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_scatter_qkv");
     return detail::launch_fp8_gdn_input_volta_qpn_scatter(x, weight, qkv_padded, z, qkv_columns,

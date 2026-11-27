@@ -14,8 +14,10 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/launcher/rmsnorm.h"
 #include "ops/launcher/sigmoid_gate_mul.h"
+#include "ops/linear/common/volta_qpn_groupwise.h"
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/volta_fp16_stage.h"
@@ -134,12 +136,16 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
     }
     std::size_t peak = layout.peak_bytes(1);
 #ifdef NINFER_VOLTA_BUILD
-    if (policy == ops::LinearPolicy::A16Only && first <= ops::detail::kVoltaQpnMaxTokens &&
-        (gate_up_qtype == QType::NVFP4 || gate_up_qtype == QType::FP8_E4M3FN_ROW_BF16S) &&
-        down_qtype == gate_up_qtype) {
+    const bool volta_fused_mlp =
+        policy == ops::LinearPolicy::A16Only && first <= ops::detail::kVoltaQpnMaxTokens &&
+        (((gate_up_qtype == QType::NVFP4 || gate_up_qtype == QType::FP8_E4M3FN_ROW_BF16S) &&
+          down_qtype == gate_up_qtype) ||
+         (gate_up_qtype == QType::Q4G64_F16S &&
+          (down_qtype == QType::Q4G64_F16S || down_qtype == QType::Q5G64_F16S)));
+    if (volta_fused_mlp) {
         const std::int32_t fused_t = std::min(last, ops::detail::kVoltaQpnMaxTokens);
         WorkspaceLayoutBuilder fused;
-        if (gate_up_qtype == QType::NVFP4) {
+        if (gate_up_qtype == QType::NVFP4 || gate_up_qtype == QType::Q4G64_F16S) {
             const int tiles = ops::detail::volta_group_major_tiles(fused_t);
             (void)fused.alloc_bytes(static_cast<std::size_t>(TextConfig::hidden) * tiles * 8 *
                                         sizeof(std::uint16_t),
@@ -238,14 +244,41 @@ bool Variant::attention_projection_from_residual(const Tensor& residual, const T
                                                  Tensor& query, Tensor& gate, Tensor& key,
                                                  Tensor& value, qwen3_6::TextPhase,
                                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t t = residual.ne[1];
+    if (residual.ne[0] != TextConfig::hidden || t <= 0 || t > ops::detail::kVoltaQpnMaxTokens ||
+        !ops::detail::volta_stage_fp16_enabled()) {
+        return false;
+    }
+    if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
+        if (split->query_key.qtype != QType::Q4G64_F16S ||
+            split->gate_value.qtype != QType::Q5G64_F16S ||
+            !ops::detail::volta_group_major_enabled() ||
+            !ops::detail::volta_qpn_groupwise_supported(split->query_key) ||
+            !ops::detail::volta_qpn_groupwise_supported(split->gate_value)) {
+            return false;
+        }
+        auto scope      = workspace.scope();
+        const int tiles = ops::detail::volta_group_major_tiles(t);
+        auto* staged_gm = static_cast<ops::detail::VoltaGroupMajorHalf*>(
+            workspace
+                .alloc_bytes(static_cast<std::size_t>(TextConfig::hidden) * tiles * 8 *
+                                 sizeof(std::uint16_t),
+                             256)
+                .data);
+        ops::detail::volta_rmsnorm_offset_d5120_to_group_major(residual, input_norm, eps, staged_gm,
+                                                               stream);
+        ops::detail::launch_q4_prepacked_volta_split_gm(residual, staged_gm, split->query_key,
+                                                        query, key, query.ne[0], stream);
+        ops::detail::launch_q5_prepacked_volta_split_gm(residual, staged_gm, split->gate_value,
+                                                        gate, value, gate.ne[0], stream);
+        return true;
+    }
     const auto* payload = std::get_if<FusedAttentionProjectionPayload>(&weights);
     if (payload == nullptr) { return false; }
-    const Weight& fused  = payload->query_key_gate_value;
-    const std::int32_t t = residual.ne[1];
+    const Weight& fused = payload->query_key_gate_value;
     if (fused.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
         text_policy(fused) != ops::LinearPolicy::A16Only ||
-        residual.ne[0] != TextConfig::hidden || t <= 0 || t > ops::detail::kFp8VoltaQpnMaxTokens ||
-        !ops::detail::volta_stage_fp16_enabled() ||
+        t > ops::detail::kFp8VoltaQpnMaxTokens ||
         !ops::detail::fp8_volta_qpn_supported(fused.n, fused.k, t)) {
         return false;
     }
@@ -272,9 +305,27 @@ bool Variant::attention_output_projection_from_gated(const Tensor& gate, Tensor&
                                                      qwen3_6::TextPhase, WorkspaceArena&,
                                                      cudaStream_t stream) {
     const std::int32_t t = attention.ne[2];
+    if (t <= 0 || t > ops::detail::kVoltaQpnMaxTokens || !ops::detail::volta_stage_fp16_enabled()) {
+        return false;
+    }
+    if ((weight.qtype == QType::Q4G64_F16S || weight.qtype == QType::Q5G64_F16S) &&
+        ops::detail::volta_qpn_groupwise_supported(weight)) {
+        if (!ops::detail::sigmoid_gate_mul_to_fp16_launch(gate, attention, stream)) {
+            return false;
+        }
+        Tensor flat = attention.view({TextConfig::query_size, t});
+        if (weight.qtype == QType::Q4G64_F16S) {
+            ops::detail::launch_q4_prepacked_volta_residual_fp16(
+                flat, static_cast<const half*>(attention.data), weight, residual, stream);
+        } else {
+            ops::detail::launch_q5_prepacked_volta_residual_fp16(
+                flat, static_cast<const half*>(attention.data), weight, residual, stream);
+        }
+        return true;
+    }
     if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
-        text_policy(weight) != ops::LinearPolicy::A16Only || t <= 0 ||
-        t > ops::detail::kFp8VoltaQpnMaxTokens || !ops::detail::volta_stage_fp16_enabled() ||
+        text_policy(weight) != ops::LinearPolicy::A16Only ||
+        t > ops::detail::kFp8VoltaQpnMaxTokens ||
         !ops::detail::fp8_volta_qpn_supported(weight.n, weight.k, t)) {
         return false;
     }
@@ -433,32 +484,74 @@ bool Variant::gdn_norm_control_projection_fp16(const Tensor& residual, const Ten
                                                float eps, const GdnProjectionWeights& weights,
                                                const Tensor* scatter_columns, Tensor& hidden_fp16,
                                                Tensor& g, Tensor& beta, cudaStream_t stream) {
-    const auto* ctrl =
-        std::get_if<FusedGdnControlProjectionPayload>(&weights.control_projection);
-    const auto* in_proj =
-        std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
     const std::int32_t t = residual.ne[1];
-    if (ctrl == nullptr || in_proj == nullptr || t <= 0 ||
-        t > ops::detail::kFp8VoltaQpnMaxTokens || !ops::detail::volta_stage_fp16_enabled()) {
-        return false;
-    }
-    const Weight& ab = ctrl->a_b_projection;
-    const Weight& qkvz = in_proj->query_key_value_z;
-    if (ab.n != 96 || ab.k != 5120 || qkvz.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
-        text_policy(qkvz) != ops::LinearPolicy::A16Only ||
-        !ops::detail::fp8_volta_qpn_supported(qkvz.n, qkvz.k, t)) {
+    if (t <= 0 || t > ops::detail::kVoltaQpnMaxTokens || !ops::detail::volta_stage_fp16_enabled()) {
         return false;
     }
     if (scatter_columns != nullptr &&
         (scatter_columns->dtype != DType::I32 || scatter_columns->ne[0] != t)) {
         return false;
     }
-    Weight a_w        = ab;
-    a_w.n             = 48;
-    a_w.shape[0]      = 48;
+    const auto* split_ctrl =
+        std::get_if<SplitGdnControlProjectionPayload>(&weights.control_projection);
+    const auto* split_in =
+        std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection);
+    if (split_ctrl != nullptr && split_in != nullptr) {
+        if (split_ctrl->a_projection.n != 48 || split_ctrl->a_projection.k != 5120 ||
+            split_ctrl->b_projection.n != 48 || split_ctrl->b_projection.k != 5120 ||
+            split_in->query_key.qtype != QType::Q4G64_F16S ||
+            split_in->value_z.qtype != QType::Q5G64_F16S ||
+            !ops::detail::volta_qpn_groupwise_supported(split_in->query_key) ||
+            !ops::detail::volta_qpn_groupwise_supported(split_in->value_z)) {
+            return false;
+        }
+        ops::detail::bf16_gdn_norm_gating_proj_27_launch(
+            residual, norm_weight, eps, hidden_fp16, split_ctrl->a_projection,
+            split_ctrl->b_projection, weights.a_log, weights.dt_bias, g, beta, stream,
+            scatter_columns != nullptr ? static_cast<const std::int32_t*>(scatter_columns->data)
+                                       : nullptr,
+            /*write_fp16=*/true);
+        return true;
+    }
+    const auto* in_proj =
+        std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
+    if (in_proj == nullptr) { return false; }
+    const Weight& qkvz = in_proj->query_key_value_z;
+    const bool fp8_ok =
+        qkvz.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+        text_policy(qkvz) == ops::LinearPolicy::A16Only &&
+        t <= ops::detail::kFp8VoltaQpnMaxTokens &&
+        ops::detail::fp8_volta_qpn_supported(qkvz.n, qkvz.k, t);
+    const bool nvfp4_ok =
+        qkvz.qtype == QType::NVFP4 &&
+        text_policy(qkvz) == ops::LinearPolicy::A16Only &&
+        t <= ops::detail::kNvfp4VoltaQpnMaxTokens &&
+        ops::detail::nvfp4_volta_qpn_supported(qkvz.n, qkvz.k, t);
+    if (!fp8_ok && !nvfp4_ok) { return false; }
+    if (split_ctrl != nullptr) {
+        if (split_ctrl->a_projection.n != 48 || split_ctrl->a_projection.k != 5120 ||
+            split_ctrl->b_projection.n != 48 || split_ctrl->b_projection.k != 5120) {
+            return false;
+        }
+        ops::detail::bf16_gdn_norm_gating_proj_27_launch(
+            residual, norm_weight, eps, hidden_fp16, split_ctrl->a_projection,
+            split_ctrl->b_projection, weights.a_log, weights.dt_bias, g, beta, stream,
+            scatter_columns != nullptr ? static_cast<const std::int32_t*>(scatter_columns->data)
+                                       : nullptr,
+            /*write_fp16=*/true);
+        return true;
+    }
+    const auto* ctrl =
+        std::get_if<FusedGdnControlProjectionPayload>(&weights.control_projection);
+    if (ctrl == nullptr) { return false; }
+    const Weight& ab = ctrl->a_b_projection;
+    if (ab.n != 96 || ab.k != 5120) { return false; }
+    Weight a_w          = ab;
+    a_w.n               = 48;
+    a_w.shape[0]        = 48;
     a_w.padded_shape[0] = 48;
-    Weight b_w        = a_w;
-    b_w.qdata         = static_cast<const std::uint8_t*>(ab.qdata) +
+    Weight b_w          = a_w;
+    b_w.qdata           = static_cast<const std::uint8_t*>(ab.qdata) +
                 static_cast<std::int64_t>(48) * 5120 * sizeof(std::uint16_t);
     ops::detail::bf16_gdn_norm_gating_proj_27_launch(
         residual, norm_weight, eps, hidden_fp16, a_w, b_w, weights.a_log, weights.dt_bias, g, beta,
@@ -473,10 +566,34 @@ bool Variant::gdn_input_projection_scatter_fp16(const Tensor& hidden_fp16,
                                                 const GdnProjectionWeights& weights,
                                                 Tensor& qkv_padded, Tensor& output_gate,
                                                 const Tensor& qkv_columns, cudaStream_t stream) {
-    const auto* fused = std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
-    if (fused == nullptr) { return false; }
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden_fp16.ne[1])});
+    if (const auto* split =
+            std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
+        if (split->query_key.qtype != QType::Q4G64_F16S ||
+            split->value_z.qtype != QType::Q5G64_F16S ||
+            !ops::detail::volta_qpn_groupwise_supported(split->query_key) ||
+            !ops::detail::volta_qpn_groupwise_supported(split->value_z)) {
+            return false;
+        }
+        Tensor qk_padded    = qkv_padded.slice(0, 0, split->query_key.n);
+        Tensor value_padded = qkv_padded.slice(0, split->query_key.n, TextConfig::value_dim);
+        const auto* x_fp16  = static_cast<const half*>(hidden_fp16.data);
+        const auto* cols    = static_cast<const std::int32_t*>(qkv_columns.data);
+        ops::detail::launch_q4_prepacked_volta_scatter_fp16(hidden_fp16, x_fp16, split->query_key,
+                                                            qk_padded, cols, stream);
+        ops::detail::launch_q5_prepacked_volta_split_scatter_fp16(
+            hidden_fp16, x_fp16, split->value_z, value_padded, output_gate_flat,
+            TextConfig::value_dim, cols, stream);
+        return true;
+    }
+    const auto* fused = std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
+    if (fused == nullptr) { return false; }
+    if (fused->query_key_value_z.qtype == QType::NVFP4) {
+        return ops::detail::launch_nvfp4_gdn_input_volta_qpn_scatter(
+            hidden_fp16, fused->query_key_value_z, qkv_padded, output_gate_flat, qkv_columns,
+            stream, hidden_fp16.data);
+    }
     return ops::detail::launch_fp8_gdn_input_volta_qpn_scatter(
         hidden_fp16, fused->query_key_value_z, qkv_padded, output_gate_flat, qkv_columns, stream,
         hidden_fp16.data);
@@ -487,14 +604,31 @@ void Variant::gdn_input_projection_record_fp16(
     const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
     cudaStream_t stream) {
-    const Weight& fused =
-        std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     const std::int32_t cols = hidden_fp16.ne[1] * hidden_fp16.ne[2];
     Tensor x_flat(hidden_fp16.data, DType::BF16, {TextConfig::hidden, cols});
     Tensor record_flat(conv_record.data, DType::BF16, {conv_record.ne[0], cols});
     Tensor gate_flat(output_gate.data, DType::BF16, {TextConfig::value_dim, cols});
-    ops::detail::launch_fp8_gdn_input_volta_qpn(x_flat, fused, record_flat, gate_flat,
-                                                hidden_fp16.data, stream);
+    if (const auto* split =
+            std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
+        Tensor qk_slice    = record_flat.slice(0, 0, split->query_key.n);
+        Tensor value_slice = record_flat.slice(0, split->query_key.n, TextConfig::value_dim);
+        const auto* x_fp16 = static_cast<const half*>(hidden_fp16.data);
+        ops::detail::launch_q4_prepacked_volta_fp16(x_flat, x_fp16, split->query_key, qk_slice,
+                                                    stream);
+        ops::detail::launch_q5_prepacked_volta_split_fp16(x_flat, x_fp16, split->value_z,
+                                                          value_slice, gate_flat,
+                                                          TextConfig::value_dim, stream);
+    } else {
+        const Weight& fused =
+            std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
+        if (fused.qtype == QType::NVFP4) {
+            ops::detail::launch_nvfp4_gdn_input_volta_qpn(x_flat, fused, record_flat, gate_flat,
+                                                          hidden_fp16.data, stream);
+        } else {
+            ops::detail::launch_fp8_gdn_input_volta_qpn(x_flat, fused, record_flat, gate_flat,
+                                                        hidden_fp16.data, stream);
+        }
+    }
     ops::gdn_projected_conv_record(conv_record, conv_weight, conv_states, valid_columns,
                                    initial_slots, query, key, value, stream);
 }
@@ -505,13 +639,22 @@ bool Variant::gdn_output_projection_from_gated_norm(
     qwen3_6::TextPhase, WorkspaceArena&, cudaStream_t stream) {
     const std::int32_t d = on_scratch.ne[0];
     const std::int32_t t = on_scratch.ne[2];
-    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
-        text_policy(weight) != ops::LinearPolicy::A16Only || t <= 0 ||
-        t > ops::detail::kFp8VoltaQpnMaxTokens || !ops::detail::volta_stage_fp16_enabled() ||
-        !ops::detail::fp8_volta_qpn_supported(weight.n, weight.k, t) || d < 64 || d > 256 ||
-        (d % 64) != 0) {
+    if (t <= 0 || t > ops::detail::kVoltaQpnMaxTokens || !ops::detail::volta_stage_fp16_enabled() ||
+        d < 64 || d > 256 || (d % 64) != 0) {
         return false;
     }
+    const bool is_groupwise =
+        (weight.qtype == QType::Q4G64_F16S || weight.qtype == QType::Q5G64_F16S) &&
+        ops::detail::volta_qpn_groupwise_supported(weight);
+    const bool is_fp8 = weight.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+                        text_policy(weight) == ops::LinearPolicy::A16Only &&
+                        t <= ops::detail::kFp8VoltaQpnMaxTokens &&
+                        ops::detail::fp8_volta_qpn_supported(weight.n, weight.k, t);
+    const bool is_nvfp4 = weight.qtype == QType::NVFP4 &&
+                          text_policy(weight) == ops::LinearPolicy::A16Only &&
+                          t <= ops::detail::kNvfp4VoltaQpnMaxTokens &&
+                          ops::detail::nvfp4_volta_qpn_supported(weight.n, weight.k, t);
+    if (!is_groupwise && !is_fp8 && !is_nvfp4) { return false; }
     const auto addr = reinterpret_cast<std::uintptr_t>(o.data) |
                       reinterpret_cast<std::uintptr_t>(gdn_norm.data) |
                       reinterpret_cast<std::uintptr_t>(z.data) |
@@ -524,8 +667,21 @@ bool Variant::gdn_output_projection_from_gated_norm(
         ops::detail::gated_rmsnorm_fp16_launch(o, gdn_norm, z, eps, on_scratch, stream);
     }
     Tensor flat = on_scratch.view({TextConfig::value_dim, t});
-    ops::detail::fp8_linear_add_qpn_fp16_launch(flat, static_cast<const half*>(on_scratch.data),
-                                                weight, residual, stream);
+    if (is_groupwise) {
+        if (weight.qtype == QType::Q4G64_F16S) {
+            ops::detail::launch_q4_prepacked_volta_residual_fp16(
+                flat, static_cast<const half*>(on_scratch.data), weight, residual, stream);
+        } else {
+            ops::detail::launch_q5_prepacked_volta_residual_fp16(
+                flat, static_cast<const half*>(on_scratch.data), weight, residual, stream);
+        }
+    } else if (is_nvfp4) {
+        ops::detail::nvfp4_linear_add_qpn_fp16_launch(
+            flat, static_cast<const half*>(on_scratch.data), weight, residual, stream);
+    } else {
+        ops::detail::fp8_linear_add_qpn_fp16_launch(flat, static_cast<const half*>(on_scratch.data),
+                                                    weight, residual, stream);
+    }
     return true;
 }
 #endif
@@ -632,6 +788,45 @@ bool Variant::post_mixer_from_residual(Tensor& residual, const Tensor& post_norm
                                                     stream);
         return true;
     }
+    if (weights.gate_up.qtype == QType::Q4G64_F16S &&
+        (weights.down.qtype == QType::Q4G64_F16S || weights.down.qtype == QType::Q5G64_F16S) &&
+        ops::detail::volta_qpn_groupwise_supported(weights.gate_up) &&
+        ops::detail::volta_qpn_groupwise_supported(weights.down) &&
+        ops::detail::volta_group_major_enabled()) {
+        auto scope      = workspace.scope();
+        const int tiles = ops::detail::volta_group_major_tiles(t);
+        auto* staged_gm = static_cast<ops::detail::VoltaGroupMajorHalf*>(
+            workspace
+                .alloc_bytes(static_cast<std::size_t>(TextConfig::hidden) * tiles * 8 *
+                                 sizeof(std::uint16_t),
+                             256)
+                .data);
+        auto* gate_scratch = static_cast<float*>(
+            workspace
+                .alloc_bytes(static_cast<std::size_t>(TextConfig::intermediate) * t * sizeof(float),
+                             256)
+                .data);
+        auto* inter_gm = static_cast<ops::detail::VoltaGroupMajorHalf*>(
+            workspace
+                .alloc_bytes(static_cast<std::size_t>(TextConfig::intermediate) * tiles * 8 *
+                                 sizeof(std::uint16_t),
+                             256)
+                .data);
+
+        ops::detail::volta_rmsnorm_offset_d5120_to_group_major(residual, post_norm, eps, staged_gm,
+                                                               stream);
+        ops::detail::launch_q4_prepacked_volta_swiglu_gm_io(residual, staged_gm, weights.gate_up,
+                                                            inter_gm, gate_scratch, stream);
+        Tensor inter_shape(inter_gm, DType::BF16, {TextConfig::intermediate, t});
+        if (weights.down.qtype == QType::Q4G64_F16S) {
+            ops::detail::launch_q4_prepacked_volta_residual_gm(inter_shape, inter_gm, weights.down,
+                                                               residual, stream);
+        } else {
+            ops::detail::launch_q5_prepacked_volta_residual_gm(inter_shape, inter_gm, weights.down,
+                                                               residual, stream);
+        }
+        return true;
+    }
     return false;
 }
 #endif
@@ -678,8 +873,21 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
-    case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::q4_q5_attn_input_proj_workspace_capacity_bytes(first, last);
+    case WeightsProfile::Qwen38GroupwiseInt: {
+        std::size_t peak = ops::q4_q5_attn_input_proj_workspace_capacity_bytes(first, last);
+#ifdef NINFER_VOLTA_BUILD
+        if (first <= ops::detail::kVoltaQpnMaxTokens) {
+            const std::int32_t fused_t = std::min(last, ops::detail::kVoltaQpnMaxTokens);
+            const int tiles            = ops::detail::volta_group_major_tiles(fused_t);
+            WorkspaceLayoutBuilder fused;
+            (void)fused.alloc_bytes(static_cast<std::size_t>(TextConfig::hidden) * tiles * 8 *
+                                        sizeof(std::uint16_t),
+                                    256);
+            peak = std::max(peak, fused.peak_bytes(1));
+        }
+#endif
+        return peak;
+    }
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -696,9 +904,13 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
-                                                        TextConfig::query_size,
-                                                        ops::LinearPolicy::A16Only, first, last);
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::Q4G64_F16S, TextConfig::hidden,
+                                                     TextConfig::query_size,
+                                                     ops::LinearPolicy::A16Only, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                     TextConfig::query_size,
+                                                     ops::LinearPolicy::A16Only, first, last));
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
@@ -724,8 +936,11 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
-        return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
+        return std::max(
+            ops::gdn_input_proj_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last),
+            ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
+                                                         kNvfp4TextPolicy, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -747,10 +962,14 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
-        return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
-                            batch_size, first, last));
+        return std::max({
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, batch_size,
+                first, last),
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size, first, last),
+        });
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -772,10 +991,14 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
-        return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
-                            batch_size, first, last));
+        return std::max({
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, batch_size,
+                first, last),
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size, first, last),
+        });
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -788,16 +1011,24 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
-                                                        TextConfig::value_dim,
-                                                        ops::LinearPolicy::A16Only, first, last);
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::Q4G64_F16S, TextConfig::hidden,
+                                                     TextConfig::value_dim,
+                                                     ops::LinearPolicy::A16Only, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                     TextConfig::value_dim,
+                                                     ops::LinearPolicy::A16Only, first, last));
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
-        return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
-                                                        TextConfig::hidden, TextConfig::value_dim,
-                                                        kFp8TextPolicy, first, last);
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
+                                                     TextConfig::hidden, TextConfig::value_dim,
+                                                     kFp8TextPolicy, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                     TextConfig::value_dim, kNvfp4TextPolicy, first,
+                                                     last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -815,8 +1046,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
-                                          ops::LinearPolicy::A16Only, first, last);
+        return std::max(post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
+                                                   ops::LinearPolicy::A16Only, first, last),
+                        post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q4G64_F16S,
+                                                   ops::LinearPolicy::A16Only, first, last));
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);

@@ -49,6 +49,9 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::Residual17408:
         launch_exact<Nvfp4Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::OutputHead:
+        launch_exact<Nvfp4OutputHeadGeometry>(x, weight, out, stream);
+        return;
     }
 }
 

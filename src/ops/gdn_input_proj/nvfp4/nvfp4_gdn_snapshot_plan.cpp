@@ -38,6 +38,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
+#ifdef NINFER_VOLTA_BUILD
+    // Prepacked Volta NVFP4 GDN input projections run through Volta QPN / CUTLASS via the
+    // materialized projection + post-conv path (the native fused SIMT kernels cannot read QPN).
+    return {Nvfp4GdnConvScheduleId::Materialized};
+#endif
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }

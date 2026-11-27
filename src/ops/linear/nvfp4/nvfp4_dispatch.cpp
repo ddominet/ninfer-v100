@@ -4,6 +4,9 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -33,6 +36,7 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::GdnInput:
         return Nvfp4LinearRoute::W4A4;
     case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::OutputHead:
         return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
@@ -48,16 +52,20 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 cudaStream_t stream) {
     const std::int32_t total_t = x.ne[1];
 #ifdef NINFER_VOLTA_BUILD
-    // Above QPN2's own range, a single wide-T MMA pass (nvfp4_volta_mma_gemm.cuh) beats
-    // chunking through QPN2 in kNvfp4VoltaQpnMaxTokens pieces -- QPN2's whole design assumes T is
-    // small enough that decoding the weight once per ~32 tokens is cheap; at prefill widths that
-    // means re-decoding the entire weight dozens of times. Measured directly against the
-    // 64-chunk QPN2 path at T=2048 on the gate_up shape: 45.5ms -> 31.3ms, 1.45x. Needs a real
-    // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
-    // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
-    // fault if a caller genuinely has none. See docs/v100.md.
-    if (workspace != nullptr && total_t >= kVoltaCutlassMinT &&
-        nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
+    // Prepacked Volta weights cannot be read by the native-layout MMA/SIMT kernels: use CUTLASS
+    // at wide T when workspace permits (skipping 248k-row output_head whose FP16 dequant would
+    // consume >2.5 GiB), and QPN2/TC-skinny otherwise.
+    if (weight.layout == QuantLayout::VoltaQpnPrepacked) {
+        if (workspace != nullptr && total_t >= kVoltaCutlassMinT &&
+            weight.n != Nvfp4OutputHeadGeometry::kOutputRows) {
+            const std::size_t need = nvfp4_cutlass_sm70_workspace_bytes(weight.n, weight.k, total_t);
+            if (workspace->capacity() - workspace->used() >= need) {
+                nvfp4_cutlass_sm70_launch(x, weight, out, *workspace, stream);
+                return;
+            }
+        }
+    } else if (workspace != nullptr && total_t >= kVoltaCutlassMinT &&
+               nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
         const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);
         if (need == 0 || workspace->capacity() - workspace->used() >= need) {
             launch_nvfp4_volta_mma(x, weight, out, *workspace, stream);

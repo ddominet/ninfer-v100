@@ -4,6 +4,8 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
+
 namespace ninfer::ops::detail {
 
 #ifdef NINFER_VOLTA_BUILD
@@ -12,6 +14,16 @@ namespace {
 using S = Nvfp4VoltaQpnSchedule;
 static_assert(kNvfp4VoltaQpnRowsPerTile == S::kRowsPerTile,
               "dispatch mirrors the tile height for host code");
+
+__global__ void nvfp4_argmax_unpack_kernel(const unsigned long long* __restrict__ packed_max,
+                                           std::int32_t* __restrict__ out_tokens, int t) {
+    const int i = static_cast<int>(threadIdx.x);
+    if (i < t) {
+        const unsigned long long packed = packed_max[i];
+        out_tokens[i] =
+            packed == 0ULL ? 0 : static_cast<std::int32_t>(~static_cast<std::uint32_t>(packed));
+    }
+}
 } // namespace
 
 bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
@@ -29,11 +41,38 @@ bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) n
 }
 
 void launch_nvfp4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const std::int32_t n                   = out.ne[0];
+    const std::int32_t n               = out.ne[0];
     const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
     launch_nvfp4_volta_qpn_with_output(
         x, w, Nvfp4ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n,
         inverse_weight_divisor, stream);
+}
+
+void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_fp16, Tensor& out,
+                                 cudaStream_t stream) {
+    const std::int32_t n               = out.ne[0];
+    const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
+    launch_nvfp4_volta_qpn_with_fp16_activation(
+        x, w, static_cast<const half*>(x_fp16),
+        Nvfp4ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n, inverse_weight_divisor,
+        stream);
+}
+
+void launch_nvfp4_volta_qpn_argmax_fp16(const Tensor& x, const Weight& w, const void* x_fp16,
+                                        Tensor& out_tokens, std::int32_t valid_rows,
+                                        void* scratch_u64, cudaStream_t stream) {
+    const std::int32_t t               = x.ne[1];
+    const std::int32_t n               = w.n;
+    const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
+    auto* packed_max                   = static_cast<unsigned long long*>(scratch_u64);
+    CUDA_CHECK(cudaMemsetAsync(packed_max, 0,
+                               static_cast<std::size_t>(t) * sizeof(unsigned long long), stream));
+    launch_nvfp4_volta_qpn_with_fp16_activation(
+        x, w, static_cast<const half*>(x_fp16),
+        Nvfp4ArgmaxOutput{packed_max, std::min(valid_rows, n)}, n, inverse_weight_divisor, stream);
+    nvfp4_argmax_unpack_kernel<<<1, static_cast<unsigned>(t), 0, stream>>>(
+        packed_max, static_cast<std::int32_t*>(out_tokens.data), t);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 #endif // NINFER_VOLTA_BUILD

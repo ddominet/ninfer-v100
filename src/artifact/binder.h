@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -56,6 +57,7 @@ public:
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 
     [[nodiscard]] bool contains(std::string_view name) const noexcept;
+    [[nodiscard]] std::optional<NumericFormat> tensor_format(std::string_view name) const noexcept;
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);

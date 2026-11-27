@@ -510,7 +510,16 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         const int row  = e / S::kColsPerCta;
         const int col  = e % S::kColsPerCta;
         const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
-        if (ocol < n) {
+        if constexpr (requires { output.make_argmax_key(0, 0.0f); }) {
+            unsigned long long key = 0ULL;
+            if (ocol < n && row < t) {
+                float value = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
+                key = output.make_argmax_key(ocol, value);
+            }
+            output.commit_warp(row, key, col, row < t);
+        } else if (ocol < n) {
             if (row < t) {
                 float value = 0.0f;
 #pragma unroll

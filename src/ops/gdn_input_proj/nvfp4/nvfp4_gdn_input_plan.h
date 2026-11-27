@@ -28,4 +28,14 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
+#ifdef NINFER_VOLTA_BUILD
+void launch_nvfp4_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                      const void* x_fp16, cudaStream_t stream);
+[[nodiscard]] bool launch_nvfp4_gdn_input_volta_qpn_scatter(const Tensor& x, const Weight& weight,
+                                                            Tensor& qkv_padded, Tensor& z,
+                                                            const Tensor& qkv_columns,
+                                                            cudaStream_t stream,
+                                                            const void* x_fp16 = nullptr);
+#endif
+
 } // namespace ninfer::ops::detail

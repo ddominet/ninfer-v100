@@ -213,15 +213,28 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template must contain the loaded chat template");
-    }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+    if (tokenizer_config.contains("chat_template") &&
+        !tokenizer_config.at("chat_template").is_null()) {
+        if (!tokenizer_config.at("chat_template").is_string()) {
+            throw std::invalid_argument(
+                "tokenizer_config.json.chat_template must contain the loaded chat template");
+        }
+        const std::string& config_template =
+            tokenizer_config.at("chat_template").get_ref<const std::string&>();
+        if (config_template != resources.chat_template_jinja) {
+            bool semantically_equivalent = false;
+            try {
+                const auto config_compiled = fi::CompiledChatTemplate::resolve(config_template);
+                const auto jinja_compiled =
+                    fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+                semantically_equivalent = config_compiled.semantics() == jinja_compiled.semantics();
+            } catch (const std::invalid_argument&) { semantically_equivalent = false; }
+            if (!semantically_equivalent) {
+                throw std::invalid_argument(
+                    "tokenizer_config.json.chat_template does not match "
+                    "frontend/chat_template.jinja");
+            }
+        }
     }
 }
 

@@ -21,6 +21,11 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
 inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = kVoltaQpnRowsPerTile;
 inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = kVoltaQpnMaxTokens;
 void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_fp16, Tensor& out,
+                                 cudaStream_t stream);
+void launch_nvfp4_volta_qpn_argmax_fp16(const Tensor& x, const Weight& w, const void* x_fp16,
+                                        Tensor& out_tokens, std::int32_t valid_rows,
+                                        void* scratch_u64, cudaStream_t stream);
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;
 

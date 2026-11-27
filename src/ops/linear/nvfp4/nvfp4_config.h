@@ -122,6 +122,7 @@ using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
 using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
+using Nvfp4OutputHeadGeometry    = Nvfp4GemvGeometry<248320, 5120>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
@@ -133,6 +134,7 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUp,
     Residual6144,
     Residual17408,
+    OutputHead,
 };
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -145,7 +147,9 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+           (output_rows == Nvfp4OutputHeadGeometry::kOutputRows &&
+            input_rows == Nvfp4OutputHeadGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -168,6 +172,10 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
         input_rows == Nvfp4Residual17408Geometry::kInputRows) {
         return Nvfp4Problem::Residual17408;
+    }
+    if (output_rows == Nvfp4OutputHeadGeometry::kOutputRows &&
+        input_rows == Nvfp4OutputHeadGeometry::kInputRows) {
+        return Nvfp4Problem::OutputHead;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }

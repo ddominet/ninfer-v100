@@ -72,6 +72,14 @@ bool Binder::contains(std::string_view name) const noexcept {
     return reader_.find(name) != nullptr;
 }
 
+std::optional<NumericFormat> Binder::tensor_format(std::string_view name) const noexcept {
+    const ObjectDescriptor* object = reader_.find(name);
+    if (object == nullptr) { return std::nullopt; }
+    const auto* tensor = std::get_if<TensorDescriptor>(object);
+    if (tensor == nullptr) { return std::nullopt; }
+    return tensor->format;
+}
+
 const ObjectDescriptor& Binder::descriptor(ObjectHandle handle) const {
     if (handle.index >= reader_.objects().size()) {
         throw ArtifactError("artifact object handle is out of range");

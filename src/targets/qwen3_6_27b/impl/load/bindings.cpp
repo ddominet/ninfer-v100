@@ -6,6 +6,8 @@
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #include "ops/linear/w8/w8_prepack_sm70.h"
 #include "ops/linear/q4/q4_prepack_sm70.h"
+#include "ops/linear/q5/q5_prepack_sm70.h"
+#include "ops/linear/q6/q6_prepack_sm70.h"
 #endif
 
 #include <algorithm>
@@ -118,6 +120,15 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
         // keep its checkpoint layout.
         if (prepack_for_qpn && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
             ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
+        } else if (prepack_for_qpn && out.layout == QuantLayout::RowSplit &&
+                   out.n % 64 == 0 && out.k % 128 == 0 && out.padded_shape[1] == out.k) {
+            if (out.qtype == QType::Q4G64_F16S) {
+                ::ninfer::ops::detail::q4_prepack_qpn_sm70(out);
+            } else if (out.qtype == QType::Q5G64_F16S) {
+                ::ninfer::ops::detail::q5_prepack_qpn_sm70(out);
+            } else if (out.qtype == QType::Q6G64_F16S) {
+                ::ninfer::ops::detail::q6_prepack_qpn_sm70(out);
+            }
         }
 #else
         (void)prepack_for_qpn;
@@ -225,9 +236,14 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
         };
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
+    Weight qkvz       = materialized_weight(materialized, fused.query_key_value_z, 16384, 5120);
+#ifdef NINFER_VOLTA_BUILD
+    if (qkvz.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(qkvz);
+    }
+#endif
     return FusedGdnInputProjectionPayload{
-        .query_key_value_z =
-            materialized_weight(materialized, fused.query_key_value_z, 16384, 5120),
+        .query_key_value_z = qkvz,
     };
 }
 
@@ -244,6 +260,17 @@ load_gdn_control_projection(const GdnPlan& plan,
     return FusedGdnControlProjectionPayload{
         .a_b_projection = materialized_weight(materialized, fused.a_b_projection, 96, 5120),
     };
+}
+
+NumericFormat select_allowed_format(const artifact::Binder& binder, std::string_view name,
+                                    NumericFormat fallback,
+                                    std::initializer_list<NumericFormat> allowed) {
+    const auto actual = binder.tensor_format(name);
+    if (!actual) { return fallback; }
+    for (const NumericFormat candidate : allowed) {
+        if (*actual == candidate) { return candidate; }
+    }
+    return fallback;
 }
 
 void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
@@ -264,8 +291,11 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
-            target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                  NumericFormat::Q5G64_F16S, {5120, 6144});
+            const NumericFormat attn_out_fmt = select_allowed_format(
+                binder, prefix + "attention/output", NumericFormat::Q5G64_F16S,
+                {NumericFormat::Q4G64_F16S, NumericFormat::Q5G64_F16S});
+            target.attention.output =
+                bind_weight(binder, prefix + "attention/output", attn_out_fmt, {5120, 6144});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -287,15 +317,20 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
+            const NumericFormat gdn_out_fmt = select_allowed_format(
+                binder, prefix + "gdn/output", NumericFormat::Q5G64_F16S,
+                {NumericFormat::Q4G64_F16S, NumericFormat::Q5G64_F16S});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::Q5G64_F16S, {5120, 6144});
+                bind_weight(binder, prefix + "gdn/output", gdn_out_fmt, {5120, 6144});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
         target.mlp.gate_up =
             bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
-        target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408});
+        const NumericFormat mlp_down_fmt = select_allowed_format(
+            binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S,
+            {NumericFormat::Q4G64_F16S, NumericFormat::Q5G64_F16S});
+        target.mlp.down = bind_weight(binder, prefix + "mlp/down", mlp_down_fmt, {5120, 17408});
     }
 }
 
@@ -395,30 +430,56 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                                   NumericFormat::FP32, {48});
             target.gdn.convolution = artifact::bind_device_tensor(
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
-            target.gdn.control_projection = FusedGdnControlProjectionPlan{
-                .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
-                                              NumericFormat::BF16, {96, 5120}),
-            };
+            if (binder.tensor_format(prefix + "gdn/a_b_projection").has_value()) {
+                target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                    .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
+                                                  NumericFormat::BF16, {96, 5120}),
+                };
+            } else {
+                target.gdn.control_projection = SplitGdnControlProjectionPlan{
+                    .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
+                                                NumericFormat::BF16, {48, 5120}),
+                    .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
+                                                NumericFormat::BF16, {48, 5120}),
+                };
+            }
+            const NumericFormat gdn_in_fmt = select_allowed_format(
+                binder, prefix + "gdn/query_key_value_z", kFp8, {kFp8, NumericFormat::NVFP4});
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8, {16384, 5120}),
+                    gdn_in_fmt == NumericFormat::NVFP4
+                        ? bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", 16384, 5120,
+                                            prefix + "gdn/input_projection/input_scale_divisor")
+                        : bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8,
+                                      {16384, 5120}),
             };
-            target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
-                                                             NumericFormat::BF16, {128});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144});
+            target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                           NumericFormat::BF16, {128});
+            const NumericFormat gdn_out_fmt = select_allowed_format(
+                binder, prefix + "gdn/output", kFp8, {kFp8, NumericFormat::NVFP4});
+            target.gdn.output =
+                gdn_out_fmt == NumericFormat::NVFP4
+                    ? bind_nvfp4_weight(binder, prefix + "gdn/output", 5120, 6144,
+                                        prefix + "gdn/output_projection/input_scale_divisor")
+                    : bind_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (layer < 56) {
-            target.mlp.gate_up =
-                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
-                                  prefix + "mlp/gate_up_projection/input_scale_divisor");
-            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
-                                                prefix + "mlp/down_projection/input_scale_divisor");
-        } else {
-            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {34816, 5120});
-            target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408});
-        }
+        const NumericFormat mlp_fallback = layer < 56 ? NumericFormat::NVFP4 : kFp8;
+        const NumericFormat mlp_gate_up_fmt = select_allowed_format(
+            binder, prefix + "mlp/gate_up", mlp_fallback, {NumericFormat::NVFP4, kFp8});
+        const NumericFormat mlp_down_fmt = select_allowed_format(
+            binder, prefix + "mlp/down", mlp_fallback, {NumericFormat::NVFP4, kFp8});
+        target.mlp.gate_up =
+            mlp_gate_up_fmt == NumericFormat::NVFP4
+                ? bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
+                                    prefix + "mlp/gate_up_projection/input_scale_divisor")
+                : bind_weight(binder, prefix + "mlp/gate_up", kFp8, {34816, 5120});
+        target.mlp.down =
+            mlp_down_fmt == NumericFormat::NVFP4
+                ? bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
+                                    prefix + "mlp/down_projection/input_scale_divisor")
+                : bind_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408});
     }
 }
 
@@ -514,6 +575,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
+    const NumericFormat embedding_format  = select_allowed_format(
+        binder, "text/token_embedding", vocabulary_format,
+        {NumericFormat::Q4G64_F16S, NumericFormat::Q6G64_F16S, NumericFormat::W8G32_F16S,
+         NumericFormat::FP8_E4M3FN_ROW_BF16S, NumericFormat::BF16});
     // The token embedding (248320 x 5120, 1.2 GiB) is read a few rows a step: one per token of
     // a decode round, one per token of a prefill chunk. On Volta it stays in pinned host memory
     // mapped into the device address space, and the gather reads its rows over PCIe, which frees
@@ -528,7 +593,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         }
     }
 #endif
-    out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
+    out.token_embedding = bind_weight(binder, "text/token_embedding", embedding_format,
                                       {248320, 5120}, embedding_placement);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
@@ -546,7 +611,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    const NumericFormat output_head_format = select_allowed_format(
+        binder, "text/output_head", vocabulary_format,
+        {NumericFormat::Q6G64_F16S, NumericFormat::W8G32_F16S,
+         NumericFormat::FP8_E4M3FN_ROW_BF16S, NumericFormat::NVFP4});
+    out.output_head =
+        output_head_format == NumericFormat::NVFP4
+            ? bind_nvfp4_weight(binder, "text/output_head", 248320, 5120,
+                                "text/output_head/input_scale_divisor")
+            : bind_weight(binder, "text/output_head", output_head_format, {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -657,6 +730,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.norm =
                 artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
             target.output = materialized_weight(backing, source.gdn.output, 5120, 6144);
+#ifdef NINFER_VOLTA_BUILD
+            if (target.output.qtype == QType::NVFP4) {
+                ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(target.output);
+            }
+#endif
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120});
             target.post_mixer = load_mlp(source.mlp, backing);
@@ -668,6 +746,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
+#ifdef NINFER_VOLTA_BUILD
+    if (output_head.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(output_head);
+    }
+#endif
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,

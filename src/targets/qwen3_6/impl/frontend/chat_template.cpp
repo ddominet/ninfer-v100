@@ -27,6 +27,19 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
     0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
 };
 
+// Same official Qwen3.8 reasoning-effort template with HuggingFace {% generation %} markers.
+constexpr Sha256Digest kReasoningEffortGenTemplateDigest{
+    0xaf, 0x16, 0xf6, 0x54, 0x96, 0x8d, 0x47, 0xd0, 0x9a, 0x6c, 0x60, 0x4e, 0x00, 0x37, 0x0b, 0x12,
+    0xdb, 0xc2, 0x1f, 0x76, 0x45, 0x6f, 0x59, 0xc9, 0xe9, 0x8b, 0x82, 0xe8, 0x4d, 0x9f, 0x63, 0x75,
+};
+
+// NInfer v3 Qwen3.8 reasoning-effort template (derived from Qwen/Qwen3.8-27B chat_template.jinja
+// with positional system/developer turns, final-assistant continuation, and tool-only histories).
+constexpr Sha256Digest kReasoningEffortNinferV3TemplateDigest{
+    0xa4, 0x97, 0xdb, 0x9e, 0x66, 0x39, 0x41, 0xe6, 0xf7, 0xa0, 0x53, 0x07, 0xc2, 0xba, 0xfa, 0x83,
+    0x74, 0xc1, 0x2e, 0x14, 0x2a, 0xd1, 0xfb, 0xea, 0x62, 0x29, 0x88, 0x8d, 0x41, 0xf1, 0xab, 0x16,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -416,7 +429,8 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     if (digest == kThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
-    if (digest == kReasoningEffortTemplateDigest) {
+    if (digest == kReasoningEffortTemplateDigest || digest == kReasoningEffortGenTemplateDigest ||
+        digest == kReasoningEffortNinferV3TemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +

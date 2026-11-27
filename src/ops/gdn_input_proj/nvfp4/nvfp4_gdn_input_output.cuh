@@ -14,11 +14,14 @@ struct Nvfp4GdnInputOutput {
 
     __nv_bfloat16* qkv;
     __nv_bfloat16* z;
+    // Optional: token t's q/k/v column is qkv_columns[t] (a wider, padded qkv plane).
+    const std::int32_t* qkv_columns = nullptr;
 
     __device__ __forceinline__ __nv_bfloat16* destination(std::int32_t parent_row,
                                                           std::int32_t token) const {
         if (parent_row < kQkvRows) {
-            return qkv + static_cast<std::int64_t>(token) * kQkvRows + parent_row;
+            const std::int32_t column = qkv_columns != nullptr ? qkv_columns[token] : token;
+            return qkv + static_cast<std::int64_t>(column) * kQkvRows + parent_row;
         }
         return z + static_cast<std::int64_t>(token) * kZRows + parent_row - kQkvRows;
     }

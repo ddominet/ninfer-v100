@@ -39,6 +39,7 @@ void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tenso
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
     case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::OutputHead:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
@@ -51,6 +52,16 @@ void nvfp4_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& 
     launch_nvfp4_volta_qpn_with_output(
         x, weight, Nvfp4ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n},
         weight.n, inverse, stream);
+}
+
+void nvfp4_linear_add_qpn_fp16_launch(const Tensor& x_shape, const half* x_fp16,
+                                      const Weight& weight, Tensor& residual,
+                                      cudaStream_t stream) {
+    const float inverse = 1.0F / weight.weight_scale_divisor;
+    launch_nvfp4_volta_qpn_with_fp16_activation(
+        x_shape, weight, x_fp16,
+        Nvfp4ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n,
+        inverse, stream);
 }
 
 void nvfp4_linear_add_qpn_group_major_launch(const Tensor& x_shape,

@@ -128,6 +128,9 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::Residual17408:
         launch_problem<Nvfp4Residual17408Geometry>(weight, out, workspace, tokens, stream);
         return;
+    case Nvfp4Problem::OutputHead:
+        launch_problem<Nvfp4OutputHeadGeometry>(weight, out, workspace, tokens, stream);
+        return;
     }
 }
 

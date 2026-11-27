@@ -3,6 +3,7 @@
 #include "core/layout.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_topk/dflash2_linear_topk_volta.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 #include "ninfer/ops/linear.h"
@@ -20,6 +21,8 @@ namespace {
 enum class HeadProfile : std::uint8_t {
     W8Full,
     Fp8Full,
+    Q6Full,
+    Nvfp4Full,
     Q4Optimized,
 };
 
@@ -47,6 +50,12 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return HeadProfile::Fp8Full;
+    }
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::Q6G64_F16S) {
+        return HeadProfile::Q6Full;
+    }
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::NVFP4) {
+        return HeadProfile::Nvfp4Full;
     }
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4G64_F16S) {
         return HeadProfile::Q4Optimized;
@@ -95,6 +104,23 @@ void require_w8(const Weight& head) {
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
     if (!common) { throw std::invalid_argument("linear_topk: invalid W8 full head"); }
+}
+
+void require_q6(const Weight& head) {
+    const bool common =
+        head.qtype == QType::Q6G64_F16S &&
+        (head.layout == QuantLayout::RowSplit
+#ifdef NINFER_VOLTA_BUILD
+         || head.layout == QuantLayout::VoltaQpnPrepacked
+#endif
+         ) &&
+        head.scale_dtype == DType::FP16 && head.group_size == 64 && head.group == 64 &&
+        head.ndim == 2 && head.n == detail::kLinearTopKFullRows &&
+        head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
+        head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh != nullptr &&
+        head.high_plane_bytes != 0 && aligned_to(head.qdata, 16) && aligned_to(head.qhigh, 16) &&
+        aligned_to(head.scales, 4);
+    if (!common) { throw std::invalid_argument("linear_topk: invalid Q6 full head"); }
 }
 
 void require_q4(const Weight& head) {
@@ -221,6 +247,10 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
     }
     if (profile == HeadProfile::W8Full) {
         require_w8(head);
+    } else if (profile == HeadProfile::Q6Full) {
+        require_q6(head);
+    } else if (profile == HeadProfile::Nvfp4Full) {
+        (void)detail::validate_nvfp4_weight(head, "linear_topk NVFP4 full head");
     } else {
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }
