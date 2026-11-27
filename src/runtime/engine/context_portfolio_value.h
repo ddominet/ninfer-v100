@@ -24,6 +24,7 @@ struct ContextPortfolioCheckpointValue {
     std::uint64_t rebuild_ns           = 0;
     std::uint64_t baseline_recovery_ns = 0;
     std::uint64_t target_recovery_ns   = 0;
+    bool unreachable                   = false;
 };
 
 struct ContextPortfolioValueResult {
@@ -75,9 +76,11 @@ public:
                     : 0;
             owner->baseline_best = std::max(owner->baseline_best, baseline_saving);
             owner->target_best   = std::max(owner->target_best, target_saving);
-            owner->private_transition_loss =
-                std::max(owner->private_transition_loss,
-                         baseline_saving > target_saving ? baseline_saving - target_saving : 0);
+            if (!checkpoint.unreachable) {
+                owner->private_transition_loss =
+                    std::max(owner->private_transition_loss,
+                             baseline_saving > target_saving ? baseline_saving - target_saving : 0);
+            }
             for (std::uint32_t bit = 0; bit < 32U; ++bit) {
                 if ((checkpoint.demand_mask & (1U << bit)) == 0) { continue; }
                 baseline_demand[bit] = std::max(baseline_demand[bit], baseline_saving);

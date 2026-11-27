@@ -389,80 +389,64 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     std::span<const HostKVAllocationRequest> target_allocations) const {
     if (proposed_releases.empty() && target_allocations.empty()) { return true; }
 
-    std::vector<FreeExtent> simulated = free_extents_;
-    const auto insert_extent          = [&](FreeExtent extent) {
-        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
-                                                        [](const FreeExtent& candidate, std::size_t offset) {
-                                                   return candidate.offset < offset;
-                                               });
-        auto inserted       = simulated.insert(position, extent);
-        if (inserted != simulated.begin()) {
-            auto previous = inserted - 1;
-            if (previous->offset + previous->bytes == inserted->offset) {
-                previous->bytes += inserted->bytes;
-                inserted = simulated.erase(inserted);
-                inserted = previous;
-            }
-        }
-        const auto next = inserted + 1;
-        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
-            inserted->bytes += next->bytes;
-            simulated.erase(next);
-        }
+    struct NormalizedRelease {
+        std::uint32_t descriptor_index = 0;
+        std::uint32_t begin_page       = 0;
+        std::uint32_t end_page         = 0;
+        std::size_t offset             = 0;
+        std::size_t bytes              = 0;
     };
 
-    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
-        const HostKVSuballocationRelease& release = proposed_releases[index];
+    std::vector<NormalizedRelease> normalized;
+    normalized.reserve(proposed_releases.size());
+    for (const HostKVSuballocationRelease& release : proposed_releases) {
         if (!valid_handle(release.allocation) || release.page_count == 0) { return false; }
         const Descriptor& descriptor = descriptors_[release.allocation.descriptor_];
         if (release.begin_page > descriptor.pages ||
             release.page_count > descriptor.pages - release.begin_page) {
             return false;
         }
-        const std::uint32_t end = release.begin_page + release.page_count;
-        for (std::size_t prior = 0; prior < index; ++prior) {
-            const HostKVSuballocationRelease& other = proposed_releases[prior];
-            if (other.allocation != release.allocation) { continue; }
-            const std::uint32_t other_end = other.begin_page + other.page_count;
-            if (release.begin_page < other_end && other.begin_page < end) { return false; }
-        }
         const std::size_t stride = layouts_[descriptor.layout].page_stride;
-        insert_extent(FreeExtent{
-            .offset = checked_add(descriptor.offset,
-                                  checked_mul(static_cast<std::size_t>(release.begin_page), stride,
-                                              "Host KV suballocation release offset overflow"),
-                                  "Host KV suballocation release offset overflow"),
-            .bytes  = checked_mul(static_cast<std::size_t>(release.page_count), stride,
-                                  "Host KV suballocation release size overflow"),
+        const std::size_t offset = checked_add(
+            descriptor.offset,
+            checked_mul(static_cast<std::size_t>(release.begin_page), stride,
+                        "Host KV suballocation release offset overflow"),
+            "Host KV suballocation release offset overflow");
+        const std::size_t bytes =
+            checked_mul(static_cast<std::size_t>(release.page_count), stride,
+                        "Host KV suballocation release size overflow");
+        normalized.push_back(NormalizedRelease{
+            .descriptor_index = release.allocation.descriptor_,
+            .begin_page       = release.begin_page,
+            .end_page         = release.begin_page + release.page_count,
+            .offset           = offset,
+            .bytes            = bytes,
         });
     }
 
+    // Sort by (descriptor_index, begin_page) so overlap validation and retained-run counting are
+    // O(P log P) instead of O(P^2) for large (~150K+ token) page release sets.
+    std::sort(normalized.begin(), normalized.end(),
+              [](const NormalizedRelease& lhs, const NormalizedRelease& rhs) {
+                  if (lhs.descriptor_index != rhs.descriptor_index) {
+                      return lhs.descriptor_index < rhs.descriptor_index;
+                  }
+                  return lhs.begin_page < rhs.begin_page;
+              });
+
     std::size_t available_descriptors = free_descriptors_.size();
     std::size_t required_descriptors  = target_allocations.size();
-    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
-        const HostKVAllocationHandle allocation = proposed_releases[index].allocation;
-        bool first                              = true;
-        for (std::size_t prior = 0; prior < index; ++prior) {
-            if (proposed_releases[prior].allocation == allocation) {
-                first = false;
-                break;
-            }
-        }
-        if (!first) { continue; }
-
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> intervals;
-        for (const HostKVSuballocationRelease& release : proposed_releases) {
-            if (release.allocation == allocation) {
-                intervals.emplace_back(release.begin_page, release.begin_page + release.page_count);
-            }
-        }
-        std::sort(intervals.begin(), intervals.end());
-        const Descriptor& descriptor = descriptors_[allocation.descriptor_];
-        std::uint32_t cursor         = 0;
-        std::size_t retained_runs    = 0;
-        for (const auto [begin, end] : intervals) {
-            if (begin > cursor) { ++retained_runs; }
-            cursor = end;
+    for (std::size_t index = 0; index < normalized.size();) {
+        const std::uint32_t desc_index = normalized[index].descriptor_index;
+        const Descriptor& descriptor   = descriptors_[desc_index];
+        std::uint32_t cursor           = 0;
+        std::size_t retained_runs      = 0;
+        while (index < normalized.size() && normalized[index].descriptor_index == desc_index) {
+            const NormalizedRelease& entry = normalized[index];
+            if (entry.begin_page < cursor) { return false; }
+            if (entry.begin_page > cursor) { ++retained_runs; }
+            cursor = entry.end_page;
+            ++index;
         }
         if (cursor < descriptor.pages) { ++retained_runs; }
         if (retained_runs == 0) {
@@ -472,6 +456,37 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
         }
     }
     if (required_descriptors > available_descriptors) { return false; }
+
+    // Sort released extents by arena byte offset and linearly merge-coalesce with free_extents_.
+    std::sort(normalized.begin(), normalized.end(),
+              [](const NormalizedRelease& lhs, const NormalizedRelease& rhs) {
+                  return lhs.offset < rhs.offset;
+              });
+
+    std::vector<FreeExtent> simulated;
+    simulated.reserve(free_extents_.size() + normalized.size());
+    const auto push_coalesced = [&](FreeExtent extent) {
+        if (!simulated.empty() && simulated.back().offset + simulated.back().bytes == extent.offset) {
+            simulated.back().bytes += extent.bytes;
+        } else {
+            simulated.push_back(extent);
+        }
+    };
+    std::size_t free_idx = 0;
+    std::size_t rel_idx  = 0;
+    while (free_idx < free_extents_.size() && rel_idx < normalized.size()) {
+        if (free_extents_[free_idx].offset <= normalized[rel_idx].offset) {
+            push_coalesced(free_extents_[free_idx++]);
+        } else {
+            push_coalesced(FreeExtent{normalized[rel_idx].offset, normalized[rel_idx].bytes});
+            ++rel_idx;
+        }
+    }
+    while (free_idx < free_extents_.size()) { push_coalesced(free_extents_[free_idx++]); }
+    while (rel_idx < normalized.size()) {
+        push_coalesced(FreeExtent{normalized[rel_idx].offset, normalized[rel_idx].bytes});
+        ++rel_idx;
+    }
 
     for (const HostKVAllocationRequest& request : target_allocations) {
         if (request.layout == nullptr || request.pages == 0) { return false; }

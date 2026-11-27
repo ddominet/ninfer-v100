@@ -220,7 +220,7 @@ inline PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::PressurePlanningSessi
 
     candidate_options.resize(candidates.size());
     const std::size_t maximum_targets =
-        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+        2U * candidates.size() + planning_detail::kOptionalTargetCapacity;
     const std::size_t maximum_successors_per_owner =
         11U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (!owners.empty() &&
@@ -450,7 +450,7 @@ inline std::uint32_t PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::intern_
         existing->root_maximal = existing->root_maximal || root_maximal;
         return static_cast<std::uint32_t>(existing - targets.data());
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum = 2U * candidates.size() + planning_detail::kOptionalTargetCapacity;
     if (targets.size() >= maximum || targets.size() == targets.capacity() ||
         choices.size() > target_choice_arena.capacity() - target_choice_arena.size() ||
         target_choice_arena.size() > std::numeric_limits<std::uint32_t>::max() ||
@@ -595,11 +595,56 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
     if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
     const std::uint32_t selected_candidate = candidate_index(root_candidate);
     populate_options(selected_candidate);
+    const CandidateState& candidate = *candidates[selected_candidate].state;
+    const bool has_host_deficit     = candidate.identity_pressure_deficit.host.state_slots != 0 ||
+                                  candidate.identity_pressure_deficit.host.kv_bytes != 0 ||
+                                  candidate.blocked_host_allocation_bytes != 0;
+    const auto shared_has_device_resources =
+        [&](const NINFER_QWEN36_RUNTIME_NS::SharedPrefixState& shared) -> bool {
+        if (program->state_store && program->state_store->valid(shared.state)) {
+            const StateReplicaResidency residency = program->state_store->residency(shared.state);
+            if (residency == StateReplicaResidency::DeviceOnly ||
+                residency == StateReplicaResidency::Both) {
+                return true;
+            }
+        }
+        const auto has_device_kv = [](const KVAddressSpaceStore* addresses,
+                                      const LogicalKVPageStore* pages,
+                                      KVAddressSpaceHandle address) -> bool {
+            if (addresses == nullptr || pages == nullptr || !addresses->valid(address)) {
+                return false;
+            }
+            const std::uint32_t mapped = addresses->mapped_pages(address);
+            for (std::uint32_t page = 0; page < mapped; ++page) {
+                if (pages->device_resident(addresses->logical_page(address, page))) { return true; }
+            }
+            return false;
+        };
+        if (shared.kv) {
+            if (has_device_kv(program->text_kv_addresses.get(), program->text_kv_pages.get(),
+                              shared.kv->text)) {
+                return true;
+            }
+            if (shared.kv->backend &&
+                has_device_kv(program->backend_kv_addresses.get(), program->backend_kv_pages.get(),
+                              *shared.kv->backend)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    using PlanningContractAccess = qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
     choice_scratch.assign(candidate_options[selected_candidate].victims.size(), 0);
     for (std::size_t index = 0; index < candidate_options[selected_candidate].victims.size();
          ++index) {
-        choice_scratch[index] =
-            candidate_options[selected_candidate].victims[index].eviction_choice;
+        const CandidateVictimOptions& victim = candidate_options[selected_candidate].victims[index];
+        const Owner& owner                   = owners[victim.owner_index];
+        if (!has_host_deficit && owner.shared) {
+            const NINFER_QWEN36_RUNTIME_NS::SharedPrefixState& shared =
+                program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)];
+            if (!shared_has_device_resources(shared)) { continue; }
+        }
+        choice_scratch[index] = victim.eviction_choice;
     }
     const std::uint32_t target_index = intern_target(selected_candidate, choice_scratch, true);
     qwen3_6::PressureTargetHandle handle;
@@ -724,7 +769,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
         if (residual == detail::PhysicalResources{}) {
             TargetNode* existing = find_target(selected_candidate, choice_scratch);
             const std::size_t maximum =
-                candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+                2U * candidates.size() + planning_detail::kOptionalTargetCapacity;
             if (existing == nullptr && targets.size() >= maximum) { return std::nullopt; }
             const std::uint32_t target_index =
                 existing != nullptr ? static_cast<std::uint32_t>(existing - targets.data())
@@ -1341,7 +1386,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::commit_expansion(
         prepared.parent_index_ >= targets.size()) {
         throw std::logic_error("prepared pressure expansion is stale");
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    const std::size_t maximum = 2U * candidates.size() + planning_detail::kOptionalTargetCapacity;
     if (prepared_new_count > maximum - std::min(maximum, targets.size())) {
         throw std::length_error("prepared pressure expansion exceeds the target arena");
     }

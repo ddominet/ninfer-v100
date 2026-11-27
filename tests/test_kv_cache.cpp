@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -411,6 +412,45 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                            !subrelease_arena.can_allocate_after_suballocation_releases(
                                subrelease, three_page_target),
                        label + " Host suballocation release feasibility is not extent exact");
+
+    // 150K-token (~2,344 pages @ 64 tok/page) suballocation release scaling and correctness test.
+    {
+        constexpr std::uint32_t kTotalPages   = 2400;
+        constexpr std::uint32_t kReleaseBegin = 56;
+        constexpr std::uint32_t kReleaseCount = kTotalPages - kReleaseBegin; // 2,344 pages
+        ninfer::HostKVArena large_arena(host_layout.page_stride * kTotalPages,
+                                        std::span<const ninfer::HostKVPageLayout>(layouts));
+        auto large_alloc = large_arena.allocate(host_layout, kTotalPages);
+        failures += expect(large_alloc.has_value(), label + " large Host arena fixture failed");
+        std::vector<ninfer::HostKVSuballocationRelease> many_releases;
+        many_releases.reserve(kReleaseCount);
+        for (std::uint32_t i = 0; i < kReleaseCount; ++i) {
+            // Deliberately reversed order to exercise sort + coalescing.
+            many_releases.push_back(ninfer::HostKVSuballocationRelease{
+                .allocation = large_alloc->handle(),
+                .begin_page = kTotalPages - 1U - i,
+                .page_count = 1,
+            });
+        }
+        const std::array fit_target{
+            ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = kReleaseCount}};
+        const std::array over_target{
+            ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = kReleaseCount + 1U}};
+        const auto t0      = std::chrono::steady_clock::now();
+        const bool ok_fit  = large_arena.can_allocate_after_suballocation_releases(many_releases,
+                                                                                   fit_target);
+        const bool ok_over = !large_arena.can_allocate_after_suballocation_releases(many_releases,
+                                                                                    over_target);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count();
+        many_releases.push_back(ninfer::HostKVSuballocationRelease{
+            .allocation = large_alloc->handle(), .begin_page = kReleaseBegin, .page_count = 1});
+        const bool rejects_overlap =
+            !large_arena.can_allocate_after_suballocation_releases(many_releases, fit_target);
+        failures += expect(ok_fit && ok_over && rejects_overlap && elapsed_ms < 50,
+                           label + " large Host suballocation feasibility failed or exceeded 50ms");
+    }
     (void)left;
     (void)tail;
     (void)blockers;

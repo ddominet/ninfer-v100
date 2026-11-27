@@ -26,6 +26,7 @@ struct MaterializationCheckpointPolicy {
     std::uint32_t demand_mask          = 0;
     std::uint64_t rebuild_ns           = 0;
     std::uint64_t baseline_recovery_ns = 0;
+    bool unreachable                   = false;
 };
 
 struct MaterializationOwnerPolicy {
@@ -114,14 +115,14 @@ public:
         queue_.clear();
         pending_.clear();
         guided_.clear();
-        const std::size_t frontier_capacity = candidates.size() + 1U + kTargetBudget;
+        const std::size_t frontier_capacity = 2U * candidates.size() + kTargetBudget;
         queue_.reserve(frontier_capacity);
         pending_.reserve(frontier_capacity);
         guided_.reserve(frontier_capacity);
         identity_costs_.clear();
         candidate_guided_steps_.assign(candidates.size(), 0);
         candidate_seed_complete_.assign(candidates.size(), false);
-        target_ledger_.reset(candidates.size() + 1U + kTargetBudget);
+        target_ledger_.reset(frontier_capacity);
 
         std::optional<Incumbent> identity_best;
         std::vector<IdentityRoot> roots;
@@ -253,15 +254,14 @@ public:
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 
-        const Clock::time_point search_started = Clock::now();
-        const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
-        const std::uint64_t guided_watchdog_ns = search_budget_ns;
-        std::uint64_t maximum_step_ns          = 0;
-        std::uint32_t optional_targets         = 0;
-        std::uint32_t guided_assessments       = 0;
-        MaterializationStopReason stop_reason  = MaterializationStopReason::QueueExhausted;
-        bool budget_exhausted                  = false;
+        const Clock::time_point search_started         = Clock::now();
+        constexpr std::uint64_t kSeedingBudgetCapNs    = 250'000'000ULL;
+        constexpr std::uint64_t kRefinementBudgetCapNs = 5'000'000ULL;
+        std::uint64_t maximum_step_ns                  = 0;
+        std::uint32_t optional_targets                 = 0;
+        std::uint32_t guided_assessments               = 0;
+        MaterializationStopReason stop_reason          = MaterializationStopReason::QueueExhausted;
+        bool budget_exhausted                          = false;
 
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
@@ -400,6 +400,18 @@ public:
                 return candidate_needs_seed(root.candidate_index);
             });
         };
+        const auto has_promising_open_seed = [&] {
+            return std::any_of(roots.begin(), roots.end(), [&](const IdentityRoot& root) {
+                return candidate_needs_seed(root.candidate_index) &&
+                       root.lower_bound_ns < incumbent.cost.total_ns;
+            });
+        };
+        const auto current_search_budget_ns = [&]() noexcept -> std::uint64_t {
+            const std::uint64_t cap =
+                (incumbent.root_maximal || has_promising_open_seed()) ? kSeedingBudgetCapNs
+                                                                      : kRefinementBudgetCapNs;
+            return std::min<std::uint64_t>(cap, incumbent.cost.total_ns / 20U);
+        };
 
         std::vector<const MaterializationOwnerPolicy*> preferred_owners;
         preferred_owners.reserve(pressure.owner_policy.size());
@@ -440,7 +452,7 @@ public:
                   });
         for (const IdentityRoot& root : closure_order) {
             if (!candidate_needs_seed(root.candidate_index) ||
-                elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
+                elapsed_ns(search_started, Clock::now()) >= current_search_budget_ns() ||
                 optional_targets >= kTargetBudget) {
                 continue;
             }
@@ -472,7 +484,7 @@ public:
         // independent beams but never excludes a candidate or certifies an incumbent.
         while (has_open_seed() && !guided_.empty() &&
                guided_assessments < kGuidedAssessmentBudget) {
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
+            if (elapsed_ns(search_started, Clock::now()) >= current_search_budget_ns()) { break; }
             const GuidedEntry next = guided_pop();
             if (!candidate_needs_seed(next.candidate_index) ||
                 target_marked(next.guidance.stable_target_ordinal, kTargetExpanded)) {
@@ -503,7 +515,7 @@ public:
                 maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
             }
             if (!exact || !candidate_needs_seed(next.candidate_index)) { continue; }
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
+            if (elapsed_ns(search_started, Clock::now()) >= current_search_budget_ns()) { break; }
             const Clock::time_point step_started = Clock::now();
             if (!expand_target(*exact)) { break; }
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
@@ -531,7 +543,7 @@ public:
                                                     : pending_.front().lower_bound_ns;
             const std::uint64_t next_bound    = std::min(queue_bound, pending_bound);
             const std::uint64_t elapsed       = elapsed_ns(search_started, Clock::now());
-            if (elapsed >= search_budget_ns) {
+            if (elapsed >= current_search_budget_ns()) {
                 stop_reason      = MaterializationStopReason::TimeBudget;
                 budget_exhausted = true;
                 break;
@@ -567,6 +579,29 @@ public:
                 }
             }
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
+        }
+
+        // Never fall back to a zero-reuse root prefill when an unseeded reuse candidate can be
+        // materialized via its own maximal target (preserving the requester's matching prefix).
+        if (incumbent.candidate_index == root_candidate_index) {
+            for (const IdentityRoot& root : closure_order) {
+                if (root.candidate_index == root_candidate_index ||
+                    candidate_seed_complete_[root.candidate_index] ||
+                    root.lower_bound_ns >= incumbent.cost.total_ns) {
+                    continue;
+                }
+                const PressureTargetHandle candidate_maximal =
+                    session.root_maximal_target(candidates[root.candidate_index].id);
+                const PressureTargetGuidance maximal_guidance = session.guidance(candidate_maximal);
+                if (maximal_guidance.candidate != candidates[root.candidate_index].id) {
+                    throw std::logic_error("candidate maximal target changed admission candidate");
+                }
+                if (target_marked(maximal_guidance.stable_target_ordinal, kTargetAssessed)) {
+                    continue;
+                }
+                (void)assess_target(candidate_maximal, root.candidate_index,
+                                    maximal_guidance.stable_target_ordinal);
+            }
         }
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
@@ -945,6 +980,7 @@ private:
                 .rebuild_ns           = policy.rebuild_ns,
                 .baseline_recovery_ns = policy.baseline_recovery_ns,
                 .target_recovery_ns   = target_recovery,
+                .unreachable          = policy.unreachable,
             });
             if (target_recovery > policy.baseline_recovery_ns) {
                 portfolio_degraded = true;

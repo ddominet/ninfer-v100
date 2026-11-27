@@ -3245,6 +3245,210 @@ void test_shortlist_collision_requires_program_exact_verification() {
             "shortlist collision bypassed Program exact identity verification");
 }
 
+void test_budget_exhaustion_prefers_reuse_maximal_over_root_fallback() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+    // Require eviction-level pressure units (cannot be satisfied by 2 owners' 1-unit non-evicting
+    // actions) and add slow assessment delay so optional search exhausts budget without finding
+    // a non-maximal seed. The planner must still evaluate reuse's maximal target before falling
+    // back to a zero-reuse root prefill (Neroued/ninfer#229).
+    program.required_pressure_actions      = 4;
+    program.eviction_pressure_action_units = 2;
+    program.pressure_action_immediate_ns   = 1'000'000;
+    program.pressure_assessment_delay_us   = 60'000;
+
+    FakeAdmissionCandidate root;
+    set_fake_machine_costs(root.identity.machine_work, 254'000'000'000ULL, 254'000'000'000ULL);
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = true;
+    root.identity.assessment_digest = 301;
+
+    FakeAdmissionCandidate reuse;
+    reuse.value.reusable_prompt_tokens = 150'000;
+    reuse.private_source_id            = 1;
+    set_fake_machine_costs(reuse.identity.machine_work, 3'600'000'000ULL, 3'600'000'000ULL);
+    reuse.identity.machine_work.reused_prompt_tokens = 150'000;
+    reuse.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    reuse.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    reuse.identity.expandable        = true;
+    reuse.identity.assessment_digest = 302;
+
+    std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate               = &root,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+        Planner::CandidateInput{.candidate               = &reuse,
+                                .id                      = PlanningCandidateId{.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+    std::array<FakeContinuationHandle, 3> owner_handles{
+        FakeContinuationHandle{1, 0},
+        FakeContinuationHandle{2, 0},
+        FakeContinuationHandle{3, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 3> private_owners{
+        &owner_handles[0], &owner_handles[1], &owner_handles[2]};
+    const std::array<PlanningOwnerId, 3> private_owner_ids{
+        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 3> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 0},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 1},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 1},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 1},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 2},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 1},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 3> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 0},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 150'000,
+                                        .ordinal  = 0},
+            .rebuild_ns = 10'000'000'000ULL},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 1},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16'000,
+                                        .ordinal  = 0},
+            .rebuild_ns = 5'000'000'000ULL},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 2},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16'000,
+                                        .ordinal  = 0},
+            .rebuild_ns = 5'000'000'000ULL},
+    };
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = private_owners,
+            .private_owner_ids = private_owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                               pressure_inputs, logical_goal, Planner::Clock::now());
+
+    require(result && result->plan && result->candidate == PlanningCandidateId{.value = 1},
+            "budget exhaustion fell back to root instead of materializing reuse candidate");
+}
+
+void test_unreachable_private_checkpoint_has_zero_transition_loss() {
+    ninfer::runtime::ContextPortfolioValue portfolio;
+    const std::array<ninfer::runtime::ContextPortfolioOwnerPolicy, 1> owners{
+        ninfer::runtime::ContextPortfolioOwnerPolicy{
+            .owner                    = PlanningOwnerId{.value = 0},
+            .private_retention_weight = 8,
+        },
+    };
+    const std::array<ninfer::runtime::ContextPortfolioCheckpointValue, 1> reachable{
+        ninfer::runtime::ContextPortfolioCheckpointValue{
+            .owner                = PlanningOwnerId{.value = 0},
+            .rebuild_ns           = 6'000'000'000ULL,
+            .baseline_recovery_ns = 0,
+            .target_recovery_ns   = 6'000'000'000ULL,
+            .unreachable          = false,
+        },
+    };
+    const std::array<ninfer::runtime::ContextPortfolioCheckpointValue, 1> unreachable{
+        ninfer::runtime::ContextPortfolioCheckpointValue{
+            .owner                = PlanningOwnerId{.value = 0},
+            .rebuild_ns           = 6'000'000'000ULL,
+            .baseline_recovery_ns = 0,
+            .target_recovery_ns   = 6'000'000'000ULL,
+            .unreachable          = true,
+        },
+    };
+    const auto with_loss    = portfolio.fold(owners, reachable);
+    const auto without_loss = portfolio.fold(owners, unreachable);
+    require(with_loss.private_transition_loss > 0 && without_loss.private_transition_loss == 0,
+            "unreachable private checkpoint still charged private_transition_loss");
+}
+
+void test_infeasible_shared_capture_reclaims_without_pressure_evidence() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+    const ActiveRequest parked = start_active(manager, program, 211, make_base(211), 1);
+    (void)finish_active(manager, program, parked);
+
+    // Register one domain's demand for frontier 64 (matching_reuse_domains == 1 < 2, so
+    // pressure_evidence is false, yet committed demand makes publication positive-value).
+    FakeRequestBasePlan automatic_req = make_base(212);
+    automatic_req.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+        .frontier = 64,
+    });
+    const ActiveRequest active = start_active(manager, program, 212, automatic_req, 2);
+    program.required_pressure_actions    = 1;
+    program.pressure_action_immediate_ns = 0;
+    program.capture_assessment           = FakeCaptureAssessment{
+                  .shortlist_key          = FakeShortlistKey{.digest = 212, .frontier = 64},
+                  .shared_evidence        = ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                  .protected_rebuild_work = PrefillWork{.tokens = 64},
+                  .publishes_shared       = true,
+                  .physically_feasible    = false,
+    };
+
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 31}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "physically infeasible shared capture did not reclaim without pressure_evidence");
+    auto progress      = manager.progress_context_transaction(program, {});
+    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published &&
+                program.started_action_ids.size() == 1,
+            "infeasible shared capture did not publish after victim reclamation");
+    program.required_pressure_actions = 0;
+    (void)finish_active(manager, program, active);
+}
+
+void test_infeasible_private_capture_reclaims_idle_owner() {
+    FakeManager manager = make_manager(1, 4, 2);
+    FakeProgram program;
+    const ActiveRequest parked = start_active(manager, program, 221, make_base(221), 1);
+    (void)finish_active(manager, program, parked);
+
+    const ActiveRequest active           = start_active(manager, program, 222, make_base(222), 2);
+    program.required_pressure_actions    = 1;
+    program.pressure_action_immediate_ns = 0;
+    program.capture_assessment           = FakeCaptureAssessment{
+                  .shortlist_key       = FakeShortlistKey{.digest = 222, .frontier = 24},
+                  .publishes_private   = true,
+                  .publishes_shared    = false,
+                  .physically_feasible = false,
+    };
+    program.capture_summary.endpoint = endpoint(222, 24);
+
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 32}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "physically infeasible private-only capture did not reclaim an idle owner");
+    auto progress      = manager.progress_context_transaction(program, {});
+    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published &&
+                program.started_action_ids.size() == 1,
+            "private-only capture reclamation did not publish cleanly");
+    program.required_pressure_actions = 0;
+    (void)finish_active(manager, program, active, 24);
+}
+
 } // namespace
 
 int main() {
@@ -3314,6 +3518,14 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("budget exhaustion reuse maximal fallback",
+             test_budget_exhaustion_prefers_reuse_maximal_over_root_fallback);
+    run_test("unreachable private checkpoint transition loss",
+             test_unreachable_private_checkpoint_has_zero_transition_loss);
+    run_test("infeasible shared capture reclaims without pressure evidence",
+             test_infeasible_shared_capture_reclaims_without_pressure_evidence);
+    run_test("infeasible private capture reclaims idle owner",
+             test_infeasible_private_capture_reclaims_idle_owner);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

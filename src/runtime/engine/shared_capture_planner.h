@@ -43,6 +43,7 @@ public:
         std::uint32_t demand_mask          = 0;
         std::uint64_t rebuild_ns           = 0;
         std::uint64_t baseline_recovery_ns = 0;
+        bool unreachable                   = false;
     };
 
     struct Input {
@@ -60,6 +61,7 @@ public:
         std::uint32_t blocked_runnable_requests     = 0;
         std::uint32_t stable_scenario_ordinal       = 0;
         std::uint32_t target_budget                 = kTargetBudget;
+        bool private_reclamation_only               = false;
     };
 
     struct Result {
@@ -238,8 +240,11 @@ private:
     };
 
     static void validate(const Input& input) {
-        if (input.capture == nullptr || !input.capture->publishes_shared ||
-            input.target_budget == 0 || input.target_budget > kTargetBudget ||
+        const bool valid_publication =
+            input.capture != nullptr &&
+            (input.capture->publishes_shared ||
+             (input.private_reclamation_only && input.capture->publishes_private));
+        if (!valid_publication || input.target_budget == 0 || input.target_budget > kTargetBudget ||
             input.private_owners.size() != input.private_owner_ids.size() ||
             input.shared_owners.size() != input.shared_owner_ids.size()) {
             throw std::invalid_argument("shared capture planning input is malformed");
@@ -311,16 +316,18 @@ private:
             });
         }
         const PlanningOwnerId candidate_owner = next_candidate_owner(input.owner_policies);
-        const bool candidate_credit =
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::ExplicitBoundary) ||
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::RequestedAutomatic);
-        owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
-            .owner                    = candidate_owner,
-            .private_retention_weight = 0,
-            .explicit_shared_credit   = candidate_credit,
-        });
+        if (!input.private_reclamation_only) {
+            const bool candidate_credit =
+                has_shared_candidate_evidence(input.capture->shared_evidence,
+                                              SharedCandidateEvidence::ExplicitBoundary) ||
+                has_shared_candidate_evidence(input.capture->shared_evidence,
+                                              SharedCandidateEvidence::RequestedAutomatic);
+            owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
+                .owner                    = candidate_owner,
+                .private_retention_weight = 0,
+                .explicit_shared_credit   = candidate_credit,
+            });
+        }
 
         checkpoint_scratch_.clear();
         for (const CheckpointPolicy& policy : input.checkpoint_policies) {
@@ -341,16 +348,19 @@ private:
                 .rebuild_ns           = policy.rebuild_ns,
                 .baseline_recovery_ns = policy.baseline_recovery_ns,
                 .target_recovery_ns   = target_recovery,
+                .unreachable          = policy.unreachable,
             });
         }
-        checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
-            .owner                = candidate_owner,
-            .demand_mask          = input.candidate_demand_mask,
-            .rebuild_ns           = input.candidate_rebuild_ns,
-            .baseline_recovery_ns = input.candidate_rebuild_ns,
-            .target_recovery_ns   = price_checkpoint_recovery_work(
-                machine_cost, input.capture->projected_recovery_work),
-        });
+        if (!input.private_reclamation_only) {
+            checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
+                .owner                = candidate_owner,
+                .demand_mask          = input.candidate_demand_mask,
+                .rebuild_ns           = input.candidate_rebuild_ns,
+                .baseline_recovery_ns = input.candidate_rebuild_ns,
+                .target_recovery_ns   = price_checkpoint_recovery_work(
+                    machine_cost, input.capture->projected_recovery_work),
+            });
+        }
 
         const ContextPortfolioValueResult portfolio =
             portfolio_value_.fold(owner_scratch_, checkpoint_scratch_);
@@ -366,6 +376,31 @@ private:
         bool saturated = portfolio.saturated ||
                          target_immediate == std::numeric_limits<std::uint64_t>::max() ||
                          baseline_immediate == std::numeric_limits<std::uint64_t>::max();
+        if (input.private_reclamation_only) {
+            std::uint64_t loss = portfolio.baseline_public_value > portfolio.target_public_value
+                                     ? portfolio.baseline_public_value -
+                                           portfolio.target_public_value
+                                     : 0;
+            const auto add_loss = [&](std::uint64_t increment) {
+                if (increment > std::numeric_limits<std::uint64_t>::max() - loss) {
+                    loss      = std::numeric_limits<std::uint64_t>::max();
+                    saturated = true;
+                } else {
+                    loss += increment;
+                }
+            };
+            add_loss(portfolio.private_transition_loss);
+            add_loss(immediate);
+            return TransitionValue{
+                .baseline_public = portfolio.baseline_public_value,
+                .target_public   = portfolio.target_public_value,
+                .private_loss    = portfolio.private_transition_loss,
+                .immediate       = immediate,
+                .gain            = std::numeric_limits<std::uint64_t>::max() - loss,
+                .positive        = true,
+                .saturated       = saturated,
+            };
+        }
         std::uint64_t threshold  = portfolio.baseline_public_value;
         const auto add_threshold = [&](std::uint64_t increment) {
             if (increment > std::numeric_limits<std::uint64_t>::max() - threshold) {
